@@ -81,7 +81,7 @@ Checked by the automated tests in `test/`:
   changes. Tested with 2, 3 and 4 players.
 - Shopping pauses nobody: the other players keep playing while one shops. While a shop is open, the shopper's
   character can't be ordered by the others, and the recruiter waits until the shop closes.
-- The selection dots (tested with 2 players).
+- The selection dots, with 2 and 4 players.
 - Recruiting and dismissing squad members (with one save and reload, see below).
 - One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
   others are told someone got there first.
