@@ -306,11 +306,13 @@ void* __fastcall PortraitDtorHook(uint8_t* self, void* edx, unsigned flags) {
 
 // Test mode: the game window as ftcoop_shot.bmp in the game folder, when DotsFrame asks for it.
 DWORD WINAPI ShotThread(LPVOID) {
+  for (int shot = 1;; shot++) {
     WaitForSingleObject(g_shot_event, INFINITE);
+    ResetEvent(g_shot_event);
     Sleep(500);  // the repaint
     HWND hwnd = g_pump_hwnd;
     if (!hwnd) EnumWindows(FindGameWindow, reinterpret_cast<LPARAM>(&hwnd));
-    if (!hwnd) return 0;
+    if (!hwnd) continue;
     RECT rc;
     GetClientRect(hwnd, &rc);
     int w = rc.right, h = rc.bottom;
@@ -325,18 +327,20 @@ DWORD WINAPI ShotThread(LPVOID) {
     GetDIBits(mdc, bmp, 0, h, px, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
     BITMAPFILEHEADER bf = {0x4d42, static_cast<DWORD>(sizeof(bf) + sizeof(bi) + stride * h), 0, 0, sizeof(bf) + sizeof(bi)};
     FILE* f = nullptr;
-    if (fopen_s(&f, "ftcoop_shot.bmp", "wb") == 0 && f) {
+    char file[32];
+    sprintf_s(file, shot == 1 ? "ftcoop_shot.bmp" : "ftcoop_shot%d.bmp", shot);
+    if (fopen_s(&f, file, "wb") == 0 && f) {
         fwrite(&bf, sizeof(bf), 1, f);
         fwrite(&bi, sizeof(bi), 1, f);
         fwrite(px, stride * h, 1, f);
         fclose(f);
     }
-    Log("dots: window captured (%dx%d, PrintWindow %s)", w, h, ok ? "ok" : "failed");
+    Log("dots: window captured as %s (%dx%d, PrintWindow %s)", file, w, h, ok ? "ok" : "failed");
     free(px);
     DeleteObject(bmp);
     DeleteDC(mdc);
     ReleaseDC(hwnd, wdc);
-    return 0;
+  }
 }
 
 template <typename Fn>

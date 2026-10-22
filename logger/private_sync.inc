@@ -35,7 +35,10 @@
 // winner from the claim it relays (four bots talking to the merchant at once: all three joiners took it as theirs). A copy refuses its own player's talk to a locked NPC; the host drops
 // a talk to a locked NPC from anyone else (two players clicking at the same moment).
 const uint8_t kCoopCmd = 0x30;
-enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6 };  // 5, 6: shop_sync.inc
+enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6, kRecruitOpen = 7 };  // 5, 6: shop_sync.inc; 7: recruit_sync.inc
+bool g_recruit_synced = false;  // a recruit screen is up and every copy made its candidates (recruit_sync.inc)
+void HandleRecruitOpen(const uint8_t* r);  // recruit_sync.inc
+void CloseHeadlessRecruit();
 uint16_t g_shop_new[16];  // test mode: a shop deal's new stacks, followed through the close (shop_sync.inc)
 int g_shop_new_n = 0;
 bool g_applying_at_frame = false;  // ApplyDelta from a delta at its frame: no second write of the bookkeeping
@@ -519,7 +522,7 @@ int PrivateScreensDiff() {
         // one run in three). Until every copy makes them too (the screen's allocation run everywhere), a recruit
         // visit is the old save and reload.
         extern bool g_private_recruit;
-        if (g_private_recruit && !g_recreate_recruits) var_fail = "the squad at the recruit screen";
+        if (g_private_recruit && !g_recreate_recruits && !g_recruit_synced) var_fail = "the squad at the recruit screen";
         if (mode == 1 && !var_fail) {  // the variables only
             w.U8('E');
             result = nvars ? kDiffApplied : kDiffNone;
@@ -1491,6 +1494,11 @@ void HandleCoopCommand(const uint8_t* r) {
         }
         return;
     }
+    if (kind == kRecruitOpen) {
+        HandleRecruitOpen(r);
+        return;
+    }
+    if (kind == kSyncDone) CloseHeadlessRecruit();  // the recruiter's screen closed before its diff: ours too, first
     if (kind == kSyncChunk) {
         if (n <= kChunk && g_rx_len + n <= kMaxDelta) {
             memcpy(g_rx_delta + g_rx_len, r + 5, n);

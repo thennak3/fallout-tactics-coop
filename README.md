@@ -82,7 +82,8 @@ Checked by the automated tests in `test/`:
 - Shopping pauses nobody: the other players keep playing while one shops. While a shop is open, the shopper's
   character can't be ordered by the others, and the recruiter waits until the shop closes.
 - The selection dots, with 2 and 4 players.
-- Recruiting and dismissing squad members (with one save and reload, see below).
+- Recruiting and dismissing squad members, without a reload (the game pauses for everyone while the recruit screen
+  is up, since it changes the squad everyone plays).
 - One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
   others are told someone got there first.
 - The world map: only the host picks where to go; the others follow.
@@ -93,8 +94,6 @@ Checked by the automated tests in `test/`:
 - While one player talks to anyone other than a merchant, or uses the recruiter, the other players' games pause until
   the conversation closes. Shops don't pause anyone (for the old behaviour, put the lines `[coop]` and
   `shop_no_pause=0` in a file `ftcoop.ini` next to `BOS.exe`, on every player's PC).
-- Using the recruiter (recruiting or dismissing) saves and reloads everyone once, a few seconds. Live sync for it is
-  [issue #1](https://github.com/thennak3/fallout-tactics-coop/issues/1).
 - Not tested yet: two separate PCs, play over the internet.
 - Turn-based modes are untested; the tests use Continuous Turn-Based.
 
