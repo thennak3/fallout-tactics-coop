@@ -10,6 +10,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 
 namespace {
 
@@ -524,7 +525,9 @@ DWORD g_private_seen = 0;               // its last tick
 int g_private_frame = 0;                // the world's frame when it opened (no frames run while they are up)
 uint8_t* g_private_speech = nullptr;    // the open conversation window (the bot closes it)
 uint8_t* g_client_ptr = nullptr;        // the local Client (frame hook)
-const DWORD kPrivateClosedMs = 1000;    // no private screen ticked for this long: closed
+const DWORD kPrivateClosedMs = 300;     // no private screen ticked for this long: closed
+bool g_talker_hold = false;             // this copy holds its own world while its private screens are up
+bool g_private_recruit = false;         // the recruit screen was among them (private_sync.inc: a full re-sync)
 const DWORD kTalkWindowMs = 10000;      // a conversation opening this soon after a talk command is that command's
 
 PrivateKind PrivateKindOf(uint8_t* w) {
@@ -560,6 +563,7 @@ const uint8_t kClientSendPrologue[] = {0x8b, 0x49, 0x04, 0x85, 0xc9};
 uint8_t* g_send_trampoline = nullptr;
 
 bool RefuseLockedTalk(uint8_t* msg, int len);  // private_sync.inc
+void SendTalkClaim(void* client, const uint8_t* msg, int len);  // private_sync.inc
 
 char __fastcall ClientSendHook(void* self, void* /*edx*/, const uint8_t* msg, int len, int reliable) {
     if ((g_coop_host || g_coop_join) && HasTalkCommand(msg, len) && RefuseLockedTalk(const_cast<uint8_t*>(msg), len))
@@ -567,6 +571,7 @@ char __fastcall ClientSendHook(void* self, void* /*edx*/, const uint8_t* msg, in
     if ((g_coop_host || g_coop_join) && HasTalkCommand(msg, len)) {  // only clients send type 2 (servers: type 1)
         g_local_talk_tick = GetTickCount();
         Log("co-op: this player started a conversation");
+        SendTalkClaim(self, msg, len);  // first, so the host relays our claim ahead of the talk
     }
     return reinterpret_cast<char(__fastcall*)(void*, void*, const uint8_t*, int, int)>(g_send_trampoline)(
         self, nullptr, msg, len, reliable);
@@ -600,6 +605,8 @@ void TakePrivateSnapshot();  // private_sync.inc
 void HostHoldForOther();     // private_sync.inc
 void HostHoldTimeout();      // private_sync.inc
 extern uint16_t g_private_npc, g_local_talk_npc;
+extern bool g_claim_mine;  // private_sync.inc: the last relayed talk claim, and when it came
+extern DWORD g_claim_tick;
 
 void PrivateScreenTick(uint8_t* w) {  // window-tick hook
     if (!g_coop_host && !g_coop_join) return;
@@ -623,6 +630,8 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
     if (!g_private_open) {
         bool mine = kind == kTradeScreen || now - g_local_talk_tick < kTalkWindowMs ||
                     (g_coop_host && now - g_remote_talk_tick >= kTalkWindowMs);  // nobody's: a script's, the host's
+        // A conversation a talk claim decided (private_sync.inc): the claim's winner, whoever else talked too.
+        if (kind == kSpeechScreen && g_claim_tick && now - g_claim_tick < kTalkWindowMs) mine = g_claim_mine;
         if (!mine) {
             static uint8_t* closed = nullptr;
             if (closed != w) {
@@ -634,25 +643,39 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
             return;
         }
         g_private_open = true;
+        g_private_recruit = false;
         g_local_talk_tick = 0;
         Log("co-op: %s opened for this player", RttiName(w));
         g_private_npc = g_local_talk_npc;
         uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
         g_private_frame = world ? *reinterpret_cast<int*>(world + kWorldFrame) : 0;
         TakePrivateSnapshot();  // compared when the screens close: what the other copies need
+        // This copy's world waits too, as every other copy's does, until the diff is made: it used to run one frame
+        // after the screens closed and before the diff, while the others ran that frame only after applying the delta,
+        // and NPCs walking in that frame then went their own way on this copy (recruit_host, 3 players).
+        if (world && !g_talker_hold) {
+            reinterpret_cast<void(__thiscall*)(void*, int)>(0x4fc800)(world, 1);  // the pause counter, World+0x2db
+            g_talker_hold = true;
+        }
     }
     g_private_seen = now;
     if (kind == kSpeechScreen) g_private_speech = w;
+    if (kind == kTradeScreen && strstr(RttiName(w), "Recruit")) g_private_recruit = true;
 }
 
 // Main thread, every game frame: the private screens have closed; true if the other copies must now get our game.
+void ReleaseTalkerHold() {  // after the diff: this copy's world goes on with everyone else's
+    if (!g_talker_hold) return;
+    g_talker_hold = false;
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    if (world) reinterpret_cast<void(__thiscall*)(void*, int)>(0x4fc800)(world, 0);
+}
+
 bool PrivateScreensClosed() {
     if (!g_private_open) return false;
-    // Closed: no private screen ticked for 1 s, or the world runs again (its first frame, called before the frame's
-    // ticks, so the talker's changes are exactly what the screens did; any later frame would mix in the simulation).
-    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
-    bool resumed = world && *reinterpret_cast<int*>(world + kWorldFrame) != g_private_frame;
-    if (!resumed && GetTickCount() - g_private_seen < kPrivateClosedMs) return false;
+    // Closed: the mission screen is back to its plain modes and no private screen has ticked for a moment. The world
+    // is held (g_talker_hold), so no frame has run since: the talker's changes are exactly what the screens did.
+    if (GetTickCount() - g_private_seen < kPrivateClosedMs) return false;
     g_private_open = false;
     g_private_speech = nullptr;
     bool others = g_coop_join || LiveJoiners() > 0;
@@ -1435,6 +1458,8 @@ void Init() {
     bool pump = PatchCall(kPumpHandlerCall, kPumpHandler, (void*)&PumpHandlerHook);
     Log("co-op: main-menu hook %s, pump hook %s", menu ? "ok" : "FAILED", pump ? "ok" : "FAILED");
     g_mp_menu = GetPrivateProfileIntA("coop", "mp_menu", 1, ".\\ftcoop.ini") != 0;
+    g_lockstep_chunks = GetPrivateProfileIntA("coop", "lockstep_chunks", 300, ".\\ftcoop.ini");
+    g_recreate_recruits = GetPrivateProfileIntA("coop", "recreate_recruits", 0, ".\\ftcoop.ini");
     if (g_mp_menu) {
         // Join keeps its original behaviour for normal sessions: copy its first 5 bytes (push ebp; mov ebp, esp;
         // push -1) into a trampoline that jumps back after them.

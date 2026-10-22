@@ -202,9 +202,58 @@ void ReceiveUpload(SOCKET c, const char* req) {  // host, file server thread
     InterlockedExchange(&g_upload_ready, 1);
 }
 
+// A private-screen delta too big for lockstep (private_sync.inc: a new recruit with full gear, several at once): the
+// host keeps the last one in memory. "DPUT <hash> <size>\n" + bytes (a joiner talker uploads it, answered "OK\n");
+// "DGET <hash>\n" -> "DELTA <size>\n" + bytes, or "NONE\n" when the host has no delta with that hash.
+uint8_t* g_big_delta = nullptr;
+uint32_t g_big_size = 0, g_big_hash = 0;
+
+void StoreBigDelta(const uint8_t* p, uint32_t n, uint32_t hash) {  // under g_serve_lock
+    free(g_big_delta);
+    g_big_delta = static_cast<uint8_t*>(malloc(n ? n : 1));
+    memcpy(g_big_delta, p, n);
+    g_big_size = n;
+    g_big_hash = hash;
+}
+
+void ServeDelta(SOCKET c, const char* req) {  // host, file server thread
+    unsigned hash = 0;
+    long size = 0;
+    if (strncmp(req, "DPUT ", 5) == 0) {
+        if (sscanf_s(req, "DPUT %x %ld", &hash, &size) != 2 || size <= 0 || size > 16 * 1024 * 1024) return;
+        uint8_t* data = static_cast<uint8_t*>(malloc(size));
+        bool ok = RecvAll(c, reinterpret_cast<char*>(data), size);
+        if (ok) {
+            EnterCriticalSection(&g_serve_lock);
+            StoreBigDelta(data, static_cast<uint32_t>(size), hash);
+            LeaveCriticalSection(&g_serve_lock);
+            SendAll(c, "OK\n", 3);
+        }
+        free(data);
+        Log("host: %s a delta from a joiner (%ld bytes, hash %08x)", ok ? "received" : "FAILED to receive", size, hash);
+        return;
+    }
+    if (sscanf_s(req, "DGET %x", &hash) != 1) return;
+    EnterCriticalSection(&g_serve_lock);
+    bool have = g_big_delta && g_big_hash == hash;
+    uint32_t n = have ? g_big_size : 0;
+    uint8_t* copy = have ? static_cast<uint8_t*>(malloc(n)) : nullptr;
+    if (copy) memcpy(copy, g_big_delta, n);
+    LeaveCriticalSection(&g_serve_lock);
+    char line[40];
+    int hl = have ? sprintf_s(line, "DELTA %u\n", n) : sprintf_s(line, "NONE\n");
+    bool ok = SendAll(c, line, hl) && (!have || SendAll(c, reinterpret_cast<char*>(copy), n));
+    free(copy);
+    Log("host: %s the delta %08x to a joiner (%u bytes)", have ? (ok ? "sent" : "FAILED to send") : "does not have", hash, n);
+}
+
 void ServeOne(SOCKET c) {
     char req[80];
     if (!RecvLine(c, req, sizeof(req))) return;
+    if (strncmp(req, "DPUT ", 5) == 0 || strncmp(req, "DGET ", 5) == 0) {
+        ServeDelta(c, req);
+        return;
+    }
     char name[260];
     unsigned id = 0;
     char who[32] = "", state = 'W';
@@ -378,6 +427,30 @@ bool FetchSave() {
     if (!ok) Log("join: could not get the host's save yet (error %d), will retry", WSAGetLastError());
     if (s != INVALID_SOCKET) closesocket(s);
     return ok;
+}
+
+// Joiner: a big delta to the host (DPUT) or from it (DGET). Blocking, 10 s timeouts; false on failure.
+bool PutBigDelta(const uint8_t* p, uint32_t n, uint32_t hash) {
+    SOCKET s = ConnectHost();
+    char line[64];
+    int hl = sprintf_s(line, "DPUT %08x %u\n", hash, n);
+    char reply[16] = "";
+    bool ok = s != INVALID_SOCKET && SendAll(s, line, hl) && SendAll(s, reinterpret_cast<const char*>(p), n) &&
+              RecvLine(s, reply, sizeof(reply)) && strcmp(reply, "OK") == 0;
+    if (s != INVALID_SOCKET) closesocket(s);
+    return ok;
+}
+
+uint32_t GetBigDelta(uint32_t hash, uint8_t* out, uint32_t cap) {
+    SOCKET s = ConnectHost();
+    char line[64];
+    int hl = sprintf_s(line, "DGET %08x\n", hash);
+    char reply[40] = "";
+    unsigned n = 0;
+    bool ok = s != INVALID_SOCKET && SendAll(s, line, hl) && RecvLine(s, reply, sizeof(reply)) &&
+              sscanf_s(reply, "DELTA %u", &n) == 1 && n <= cap && RecvAll(s, reinterpret_cast<char*>(out), n);
+    if (s != INVALID_SOCKET) closesocket(s);
+    return ok ? n : 0;
 }
 
 // Joiner: ask the host for its current generation every 2 s (background thread, never touches game state).
