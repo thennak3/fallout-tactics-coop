@@ -861,6 +861,7 @@ bool g_session_coop = false;  // host: the current session came from a co-op lob
 DWORD g_main_thread_id = 0;
 #include "bot_scenarios.inc"
 #include "dots.inc"
+#include "drift.inc"
 
 
 // On a hang, log where the game's main thread is: EIP and BOS.exe return addresses on its stack.

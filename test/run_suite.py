@@ -20,6 +20,7 @@ SUITE = [
     ("fetch_save without the transfer (mutation)", ["fetch_save", "--mutate-fetch", "--timeout", "60"], "FAIL"),
     ("resync (mid-mission save + reload, joiner follows)", ["resync", "--timeout", "90"], "PASS"),
     ("resync without following (mutation)", ["resync", "--mutate-follow", "--timeout", "90"], "FAIL"),
+    ("drift_host (the joiner's game drifts on purpose; the host notices and re-syncs)", ["drift_host", "--timeout", "240"], "PASS"),
     ("transition (mission -> world map -> mission)", ["transition", "--timeout", "90"], "PASS"),
     ("menu_join (roles from the Multiplayer menu)", ["menu_join", "--timeout", "90"], "PASS"),
     ("dropin (joiner arrives mid-session)", ["dropin", "--timeout", "120"], "PASS"),
