@@ -61,6 +61,7 @@ struct Joiner {
     char state;     // W, L or P (see above)
     long gen;       // generation the joiner loaded
     DWORD last_seen, last_resync;
+    int colour;     // selection dots: 1..3 (blue, yellow, green), 0 none yet (the host is red)
 };
 Joiner g_joiners[8] = {};
 int g_joiner_count = 0;
@@ -247,9 +248,15 @@ void ServeDelta(SOCKET c, const char* req) {  // host, file server thread
     Log("host: %s the delta %08x to a joiner (%u bytes)", have ? (ok ? "sent" : "FAILED to send") : "does not have", hash, n);
 }
 
+void ServeSelection(SOCKET c, const char* req);  // dots.inc
+
 void ServeOne(SOCKET c) {
-    char req[80];
+    char req[200];
     if (!RecvLine(c, req, sizeof(req))) return;
+    if (strncmp(req, "SEL ", 4) == 0) {
+        ServeSelection(c, req);
+        return;
+    }
     if (strncmp(req, "DPUT ", 5) == 0 || strncmp(req, "DGET ", 5) == 0) {
         ServeDelta(c, req);
         return;

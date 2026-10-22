@@ -1272,11 +1272,14 @@ void PrivateCloseStep() {  // frame hook, and the mission screen's tick (the wor
     }
 }
 
+void DotsFrame();  // dots.inc
+
 uint32_t __fastcall FrameTickHook(uint8_t* client) {
     g_client_ptr = client;
     __try {
         ReapplyBookkeeping();
         RunDeferredCreates();  // shop_sync.inc
+        DotsFrame();           // dots.inc
         if (g_test.enabled) DebugDumpActors();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("co-op: exception 0x%08x re-applying delta bookkeeping", GetExceptionCode());
