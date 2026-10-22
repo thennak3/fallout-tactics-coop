@@ -1,4 +1,4 @@
-// ---- Selection dots: a coloured dot on a squad portrait for every player who has that character selected ----
+// ---- Selection dots: a coloured dot above a squad member's name tab for every player who has them selected ----
 // Included from netlog.cpp after bot_scenarios.inc. Not lockstep: each copy reads its own player's selection every
 // frame; joiners send theirs to the host on the file port ("SEL", about 5 times a second) and get every player's
 // back. Colours go by join order: the host red, then blue, yellow, green; a joiner that drops (no GEN poll for
@@ -8,6 +8,11 @@
 // {x0, y0, x1, y1} (ints, the window's own coordinates) in an ARGB colour (the portrait's selection frame). A portrait
 // draws only when invalidated: base slot 3 (0x6c7260, __thiscall(this)) invalidates the whole window. Slot 0
 // (0x4bcdf0, ret 4) is the destructor. A character is selected while its +0xb2 has bit 0x40.
+// The dots go above the name tabs, so they are drawn by the game view (vtable 0x804570, 800x472 above the bottom
+// panel; slot 4 0x4a0100 draws it, same signature; slot 0 0x4a34b0 the destructor). The game redraws only the view's
+// changed parts, so a change of dots repaints the whole view (window base slot 3). The bottom panel (vtable 0x80299c, a portrait's
+// +0x10e) holds the six name tabs (vtable 0x80805c, 80x30, panel coordinates) at +0xfe..+0x112 and the six portraits
+// in the same order at +0x147..+0x15b. Window rect {x0, y0, x1, y1} at +0xc3, relative to the parent.
 const uintptr_t kPortraitDrawSlot = 0x806d44 + 4 * 4;
 const uintptr_t kPortraitDraw = 0x4bc7d0;
 const uintptr_t kPortraitDtorSlot = 0x806d44;
@@ -15,7 +20,16 @@ const uintptr_t kPortraitDtor = 0x4bcdf0;
 const size_t kPortraitEntity = 0x153;
 typedef void(__fastcall* PortraitDrawFn)(void*, void*, void*);
 typedef void*(__fastcall* PortraitDtorFn)(void*, void*, unsigned);
+const uintptr_t kViewDrawSlot = 0x804570 + 4 * 4;
+const uintptr_t kViewDraw = 0x4a0100;
+const uintptr_t kPanelVtable = 0x80299c;
+const uintptr_t kTabVtable = 0x80805c;
 PortraitDrawFn g_portrait_draw = nullptr;
+PortraitDrawFn g_view_draw = nullptr;
+PortraitDtorFn g_view_dtor = nullptr;
+uint8_t* g_view = nullptr;  // main thread: the game view last seen drawing, until destroyed
+const uintptr_t kViewDtorSlot = 0x804570;
+const uintptr_t kViewDtor = 0x4a34b0;
 PortraitDtorFn g_portrait_dtor = nullptr;
 
 const uint32_t kDotColour[4] = {0xffe02828, 0xff3070ff, 0xffffd820, 0xff28d050};
@@ -147,11 +161,6 @@ void StartSelectionPoller() {
     CloseHandle(CreateThread(nullptr, 0, SelectionPoller, nullptr, 0, nullptr));
 }
 
-void InvalidatePortraits() {
-    for (uint8_t* p : g_portraits)
-        if (p) reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(p))[3])(p);
-}
-
 // Main thread, every client tick: read this player's selection; the host keeps the table; repaint on a change.
 void DotsFrame() {
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
@@ -199,7 +208,7 @@ void DotsFrame() {
     static char shown[400] = "";
     if (strcmp(table, shown) != 0) {
         strcpy_s(shown, table);
-        InvalidatePortraits();
+        if (g_view) reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(g_view))[3])(g_view);
         if (g_test.enabled) Log("dots: %s", table[0] ? table : "none");
     }
     if (!g_test.enabled || !world) return;
@@ -240,20 +249,46 @@ void __fastcall PortraitDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
             p = self;
             known = true;
         }
-    uint32_t id = *reinterpret_cast<uint32_t*>(self + kPortraitEntity);
-    uint16_t slot = static_cast<uint16_t>(id >> 16);
-    int x = 3;
+}
+
+int* Rect(uint8_t* w) { return reinterpret_cast<int*>(w + 0xc3); }
+
+void __fastcall ViewDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
+    g_view_draw(self, edx, renderer);
+    g_view = self;
+    uint8_t* panel = nullptr;
+    for (uint8_t* p : g_portraits)
+        if (p && !panel) panel = *reinterpret_cast<uint8_t**>(p + 0x10e);
+    if (!panel || *reinterpret_cast<uintptr_t*>(panel) != kPanelVtable) return;
     AcquireSRWLockShared(&g_dots_lock);
-    for (int k = 0; k < 4; k++) {
-        if (!g_dots[k].live) continue;
-        for (int i = 0; i < g_dots[k].n; i++)
-            if (g_dots[k].slots[i] == slot) {
-                DrawDot(renderer, x, 3, kDotColour[k]);
-                x += kDotSize + 3;
-                break;
-            }
+    for (int k = 0; k < 6; k++) {
+        uint8_t* tab = *reinterpret_cast<uint8_t**>(panel + 0xfe + 4 * k);
+        uint8_t* portrait = *reinterpret_cast<uint8_t**>(panel + 0x147 + 4 * k);
+        if (!tab || !portrait || *reinterpret_cast<uintptr_t*>(tab) != kTabVtable) continue;
+        uint16_t slot = static_cast<uint16_t>(*reinterpret_cast<uint32_t*>(portrait + kPortraitEntity) >> 16);
+        int colours[4], n = 0;
+        for (int c = 0; c < 4; c++) {
+            if (!g_dots[c].live) continue;
+            for (int i = 0; i < g_dots[c].n; i++)
+                if (g_dots[c].slots[i] == slot) {
+                    colours[n++] = c;
+                    break;
+                }
+        }
+        if (!n) continue;
+        // The tab's place in the view's coordinates (panel and view share a parent), the dots centred above it.
+        int tx0 = Rect(panel)[0] + Rect(tab)[0] - Rect(self)[0], tx1 = Rect(panel)[0] + Rect(tab)[2] - Rect(self)[0];
+        int ty = Rect(panel)[1] + Rect(tab)[1] - Rect(self)[1];
+        int width = n * kDotSize + (n - 1) * 3;
+        int x = (tx0 + tx1 - width) / 2, y = ty - kDotSize - 3;
+        for (int i = 0; i < n; i++, x += kDotSize + 3) DrawDot(renderer, x, y, kDotColour[colours[i]]);
     }
     ReleaseSRWLockShared(&g_dots_lock);
+}
+
+void* __fastcall ViewDtorHook(uint8_t* self, void* edx, unsigned flags) {
+    if (g_view == self) g_view = nullptr;
+    return g_view_dtor(self, edx, flags);
 }
 
 void* __fastcall PortraitDtorHook(uint8_t* self, void* edx, unsigned flags) {
@@ -304,6 +339,9 @@ void InstallDots() {
     Log("co-op: portrait hooks %s, %s (selection dots)",
         PatchSlot(kPortraitDrawSlot, kPortraitDraw, (void*)&PortraitDrawHook, &g_portrait_draw) ? "ok" : "FAILED",
         PatchSlot(kPortraitDtorSlot, kPortraitDtor, (void*)&PortraitDtorHook, &g_portrait_dtor) ? "ok" : "FAILED");
+    Log("co-op: view hook %s (selection dots above the name tabs)",
+        PatchSlot(kViewDrawSlot, kViewDraw, (void*)&ViewDrawHook, &g_view_draw) &&
+                PatchSlot(kViewDtorSlot, kViewDtor, (void*)&ViewDtorHook, &g_view_dtor) ? "ok" : "FAILED");
 }
 
 void StartShotThread() {  // after the test config is read
