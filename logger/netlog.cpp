@@ -403,6 +403,18 @@ bool PatchJmp(uintptr_t site, const uint8_t* expect, size_t n, void* hook) {
     return true;
 }
 
+// Jump from `fn` to `hook`; returns a trampoline that runs the `n` bytes overwritten (whole instructions, none
+// relative) and jumps back after them, or nullptr when the bytes there are not `prologue`.
+uint8_t* HookWithTrampoline(uintptr_t fn, const uint8_t* prologue, size_t n, void* hook) {
+    if (n < 5 || n > 16 || memcmp(reinterpret_cast<void*>(fn), prologue, n) != 0) return nullptr;
+    uint8_t* t = static_cast<uint8_t*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!t) return nullptr;
+    memcpy(t, reinterpret_cast<void*>(fn), n);
+    t[n] = 0xe9;
+    *reinterpret_cast<int32_t*>(t + n + 1) = static_cast<int32_t>((fn + n) - reinterpret_cast<uintptr_t>(t + n + 5));
+    return PatchJmp(fn, prologue, n, hook) ? t : nullptr;
+}
+
 bool PatchCall(uintptr_t site, uintptr_t expect_target, void* hook) {
     uint8_t* p = reinterpret_cast<uint8_t*>(site);
     if (p[0] != 0xe8 || site + 5 + *reinterpret_cast<int32_t*>(p + 1) != expect_target) return false;
@@ -528,6 +540,29 @@ uint8_t* g_client_ptr = nullptr;        // the local Client (frame hook)
 const DWORD kPrivateClosedMs = 300;     // no private screen ticked for this long: closed
 bool g_talker_hold = false;             // this copy holds its own world while its private screens are up
 bool g_private_recruit = false;         // the recruit screen was among them (private_sync.inc: a full re-sync)
+// [coop] shop_no_pause (experimental): a conversation with anyone but a recruiter pauses nobody. Its talker's world
+// keeps running (the conversation's own pause, World+0x2db via 0x4fc800, is swallowed on that copy) and no other copy
+// holds.
+bool g_shop_no_pause = false;
+bool g_conv_light = false;              // the last talk was to someone who is not a recruiter
+bool g_suppress_pause = false;          // this copy swallows pause-counter changes (its light conversation is up)
+int g_suppressed = 0;                   // their balance: +1 per pause swallowed, -1 per unpause
+uint8_t* g_pause_trampoline = nullptr;  // the game's pause-counter change, 0x4fc800 (__thiscall(World*, bool), ret 4)
+
+void __fastcall PauseHook(void* world, void* /*edx*/, int on) {
+    if (g_suppress_pause) {
+        g_suppressed += (on & 0xff) ? 1 : -1;
+        Log("co-op: swallowed the game's %s (balance %d)", (on & 0xff) ? "pause" : "resume", g_suppressed);
+        return;
+    }
+    reinterpret_cast<void(__thiscall*)(void*, int)>(g_pause_trampoline)(world, on);
+}
+
+// The mod's own holds: past the hook, never swallowed.
+void WorldPause(void* world, bool on) {
+    reinterpret_cast<void(__thiscall*)(void*, int)>(g_pause_trampoline ? g_pause_trampoline : reinterpret_cast<uint8_t*>(0x4fc800))(
+        world, on ? 1 : 0);
+}
 const DWORD kTalkWindowMs = 10000;      // a conversation opening this soon after a talk command is that command's
 
 PrivateKind PrivateKindOf(uint8_t* w) {
@@ -565,7 +600,13 @@ uint8_t* g_send_trampoline = nullptr;
 bool RefuseLockedTalk(uint8_t* msg, int len);  // private_sync.inc
 void SendTalkClaim(void* client, const uint8_t* msg, int len);  // private_sync.inc
 
+int RefuseShopperOrders(uint8_t* msg, int len);  // shop_sync.inc
+
 char __fastcall ClientSendHook(void* self, void* /*edx*/, const uint8_t* msg, int len, int reliable) {
+    if (g_coop_host || g_coop_join) {
+        len = RefuseShopperOrders(const_cast<uint8_t*>(msg), len);
+        if (!len) return 1;  // nothing left: not sent
+    }
     if ((g_coop_host || g_coop_join) && HasTalkCommand(msg, len) && RefuseLockedTalk(const_cast<uint8_t*>(msg), len))
         return 1;  // a talk to an NPC another player is talking to: not sent
     if ((g_coop_host || g_coop_join) && HasTalkCommand(msg, len)) {  // only clients send type 2 (servers: type 1)
@@ -637,7 +678,7 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
             if (closed != w) {
                 closed = w;
                 Log("co-op: %s opened for another player's conversation: closing it here", RttiName(w));
-                HostHoldForOther();  // every other copy waits on this frame (private_sync.inc)
+                if (!g_conv_light) HostHoldForOther();  // every other copy waits on this frame (private_sync.inc)
             }
             g_end_game_mode = true;
             return;
@@ -653,8 +694,11 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
         // This copy's world waits too, as every other copy's does, until the diff is made: it used to run one frame
         // after the screens closed and before the diff, while the others ran that frame only after applying the delta,
         // and NPCs walking in that frame then went their own way on this copy (recruit_host, 3 players).
-        if (world && !g_talker_hold) {
-            reinterpret_cast<void(__thiscall*)(void*, int)>(0x4fc800)(world, 1);  // the pause counter, World+0x2db
+        if (world && !g_talker_hold && !g_conv_light) {
+            if (g_test.enabled)
+                Log("co-op: pause counter World+0x2db = %d at the conversation (before this copy's hold)",
+                    *reinterpret_cast<int*>(world + 0x2db));
+            WorldPause(world, true);  // the pause counter, World+0x2db
             g_talker_hold = true;
         }
     }
@@ -668,7 +712,7 @@ void ReleaseTalkerHold() {  // after the diff: this copy's world goes on with ev
     if (!g_talker_hold) return;
     g_talker_hold = false;
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
-    if (world) reinterpret_cast<void(__thiscall*)(void*, int)>(0x4fc800)(world, 0);
+    if (world) WorldPause(world, false);
 }
 
 bool PrivateScreensClosed() {
@@ -1460,6 +1504,18 @@ void Init() {
     g_mp_menu = GetPrivateProfileIntA("coop", "mp_menu", 1, ".\\ftcoop.ini") != 0;
     g_lockstep_chunks = GetPrivateProfileIntA("coop", "lockstep_chunks", 300, ".\\ftcoop.ini");
     g_recreate_recruits = GetPrivateProfileIntA("coop", "recreate_recruits", 0, ".\\ftcoop.ini");
+    g_shop_no_pause = GetPrivateProfileIntA("coop", "shop_no_pause", 1, ".\\ftcoop.ini") != 0;
+    {
+        static const uint8_t kPausePrologue[] = {0x8a, 0x44, 0x24, 0x04, 0x84, 0xc0};  // mov al, [esp+4]; test al, al
+        g_pause_trampoline = HookWithTrampoline(0x4fc800, kPausePrologue, sizeof(kPausePrologue), (void*)&PauseHook);
+        Log("co-op: pause-counter hook %s", g_pause_trampoline ? "ok" : "FAILED");
+        static const uint8_t kBarterPrologue[] = {0x66, 0x8b, 0x81, 0x00, 0x01, 0x00, 0x00};  // mov ax, [ecx+0x100]
+        g_barter_trampoline = HookWithTrampoline(0x4d0000, kBarterPrologue, sizeof(kBarterPrologue), (void*)&BarterButtonHook);
+        static const uint8_t kQmDtorPrologue[] = {0x6a, 0xff, 0x68, 0x90, 0xfd, 0x7b, 0x00};  // push -1; push 0x7bfd90
+        g_qm_dtor_trampoline = HookWithTrampoline(0x454f40, kQmDtorPrologue, sizeof(kQmDtorPrologue), (void*)&QmDtorHook);
+        Log("co-op: barter hook %s, shop close hook %s", g_barter_trampoline ? "ok" : "FAILED",
+            g_qm_dtor_trampoline ? "ok" : "FAILED");
+    }
     if (g_mp_menu) {
         // Join keeps its original behaviour for normal sessions: copy its first 5 bytes (push ebp; mov ebp, esp;
         // push -1) into a trampoline that jumps back after them.

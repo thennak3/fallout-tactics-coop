@@ -35,7 +35,10 @@
 // winner from the claim it relays (four bots talking to the merchant at once: all three joiners took it as theirs). A copy refuses its own player's talk to a locked NPC; the host drops
 // a talk to a locked NPC from anyone else (two players clicking at the same moment).
 const uint8_t kCoopCmd = 0x30;
-enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4 };
+enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6 };  // 5, 6: shop_sync.inc
+uint16_t g_shop_new[16];  // test mode: a shop deal's new stacks, followed through the close (shop_sync.inc)
+int g_shop_new_n = 0;
+bool g_applying_at_frame = false;  // ApplyDelta from a delta at its frame: no second write of the bookkeeping
 enum { kDiffNone = 0, kDiffApplied = 1, kDiffFull = 2 };
 const size_t kWorldFreeHead = 0x74f;
 const uintptr_t kEntitySerial = 0x8be148;
@@ -365,6 +368,31 @@ struct DeltaWriter {
     void U32(uint32_t v) { Put(&v, 4); }
 };
 
+// An entity's template name (Entity +0x199, a FOTString: "pullTabs.ent"): made from its bytes on another copy, it took
+// the temporary file's name instead ("ftcoop_entity.tmp"), and a quartermaster's stock list, rebuilt from the names of
+// what is left in the shop, then differed (trade, shop_no_pause). So 'C' carries it: u16 length, ASCII.
+void PutEntityName(DeltaWriter& w, uint8_t* ent) {
+    char name[260] = "";
+    int len = 0;
+    __try {
+        const wchar_t* nm = ent ? *reinterpret_cast<wchar_t**>(ent + 0x199) : nullptr;
+        for (; nm && nm[len] && len < 259; len++) name[len] = nm[len] < 0x80 ? static_cast<char>(nm[len]) : '?';
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        len = 0;
+    }
+    w.U16(static_cast<uint16_t>(len));
+    w.Put(name, len);
+}
+
+void SetEntityName(uint8_t* ent, const uint8_t* name, int len) {
+    if (!ent || len <= 0 || len > 259) return;
+    char buf[260];
+    memcpy(buf, name, len);
+    buf[len] = 0;
+    void* str = MakeFOTString(buf);
+    reinterpret_cast<void*(__thiscall*)(void*, void**)>(kStringAssign)(ent + 0x199, &str);
+}
+
 void ParseInv(const char* s, uint16_t* items, int* counts, int* n, int max) {
     *n = 0;
     if (!s || !*s || *s == '-' || *s == '?') return;
@@ -432,8 +460,19 @@ uint32_t Decompress(const uint8_t* src, uint32_t n, uint8_t* dst, uint32_t cap) 
     return out;
 }  // this copy sent the delta now in flight: do not apply it to ourselves
 
+// What PrivateScreensDiff looks at: 0 everything (a held conversation); 1 the quest variables only (a conversation
+// that paused nobody: the world ran meanwhile); 2 a shop's deal only (shop_sync.inc: the buyer's and merchant's
+// inventories). And the kind of its last record (kShopClose for a shop).
+int g_diff_mode = 0;
+uint8_t g_done_kind = kSyncDone;
+struct ShopState;
+extern ShopState g_shop;
+int ShopDealDiff(DeltaWriter& w, uint8_t* world, const SlotState* now, int count);  // below
+
 int PrivateScreensDiff() {
     LogAiFlags("at the diff");
+    g_delta_b_off = -1;
+    int mode = g_diff_mode;
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     int result = kDiffNone;
     DeltaWriter w = {g_delta, 0, kMaxDelta, false};
@@ -481,7 +520,15 @@ int PrivateScreensDiff() {
         // visit is the old save and reload.
         extern bool g_private_recruit;
         if (g_private_recruit && !g_recreate_recruits) var_fail = "the squad at the recruit screen";
-        if (var_fail || count != g_snap_count) {
+        if (mode == 1 && !var_fail) {  // the variables only
+            w.U8('E');
+            result = nvars ? kDiffApplied : kDiffNone;
+            Log("co-op: a conversation that paused nobody changed %d variables", nvars);
+        } else if (mode == 2) {  // the variables written above, then the deal
+            int n = ShopDealDiff(w, world, now, count);
+            w.U8('E');
+            result = n || nvars ? kDiffApplied : kDiffNone;
+        } else if (var_fail || count != g_snap_count) {
             Log("co-op: private screens changed %s: full re-sync", var_fail ? var_fail : "the entity table size");
             result = kDiffFull;
         } else {
@@ -583,6 +630,7 @@ int PrivateScreensDiff() {
                     w.U32(*reinterpret_cast<uint32_t*>(EntityById(world, static_cast<uint16_t>(i)) + 0x5d));
                     w.U32(static_cast<uint32_t>(n));
                     w.Put(bytes, n);
+                    PutEntityName(w, EntityById(world, static_cast<uint16_t>(i)));
                     news++;
                     uint8_t* ent = EntityById(world, static_cast<uint16_t>(i));
                     Log("co-op: new entity %u (%s): %d bytes, serial %u%s", i, RttiName(ent), n, serial_of(static_cast<uint16_t>(i)),
@@ -750,7 +798,7 @@ int PrivateScreensDiff() {
         // The talker too: its own destroys (a dismissed member, the shop's stock) finish during the next frame and
         // change its free list after this diff; write the bookkeeping it sent again after that frame, as the others
         // do (recruit_join: the recruiter's entity table differed from everyone else's from then on).
-        if (g_delta_b_off >= 0) {
+        if (g_delta_b_off >= 0 && mode == 0) {  // a shop's bookkeeping is written before its close, once
             g_reapply_b = g_delta + g_delta_b_off;
             g_reapply_wait = 1;
         }
@@ -760,9 +808,9 @@ int PrivateScreensDiff() {
         }
         g_deferred_mine = false;
     }
-    CoopRecord(recs[nrec], kSyncDone, 0);
+    CoopRecord(recs[nrec], g_done_kind, 0);
     recs[nrec][7] = static_cast<uint8_t>(result);
-    recs[nrec][8] = (packed ? 1 : 0) | (via_file ? 2 : 0);
+    recs[nrec][8] = (packed ? 1 : 0) | (via_file ? 2 : 0) | (mode != 0 ? 4 : 0);  // 4: applied at its frame
     uint32_t hash = Fnv(2166136261u, body, size);
     memcpy(recs[nrec] + 9, &size, 4);
     memcpy(recs[nrec] + 13, &hash, 4);
@@ -953,7 +1001,70 @@ void ReapplyBookkeeping() {
     g_reapply_b = nullptr;
 }
 
-struct NewEntity { uint16_t slot; int16_t seq; uint32_t serial, size; const uint8_t* bytes; };
+struct NewEntity { uint16_t slot; int16_t seq; uint32_t serial, size; const uint8_t* bytes; const uint8_t* name; int nlen; };
+
+// Creates that wait for their slot (its old entity's destroy finishes during the next frame), with the bookkeeping the
+// talker had for that slot ('B'), written again once made.
+struct DeferredNew { NewEntity ne; uint8_t* copy; bool have_b; uint16_t next_free; int16_t seq; };
+DeferredNew g_deferred_new[16];
+int g_ndeferred_new = 0;
+uint8_t* g_frame_b = nullptr;  // a delta-at-its-frame's bookkeeping, written at the start of the next frame
+
+bool DeferCreate(const NewEntity& ne) {
+    if (g_ndeferred_new == 16 || !g_applying_at_frame) return false;
+    DeferredNew& d = g_deferred_new[g_ndeferred_new++];
+    d = {};
+    d.copy = static_cast<uint8_t*>(malloc(ne.size + ne.nlen + 1));
+    memcpy(d.copy, ne.bytes, ne.size);
+    memcpy(d.copy + ne.size, ne.name, ne.nlen);
+    d.ne = ne;
+    d.ne.bytes = d.copy;
+    d.ne.name = d.copy + ne.size;
+    return true;
+}
+
+// An entity keeps its own EntityID too (a GenericItem at +0x146: {seq, slot}). Made here with the seq the table gave
+// it, then given the talker's seq in the table, it no longer matched itself and the game would not destroy it (the
+// paid ringpulls stayed when the shop's stock was destroyed, shop_no_pause). Each {made seq, slot} pair in its first
+// 0x400 bytes becomes {talker's seq, slot}.
+void FixSelfId(uint8_t* ent, uint16_t slot, int16_t made, int16_t seq) {
+    if (!ent || made == seq) return;
+    int patched = 0;
+    for (int off = 8; off + 4 <= 0x400; off++) {
+        int16_t sq;
+        uint16_t sl;
+        __try {
+            memcpy(&sq, ent + off, 2);
+            memcpy(&sl, ent + off + 2, 2);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        if (sq != made || sl != slot) continue;
+        memcpy(ent + off, &seq, 2);
+        patched++;
+        if (g_test.enabled) Log("co-op: entity %u keeps its own id at +0x%x: seq %d -> %d", slot, off, made, seq);
+    }
+    if (!patched && g_test.enabled) Log("co-op: entity %u: no copy of its own id found (seq %d -> %d)", slot, made, seq);
+}
+
+// Take a free slot out of the free list (head World+0x74f, links in each entry's next_free).
+void UnlinkFree(uint8_t* world, uint16_t slot) {
+    uint8_t* e = Entries(world);
+    uint16_t* head = reinterpret_cast<uint16_t*>(world + kWorldFreeHead);
+    int n = EntityCount(world);
+    if (*head == slot) {
+        *head = *reinterpret_cast<uint16_t*>(e + slot * 8 + 4);
+        return;
+    }
+    for (int cur = *head, steps = 0; cur > 0 && cur < n && steps < n; steps++) {
+        uint16_t next = *reinterpret_cast<uint16_t*>(e + cur * 8 + 4);
+        if (next == slot) {
+            *reinterpret_cast<uint16_t*>(e + cur * 8 + 4) = *reinterpret_cast<uint16_t*>(e + slot * 8 + 4);
+            return;
+        }
+        cur = next;
+    }
+}
 
 // Create the talker's new entities in their slots. For each one not yet made (by its parent), the free list is chained
 // through the slots still free, in the talker's order, so its children take the next ones as on the talker's copy.
@@ -970,16 +1081,23 @@ int ApplyNewEntities(uint8_t* world, NewEntity* ne, int nn, int* made, int* kids
     static bool done[1024];
     for (int k = 0; k < nn; k++) {
         done[k] = false;
-        if (used(ne[k].slot)) {
-            Log("co-op: slot %u is in use here: cannot create the talker's entity", ne[k].slot);
-            conflicts++;
+        if (!used(ne[k].slot)) continue;
+        uint8_t* occupant = EntityById(world, ne[k].slot);
+        if (occupant[0x141] && DeferCreate(ne[k])) {  // freed and reused within the deal: made after the destroy is done
+            Log("co-op: slot %u still holds something being destroyed: the talker's entity is made next frame", ne[k].slot);
             done[k] = true;
+            continue;
         }
+        Log("co-op: slot %u is in use here: cannot create the talker's entity", ne[k].slot);
+        conflicts++;
+        done[k] = true;
     }
     *made = *kids = 0;
     for (int k = 0; k < nn; k++) {
         if (done[k]) continue;
         uint16_t* head = reinterpret_cast<uint16_t*>(world + kWorldFreeHead);
+        for (int j = k; j < nn; j++)  // each slot out of wherever it is in the free list, so it is not handed out twice
+            if (!done[j] && !used(ne[j].slot)) UnlinkFree(world, ne[j].slot);
         uint16_t old = *head;
         int last = -1;
         for (int j = nn - 1; j >= k; j--) {  // head -> ne[k] -> the next free ones -> the old head
@@ -990,6 +1108,7 @@ int ApplyNewEntities(uint8_t* world, NewEntity* ne, int nn, int* made, int* kids
         *head = ne[k].slot;
         uint16_t got = CreateEntityChained(world, ne[k].bytes, ne[k].size);
         e = Entries(world);
+        if (got) SetEntityName(EntityById(world, got), ne[k].name, ne[k].nlen);
         if (got != ne[k].slot) {
             Log("co-op: the talker's entity for slot %u landed in slot %u", ne[k].slot, got);
             conflicts++;
@@ -997,10 +1116,13 @@ int ApplyNewEntities(uint8_t* world, NewEntity* ne, int nn, int* made, int* kids
         for (int j = k; j < nn; j++) {  // it and whatever came with it
             if (done[j] || !used(ne[j].slot)) continue;
             done[j] = true;
+            int16_t made_seq = *reinterpret_cast<int16_t*>(e + ne[j].slot * 8 + 6);
             *reinterpret_cast<int16_t*>(e + ne[j].slot * 8 + 6) = ne[j].seq;
+            FixSelfId(EntityById(world, ne[j].slot), ne[j].slot, made_seq, ne[j].seq);
             *reinterpret_cast<uint32_t*>(EntityById(world, ne[j].slot) + 0x5d) = ne[j].serial;
             if (j == k) (*made)++;
             else (*kids)++;
+            if (g_applying_at_frame && g_shop_new_n < 16) g_shop_new[g_shop_new_n++] = ne[j].slot;
         }
     }
     for (int k = 0; k < nn; k++) {
@@ -1032,7 +1154,7 @@ void ApplyDelta(const uint8_t* data, int len) {
         if (op == 'D') {
             uint16_t slot = r.U16();
             uint8_t* ent = slot < EntityCount(world) ? *reinterpret_cast<uint8_t**>(e + slot * 8) : nullptr;
-            if (ent && ent != dummy) {
+            if (ent && ent != dummy && !ent[0x141]) {  // not one already being destroyed
                 if (g_test.enabled) Log("co-op: delta: destroying entity %u (%s)", slot, RttiName(ent));
                 static uint8_t before[0x200];
                 if (g_test.enabled) memcpy(before, ent, sizeof(before));
@@ -1063,6 +1185,13 @@ void ApplyDelta(const uint8_t* data, int len) {
                 }
                 x.bytes = r.p;
                 r.p += x.size;
+                x.nlen = r.U16();
+                if (!r.Has(x.nlen)) {
+                    r.bad = true;
+                    break;
+                }
+                x.name = r.p;
+                r.p += x.nlen;
                 nn++;
                 more = r.Has(1) && *r.p == 'C';
                 if (more) r.p++;
@@ -1156,15 +1285,35 @@ void ApplyDelta(const uint8_t* data, int len) {
             int had = RewriteIdList(lhead, slots, seqs, n);
             Log("co-op: squad rewritten: %d -> %d members (list size field was %d)", had, n, *size);
             if (*size == had) *size = n;
+        } else if (op == 'B' && g_applying_at_frame && (destroyed || g_ndeferred_new)) {
+            // Destroys just started finish during the next frame and would change these entries again: the
+            // bookkeeping (and the shop's close after it) waits for the start of that frame (RunDeferredCreates).
+            uint16_t nb_;
+            memcpy(&nb_, r.p + 8, 2);
+            int n = 10 + nb_ * 6;
+            if (!r.Has(n)) break;
+            free(g_frame_b);
+            g_frame_b = static_cast<uint8_t*>(malloc(n));
+            memcpy(g_frame_b, r.p, n);
+            r.p += n;
+            Log("co-op: delta: the bookkeeping waits for this frame's destroys (%d entries)", nb_);
         } else if (op == 'B') {
-            g_reapply_b = r.p;
-            g_reapply_wait = 1;  // the destroys finish during the next frame: write it again before the one after
+            if (!g_applying_at_frame) {
+                g_reapply_b = r.p;
+                g_reapply_wait = 1;  // the destroys finish during the next frame: write it again before the one after
+            }
             uint16_t count = r.U16(), head = r.U16();
             uint32_t serial = r.U32();
             int nb = r.U16();
             e = Entries(world);
             for (int i = 0; i < nb && !r.bad; i++) {
                 uint16_t slot = r.U16(), next_free = r.U16(), seq = r.U16();
+                for (int d = 0; d < g_ndeferred_new; d++)
+                    if (g_deferred_new[d].ne.slot == slot) {
+                        g_deferred_new[d].have_b = true;
+                        g_deferred_new[d].next_free = next_free;
+                        g_deferred_new[d].seq = static_cast<int16_t>(seq);
+                    }
                 if (slot < EntityCount(world)) {
                     *reinterpret_cast<uint16_t*>(e + slot * 8 + 4) = next_free;
                     *reinterpret_cast<uint16_t*>(e + slot * 8 + 6) = seq;
@@ -1208,7 +1357,7 @@ void HostHoldForOther() {
     LogAiFlags("holding");
     g_host_hold_npc = g_last_other_npc;
     g_host_hold_since = GetTickCount();
-    reinterpret_cast<void(__thiscall*)(void*, int)>(0x4fc800)(*reinterpret_cast<uint8_t**>(kWorldPtr), 1);  // World+0x2db
+    WorldPause(*reinterpret_cast<uint8_t**>(kWorldPtr), true);  // World+0x2db
     Log("co-op: holding the game while another player talks to NPC %u", g_host_hold_npc);
     Notice("Co-op: another player is talking to someone - the game waits for them");
 }
@@ -1217,7 +1366,7 @@ void HostReleaseHold(const char* why) {
     if (!g_host_hold_npc) return;
     Log("co-op: the game goes on (%s, held %lu ms)", why, GetTickCount() - g_host_hold_since);
     g_host_hold_npc = 0;
-    reinterpret_cast<void(__thiscall*)(void*, int)>(0x4fc800)(*reinterpret_cast<uint8_t**>(kWorldPtr), 0);  // World+0x2db
+    WorldPause(*reinterpret_cast<uint8_t**>(kWorldPtr), false);  // World+0x2db
 }
 
 void HostHoldTimeout() {  // window ticks (no frames run while held): a joiner that never finishes, or left
@@ -1313,6 +1462,9 @@ void SendTalkClaim(void* client, const uint8_t* msg, int len) {
     }
 }
 
+void QueueFrameDelta(uint8_t kind, bool ok, bool mine, const uint8_t* data, int len);  // shop_sync.inc
+void CoopCommandAtFrame(const uint8_t* r);                                              // shop_sync.inc
+
 void HandleCoopCommand(const uint8_t* r) {
     uint8_t kind = r[3], n = r[4];
     uint16_t npc;
@@ -1336,11 +1488,12 @@ void HandleCoopCommand(const uint8_t* r) {
             memcpy(g_rx_delta + g_rx_len, r + 5, n);
             g_rx_len += n;
         }
-    } else if (kind == kSyncDone) {
+    } else if (kind == kSyncDone || kind == kShopClose) {
         uint32_t size, hash, raw;
         memcpy(&size, r + 9, 4);
         memcpy(&hash, r + 13, 4);
         memcpy(&raw, r + 17, 4);
+        bool queued = false;
         if (r[7] == kDiffApplied) {
             static uint8_t plain[kMaxDelta];
             uint32_t got = 0;
@@ -1364,12 +1517,17 @@ void HandleCoopCommand(const uint8_t* r) {
                     Fnv(2166136261u, g_rx_delta, g_rx_len) == hash ? "ok" : "bad");
             } else if ((r[8] & 1) && ((got = Decompress(g_rx_delta, size, plain, sizeof(plain))) != raw || raw > kMaxDelta)) {
                 Log("co-op: delta did not decompress (%u of %u bytes): not applied", got, raw);
+            } else if (r[8] & 4) {  // at its frame (shop_sync.inc)
+                QueueFrameDelta(kind, true, false, (r[8] & 1) ? plain : g_rx_delta, static_cast<int>((r[8] & 1) ? raw : size));
+                queued = true;
             } else {
                 ApplyDelta((r[8] & 1) ? plain : g_rx_delta, static_cast<int>((r[8] & 1) ? raw : size));
             }
         }
+        if ((r[8] & 4) && !queued) QueueFrameDelta(kind, false, g_delta_mine, nullptr, 0);  // ours, or nothing to apply
         g_delta_mine = false;
         g_rx_len = 0;
+        if (kind == kShopClose) return;  // the conversation goes on: its NPC stays busy
         if (g_test.enabled) {  // test mode: dump some actors' memory for 100 frames, to diff the copies
             uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr);
             g_dump_until = w ? *reinterpret_cast<int*>(w + kWorldFrame) + 250 : 0;
@@ -1384,7 +1542,10 @@ void HandleCoopCommand(const uint8_t* r) {
 }
 
 void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
-    if (cmd && cmd[0] == kCoopCmd) return;  // handled when it arrived (CoopFromNetwork)
+    if (cmd && cmd[0] == kCoopCmd) {  // mostly handled when it arrived (CoopFromNetwork); some act at their frame
+        CoopCommandAtFrame(cmd);
+        return;
+    }
     if (cmd && cmd[0] == 0x17 && (g_coop_host || g_coop_join)) {  // a talk: that NPC is busy until kSyncDone
         uint16_t npc;
         memcpy(&npc, cmd + 5, 2);
@@ -1404,6 +1565,22 @@ void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
             l->since = GetTickCount();
         }
         Log("co-op: NPC %u is busy with %s", npc, mine ? "this player" : "another player");
+        // A recruiter (FTSE slot 252, IsRecruitMaster) changes the squad everyone plays: everyone waits, as before.
+        // Anyone else, with shop_no_pause: nobody waits, and the talker's own world keeps running.
+        extern bool g_shop_no_pause, g_conv_light, g_suppress_pause;
+        extern int g_suppressed;
+        uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+        uint8_t* who = world && npc < EntityCount(world) ? EntityById(world, npc) : nullptr;
+        bool recruiter = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f0 / 4])(who);
+        bool quartermaster = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f4 / 4])(who);
+        g_conv_light = g_shop_no_pause && quartermaster && !recruiter;
+        g_diff_mode = g_conv_light ? 1 : 0;
+        if (g_conv_light && mine) {
+            g_suppress_pause = true;
+            g_suppressed = 0;
+        }
+        Log("co-op: NPC %u is %s: %s", npc, recruiter ? "a recruiter" : quartermaster ? "a quartermaster" : "someone else",
+            g_conv_light ? "nobody waits" : "everyone waits while the conversation is up");
         if (!mine) g_last_other_npc = npc;
     }
     g_actor_act(actor, edx, cmd);
@@ -1552,4 +1729,104 @@ void BotChangeQuestVar(uint8_t* world) {
         }
     }
     Log("bot: QUEST VAR none to change");
+}
+
+#include "shop_sync.inc"
+
+// The deal (diff mode 2): only the buyer's and the merchant's inventories (the merchant's is the shop's stock now),
+// measured from the shop's opening, when the stock existed on every copy. New stacks (a split) are made from their bytes;
+// stacks gone (merged) are destroyed; no bookkeeping: the world ran on every copy meanwhile.
+int ShopDealDiff(DeltaWriter& w, uint8_t* world, const SlotState* now, int count) {
+    g_shop_new_n = 0;
+    uint16_t owners[2] = {SlotOf(g_shop.buyer), SlotOf(g_shop.merchant)};
+    static uint16_t a_items[2][200], b_items[2][200];
+    static int a_counts[2][200], b_counts[2][200];
+    int na[2] = {}, nb[2] = {};
+    char s[2048];
+    for (int k = 0; k < 2; k++) {
+        const ActorSnap* before = SnapOf(owners[k]);
+        ParseInv(before ? before->inv : "", b_items[k], b_counts[k], &nb[k], 200);
+        if (InvString(world, owners[k], s, sizeof(s))) ParseInv(s, a_items[k], a_counts[k], &na[k], 200);
+    }
+    int ops = 0;
+    auto fresh = [&](uint16_t id) { return id < count && (!g_snap_slots[id].used || g_snap_slots[id].seq != now[id].seq); };
+    for (int k = 0; k < 2; k++)  // 'D' first: stacks that were there and are gone (merged, or spent); a slot freed may be reused by a new stack
+        for (int j = 0; j < nb[k]; j++) {
+            uint16_t id = b_items[k][j];
+            uint8_t* ent = id < count && now[id].used ? EntityById(world, id) : nullptr;
+            bool gone = !ent || now[id].seq != g_snap_slots[id].seq || ent[0x141];
+            bool elsewhere = false;
+            for (int m = 0; m < 2 && !elsewhere; m++)
+                for (int i = 0; i < na[m] && !elsewhere; i++) elsewhere = a_items[m][i] == id;
+            if (!gone || (elsewhere && !fresh(id))) continue;  // the same slot with a new seq is another entity
+            w.U8('D');
+            w.U16(id);
+            ops++;
+        }
+    for (int k = 0; k < 2; k++)  // 'C': new stacks
+        for (int i = 0; i < na[k] && !w.overflow; i++) {
+            uint16_t id = a_items[k][i];
+            if (!fresh(id)) continue;
+            int n = 0;
+            uint8_t* bytes = SerializeEntity(world, id, &n);
+            if (!bytes || n <= 0) continue;
+            w.U8('C');
+            w.U16(id);
+            w.U16(static_cast<uint16_t>(now[id].seq));
+            w.U32(*reinterpret_cast<uint32_t*>(EntityById(world, id) + 0x5d));
+            w.U32(static_cast<uint32_t>(n));
+            w.Put(bytes, n);
+            PutEntityName(w, EntityById(world, id));
+            ops++;
+            Log("co-op: shop: new stack %u (%s) in the %s's inventory, %d bytes", id, RttiName(EntityById(world, id)),
+                k ? "merchant" : "buyer", n);
+            if (g_shop_new_n < 16) g_shop_new[g_shop_new_n++] = id;
+        }
+    for (int k = 0; k < 2; k++)  // 'N': stack counts
+        for (int i = 0; i < na[k]; i++) {
+            if (fresh(a_items[k][i])) continue;
+            int was = -1;
+            for (int j = 0; j < nb[k]; j++)
+                if (b_items[k][j] == a_items[k][i]) was = b_counts[k][j];
+            if (was == a_counts[k][i]) continue;
+            w.U8('N');
+            w.U16(a_items[k][i]);
+            w.U32(static_cast<uint32_t>(a_counts[k][i]));
+            ops++;
+        }
+    for (int k = 0; k < 2; k++) {  // 'I': the lists
+        bool same = na[k] == nb[k] && memcmp(a_items[k], b_items[k], na[k] * sizeof(uint16_t)) == 0;
+        if (same) continue;
+        w.U8('I');
+        w.U16(owners[k]);
+        PutIdList(w, world, a_items[k], na[k]);
+        ops++;
+    }
+    // 'B': the table's bookkeeping, as the shopper has it now. Its barter screen made and destroyed stacks during the
+    // deal (offer-table splits, merges) that nobody else made: their seq numbers and the free list's order differ
+    // otherwise (trade_host, shop_no_pause). Written on the other copies before their close, so both run the same
+    // close from the same table. Entries the world changed meanwhile change on every copy alike.
+    int nbook = 0;
+    for (int i = 0; i < count; i++) {
+        uint8_t* ent = now[i].used ? *reinterpret_cast<uint8_t**>(Entries(world) + i * 8) : nullptr;
+        bool pend = ent && ent[0x141];
+        if (now[i].next_free != g_snap_slots[i].next_free || now[i].seq != g_snap_slots[i].seq || pend) nbook++;
+    }
+    w.U8('B');
+    w.U16(static_cast<uint16_t>(count));
+    w.U16(*reinterpret_cast<uint16_t*>(world + kWorldFreeHead));
+    w.U32(*reinterpret_cast<uint32_t*>(kEntitySerial));
+    w.U16(static_cast<uint16_t>(nbook));
+    for (int i = 0; i < count; i++) {
+        uint8_t* ent = now[i].used ? *reinterpret_cast<uint8_t**>(Entries(world) + i * 8) : nullptr;
+        bool pend = ent && ent[0x141];
+        if (now[i].next_free != g_snap_slots[i].next_free || now[i].seq != g_snap_slots[i].seq || pend) {
+            w.U16(static_cast<uint16_t>(i));
+            w.U16(static_cast<uint16_t>(now[i].next_free));
+            w.U16(static_cast<uint16_t>(now[i].seq));
+        }
+    }
+    if (nbook) ops++;
+    Log("co-op: shop: the deal is %d ops (%d table entries), %d bytes", ops, nbook, w.len);
+    return ops;
 }

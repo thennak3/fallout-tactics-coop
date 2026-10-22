@@ -39,6 +39,9 @@ bool IsActor(uint8_t* world, int i) {
 }
 // recruit: dismiss two, add one back (the list selects the last dismissed); recruitnew: add someone never recruited
 bool IsRecruitScenario() { return _stricmp(g_test.scenario, "recruit") == 0 || _stricmp(g_test.scenario, "recruitnew") == 0; }
+// trade: one player trades; trade2: then the other player trades with the same merchant and also sells an item
+bool IsTradeScenario() { return _stricmp(g_test.scenario, "trade") == 0 || _stricmp(g_test.scenario, "trade2") == 0; }
+int g_bot_deals = 0;  // deals this copy's bot made
 
 bool InList(const uint16_t* ids, int n, int id) {
     for (int i = 0; i < n; i++)
@@ -94,6 +97,7 @@ uint16_t FirstItem(uint8_t* world, uint16_t actor) {
 }
 
 uint32_t HashVars(uint8_t* world);  // private_sync.inc
+uint32_t HashWide(uint32_t h, const wchar_t* s);  // private_sync.inc
 
 void SnapshotAll(uint8_t* world, int frame) {
     int count = EntityCount(world), actors = 0;
@@ -129,6 +133,22 @@ void SnapshotAll(uint8_t* world, int frame) {
         Log("ETABX s=%ld f=%d %s", g_snap_tag, frame, line);
     }
     Log("VARS s=%ld f=%d hash=%08x", g_snap_tag, frame, HashVars(world));  // mission and campaign variables
+    {  // the campaign's stock list (what a quartermaster sells): templates and counts
+        uint32_t sh = 2166136261u;
+        __try {
+            uint8_t* campaign = *reinterpret_cast<uint8_t**>(0x8bdd2c);
+            wchar_t** tb = campaign ? *reinterpret_cast<wchar_t***>(campaign + 0x151) : nullptr;
+            wchar_t** te = campaign ? *reinterpret_cast<wchar_t***>(campaign + 0x155) : nullptr;
+            int* cnt = campaign ? *reinterpret_cast<int**>(campaign + 0x161) : nullptr;
+            for (int i = 0; tb && tb + i < te && i < 4096; i++) {
+                sh = HashWide(sh, tb[i]);
+                sh = (sh ^ static_cast<uint32_t>(cnt ? cnt[i] : 0)) * 16777619u;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            sh ^= 0xdeadbeef;
+        }
+        Log("STOCK s=%ld f=%d hash=%08x", g_snap_tag, frame, sh);
+    }
     for (int i = 1; i < count; i++) {
         if (!IsActor(world, i)) continue;
         float* p = EntityPos(world, static_cast<uint16_t>(i));
@@ -466,6 +486,7 @@ void ExploreSerialize(uint8_t* world, uint16_t id, int mode) {
 int g_bot_caps_before = 0;
 void PressHandler(uintptr_t handler, uint8_t* owner, const char* what);  // below, with the recruit screen
 void BotChangeQuestVar(uint8_t* world);  // private_sync.inc
+bool ShopOpenForOther(uint16_t* buyer);  // shop_sync.inc: another player's shop is open (its buyer's slot)
 
 // Fill the offers: the merchant's first item that is not caps, and caps from the buyer (three times its value, at
 // least 20, at most what the buyer has).
@@ -527,6 +548,18 @@ void BotDealOffer(uint8_t* world) {
     LogInv(world, "BEFORE", merchant);
     uint16_t a = MoveItem(world, merchant, om, buy, 1);
     uint16_t b = MoveItem(world, buyer, ob, caps, pay);
+    if (_stricmp(g_test.scenario, "trade2") == 0 && g_coop_join) {  // the second shopper (the joiner) sells too
+        uint16_t sell = 0;
+        for (int i = 0; i < nb && !sell; i++)
+            if (!IsCaps(world, items[i]) && items[i] != buy) sell = items[i];
+        if (sell) {
+            char sn[128];
+            ItemName(world, sell, sn, sizeof(sn));
+            uint16_t c = MoveItem(world, buyer, ob, sell, 1);
+            Log("bot: SELL the buyer's %u \"%s\" too: offered %u", sell, sn, c);
+        }
+    }
+    g_bot_deals++;
     Log("bot: OFFER the merchant's %u \"%s\" (value %d) for %d of the buyer's %d caps: offered %u and %u", buy, name,
         value, pay, g_bot_caps_before, a, b);
     g_bot_deal_offered = a && b;
@@ -743,6 +776,69 @@ void BotTradeSpeechTick(uint8_t* w) {  // the open conversation's tick (no game 
     }
 }
 
+// Test mode: a hardware write watch (debug register 0) on one byte, set on the main thread from a helper thread (a
+// thread cannot set its own debug registers). Each hit logs EIP and the BOS.exe return addresses on the stack: used to
+// find what allocates entities when the barter screen opens (the free list's head, World+0x74f).
+volatile LONG g_watch_hits = 0;
+LONG CALLBACK WatchHit(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(ep->ContextRecord->Dr6 & 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    c->Dr6 = 0;
+    if (InterlockedIncrement(&g_watch_hits) <= 80) {
+        char chain[400];
+        size_t o = 0;
+        uint32_t* sp = reinterpret_cast<uint32_t*>(c->Esp);
+        for (int i = 0, found = 0; i < 400 && found < 12; i++) {
+            uint32_t v;
+            __try { v = sp[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+            if (v >= 0x401000 && v < 0x7fc000) {
+                o += sprintf_s(chain + o, sizeof(chain) - o, " %08x", v);
+                found++;
+            }
+        }
+        uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+        Log("WATCH hit %ld eip=%08x head=%u stack:%s", g_watch_hits, c->Eip,
+            world ? *reinterpret_cast<uint16_t*>(world + 0x74f) : 0, chain);
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+struct WatchSet { uintptr_t addr; bool on; };
+DWORD WINAPI WatchSetter(LPVOID p) {
+    WatchSet* ws = static_cast<WatchSet*>(p);
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, g_main_thread_id);
+    if (!t) return 0;
+    SuspendThread(t);
+    CONTEXT c = {};
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (GetThreadContext(t, &c)) {
+        c.Dr0 = ws->on ? ws->addr : 0;
+        c.Dr7 = ws->on ? (c.Dr7 & ~0xf0003u) | 0x1u | (0x1u << 16) : (c.Dr7 & ~0xf0003u);  // L0, write, 1 byte
+        c.Dr6 = 0;
+        SetThreadContext(t, &c);
+    }
+    ResumeThread(t);
+    CloseHandle(t);
+    return 0;
+}
+
+void SetWriteWatch(uintptr_t addr, bool on) {
+    static bool handler = false;
+    if (!handler) {
+        AddVectoredExceptionHandler(1, WatchHit);
+        handler = true;
+    }
+    static WatchSet ws;
+    ws = {addr, on};
+    HANDLE h = CreateThread(nullptr, 0, WatchSetter, &ws, 0, nullptr);
+    if (h) {
+        WaitForSingleObject(h, 2000);
+        CloseHandle(h);
+    }
+    Log("bot: write watch %s at %08x", on ? "on" : "off", static_cast<unsigned>(addr));
+}
+
 void BotTradeGameMainTick(uint8_t* w) {  // the mission screen's tick, after its children's
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     int mode = *reinterpret_cast<int*>(w + 0x156);
@@ -763,7 +859,11 @@ void BotTradeGameMainTick(uint8_t* w) {  // the mission screen's tick, after its
         if (++barter_ticks == 1) {
             barter_up = GetTickCount();
             Log("bot: BARTER screen up (mode %d)", mode);
+            if (_stricmp(g_test.scenario, "browse") == 0) SetWriteWatch(0, false);
         }
+        if (barter_ticks == 2)  // what stops the world here: the pause counter, or the mode alone
+            Log("bot: during barter: pause counter World+0x2db = %d, frame %d", *reinterpret_cast<int*>(world + 0x2db),
+                *reinterpret_cast<int*>(world + kWorldFrame));
         if (barter_ticks == 2 && _stricmp(g_test.scenario, "browse") != 0) BotDealOffer(world);  // browse: look only
         if (g_bot_deal_offered && GetTickCount() - barter_up >= 700) {
             g_bot_deal_offered = false;
@@ -776,7 +876,9 @@ void BotTradeGameMainTick(uint8_t* w) {  // the mission screen's tick, after its
         }
         return;
     }
-    if (wait > 0 && barter_ticks == 0 && ++wait == 150) {
+    static DWORD pressed_at = 0;  // the screen may open a few frames after the press (shop_no_pause: at its frame)
+    if (wait == 1 && !pressed_at) pressed_at = GetTickCount();
+    if (wait > 0 && barter_ticks == 0 && pressed_at && GetTickCount() - pressed_at > 5000 && wait++ == 1) {
         Log("bot: FAIL the barter screen did not open (mode %d)", mode);
         g_end_game_mode = true;
     }
@@ -924,7 +1026,7 @@ void __fastcall WindowTickHook(uint8_t* w) {
             DumpWindowTree(w, 0);
         }
     }
-    if (g_test.enabled && (_stricmp(g_test.scenario, "trade") == 0 || _stricmp(g_test.scenario, "browse") == 0)) {
+    if (g_test.enabled && (IsTradeScenario() || _stricmp(g_test.scenario, "browse") == 0)) {
         if (w == g_private_speech) BotTradeSpeechTick(w);
         if (*reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) BotTradeGameMainTick(w);
     }
@@ -1067,7 +1169,10 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             if (g_snap_tag == 1 && rel_s >= 30 + 80 * leg && Once(5 + leg) && i_act) BotRouteLeg(client, world, leg);
         if (g_snap_tag == 1 && rel_s >= 190 && Once(7) && i_act) SendCommand(client, 0, g_bot_talker, 0, kMerchantApproach, 4);
         const int talk_at = 310;
-        if (g_snap_tag == 1 && rel_s >= talk_at && Once(0) && i_act) BotTalk(client, world, kMerchant, frame);
+        if (g_snap_tag == 1 && rel_s >= talk_at && Once(0) && i_act) {
+            SetWriteWatch(reinterpret_cast<uintptr_t>(world + 0x74f), true);  // what the conversation and barter allocate
+            BotTalk(client, world, kMerchant, frame);
+        }
         if (g_snap_tag == 1 && rel_s >= talk_at + 8 && Once(2) && !i_act) {
             uint16_t squad[16];
             if (GetSquad(world, squad, 16) > 1) {
@@ -1077,7 +1182,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             }
         }
         if (rel_s >= talk_at + 500) BotFinish();
-    } else if (_stricmp(s, "trade") == 0) {
+    } else if (IsTradeScenario()) {
         // Bunker save. Both players move squad members around first (the other side member 1, the actor member 2),
         // then [test] actor's member 0 walks to the merchant, talks, barters (BotTradeGameMainTick) and trades.
         // Session 1 must match on both copies until the talk; session 2 (from the trader's game) everywhere.
@@ -1102,7 +1207,31 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             Log("bot: FAIL no conversation opened 500 frames after the talk command");
             BotFinish();
         }
-        if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= talk_at + 450)) BotFinish();  // no reload: session 1 goes on
+        // While someone else's shop is open (shop_no_pause): try to order the trading character and to talk to the
+        // recruiter; both must be refused on this copy.
+        if (_stricmp(s, "trade2") == 0 && g_snap_tag == 1 && rel_s >= talk_at + 300 && Once(11) && !i_act) {
+            uint16_t squad[16];
+            if (GetSquad(world, squad, 16) > 0) g_bot_talker = squad[0];  // the member the first trade left at the merchant
+            Log("bot: the second player trades with the merchant too");
+            BotTalk(client, world, kMerchant, frame);
+        }
+        uint16_t shop_buyer = 0;
+        if (ShopOpenForOther(&shop_buyer) && Once(9) && _stricmp(s, "trade2") != 0) {
+            uint16_t squad[16];
+            int n = GetSquad(world, squad, 16);
+            for (int i = 0; i < n; i++)
+                if (squad[i] == shop_buyer) {
+                    Log("bot: tries to move the trading squad member %u", squad[i]);
+                    BotMoveMember(client, world, i, 3);
+                }
+            Log("bot: tries to talk to the recruiter while the shop is open");
+            uint16_t keep = g_bot_talker;
+            g_bot_talker = n > 1 ? squad[n - 1] : squad[0];
+            BotTalk(client, world, 0, frame);
+            g_bot_talker = keep;
+        }
+        int end_at = _stricmp(s, "trade2") == 0 ? talk_at + 750 : talk_at + 450;
+        if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= end_at)) BotFinish();  // no reload: session 1 goes on
     } else if (_stricmp(s, "watch") == 0 || _stricmp(s, "play") == 0) {
         // A person plays; the bot only logs (snapshots, RNG, HP changes) so copies can be compared afterwards.
         // play: unlike watch, the copies load [test] save themselves and the host waits for [test] joiners.
@@ -1116,7 +1245,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
 
 void PrivateCloseStep() {  // frame hook, and the mission screen's tick (the world may be held: no frames)
     if (PrivateScreensClosed()) {
-        if (g_test.enabled && (_stricmp(g_test.scenario, "trade") == 0 || IsRecruitScenario())) {
+        if (g_test.enabled && (IsTradeScenario() || IsRecruitScenario())) {
             uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);  // what the others will get
             LogInv(world, "SYNCED", g_bot_talker);
             LogInv(world, "SYNCED", kMerchant);
@@ -1124,6 +1253,13 @@ void PrivateCloseStep() {  // frame hook, and the mission screen's tick (the wor
         }
         int diff = PrivateScreensDiff();
         ReleaseTalkerHold();  // the delta is out: this world goes on (a re-sync needs frames too)
+        extern bool g_suppress_pause;
+        extern int g_suppressed;
+        if (g_suppress_pause) {
+            g_suppress_pause = false;
+            Log("co-op: the light conversation is over: pause changes go through again (balance %d%s)", g_suppressed,
+                g_suppressed ? ", NOT ZERO" : "");
+        }
         if (diff != kDiffFull) {
             // nothing to reload: the co-op commands carried what changed
         } else if (g_coop_host) {
@@ -1140,6 +1276,7 @@ uint32_t __fastcall FrameTickHook(uint8_t* client) {
     g_client_ptr = client;
     __try {
         ReapplyBookkeeping();
+        RunDeferredCreates();  // shop_sync.inc
         if (g_test.enabled) DebugDumpActors();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("co-op: exception 0x%08x re-applying delta bookkeeping", GetExceptionCode());
