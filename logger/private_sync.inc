@@ -1528,6 +1528,7 @@ void HandleCoopCommand(const uint8_t* r) {
         g_delta_mine = false;
         g_rx_len = 0;
         if (kind == kShopClose) return;  // the conversation goes on: its NPC stays busy
+        if (r[8] & 4) return;  // freed at its frame on every copy (CoopCommandAtFrame): arrival differs per copy
         if (g_test.enabled) {  // test mode: dump some actors' memory for 100 frames, to diff the copies
             uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr);
             g_dump_until = w ? *reinterpret_cast<int*>(w + kWorldFrame) + 250 : 0;
