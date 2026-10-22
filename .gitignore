@@ -1,0 +1,13 @@
+# Build output
+*.dll
+*.obj
+*.exp
+*.lib
+*.pdb
+# Editor and scratch backups
+*.bak
+*.bak[0-9]
+__pycache__/
+# Never commit game files, saves or logs
+*.sav
+*.log

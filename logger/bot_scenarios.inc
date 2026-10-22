@@ -1,0 +1,1088 @@
+// ---- in-game bot: runs once per simulation frame, before the frame's ticks are applied ----
+// Included from netlog.cpp. Scenario from ftcoop.ini [test] scenario= (move, simul, attack, soak).
+// Every 50 frames each copy logs every Actor on the map (id, position, HP); the launcher compares all
+// snapshot frames the two copies share, so enemy AI, NPCs and combat results are part of the check.
+int g_bot_t0 = -1;
+int g_bot_last_snap = -1;
+bool g_bot_done_step[16] = {};
+const uintptr_t kActorVtable = 0x80c1d0;
+const float kMoveMin = 10.0f, kMoveMax = 40.0f;
+
+int GetSquad(uint8_t* world, uint16_t* ids, int max) {
+    uint8_t* begin = *reinterpret_cast<uint8_t**>(world + kWorldPlayers);
+    uint8_t* end = *reinterpret_cast<uint8_t**>(world + kWorldPlayers + 4);
+    if (!begin || (end - begin) / kPlayerSize < 2) return 0;
+    uint8_t* head = *reinterpret_cast<uint8_t**>(begin + 1 * kPlayerSize + kPlayerMembers);
+    int n = 0;
+    for (uint8_t* node = *reinterpret_cast<uint8_t**>(head); node != head && n < max;
+         node = *reinterpret_cast<uint8_t**>(node)) {
+        ids[n++] = *reinterpret_cast<uint16_t*>(node + 10);  // EntityID.id
+    }
+    return n;
+}
+
+uint8_t* Entries(uint8_t* world) { return *reinterpret_cast<uint8_t**>(world + kWorldEntities); }
+int EntityCount(uint8_t* world) {
+    return static_cast<int>((*reinterpret_cast<uint8_t**>(world + kWorldEntities + 4) - Entries(world)) / 8);
+}
+uint8_t* EntityById(uint8_t* world, uint16_t id) { return *reinterpret_cast<uint8_t**>(Entries(world) + id * 8); }
+float* EntityPos(uint8_t* world, uint16_t id) { return reinterpret_cast<float*>(EntityById(world, id) + kEntityPos); }
+int ActorHp(uint8_t* world, uint16_t id) { return *reinterpret_cast<int*>(EntityById(world, id) + kActorHp); }
+uint32_t FullId(uint8_t* world, uint16_t id) {  // EntityID {u16 seq, u16 id}; seq from the table entry +6
+    return *reinterpret_cast<uint16_t*>(Entries(world) + id * 8 + 6) | (static_cast<uint32_t>(id) << 16);
+}
+bool IsActor(uint8_t* world, int i) {
+    uint8_t* e = EntityById(world, static_cast<uint16_t>(i));
+    return e && e != *reinterpret_cast<uint8_t**>(Entries(world)) && *reinterpret_cast<uintptr_t*>(e) == kActorVtable;
+}
+bool InList(const uint16_t* ids, int n, int id) {
+    for (int i = 0; i < n; i++)
+        if (ids[i] == id) return true;
+    return false;
+}
+
+// Inventories (FTSE Actor.h / Inventory.h / Collectable.h, whose offset comments are from the entity's start): an
+// Actor's inventory EntityID {u16 seq, u16 id} at +0x1006; the Inventory entity (vtable 0x818af8) has a circular list at +0x1a9
+// (sentinel node; node: next, prev, EntityID); an item's count at +0x1ad (Collectable struct +8).
+const size_t kActorInventory = 0x1006;
+const uintptr_t kContainerVtable = 0x817a2c;  // FTSE Container.h: struct at +0x1a6, inventory EntityID at struct +4
+const size_t kContainerInventory = 0x1aa;
+const uintptr_t kInventoryVtable = 0x818af8;
+const size_t kInventoryList = 0x1a9;
+const size_t kItemCount = 0x1ad;
+
+// "id:count,id:count" (list order), or "-" when empty; false if the actor has no readable inventory.
+bool InvString(uint8_t* world, uint16_t actor, char* out, size_t size) {
+    out[0] = 0;
+    __try {
+        uint8_t* owner = EntityById(world, actor);
+        uintptr_t ovt = *reinterpret_cast<uintptr_t*>(owner);
+        size_t field = ovt == kActorVtable ? kActorInventory : ovt == kContainerVtable ? kContainerInventory : 0;
+        if (!field && ovt != kInventoryVtable) return false;
+        uint16_t inv_id = field ? *reinterpret_cast<uint16_t*>(owner + field + 2) : actor;  // or an Inventory itself
+        if (inv_id == 0 || inv_id >= EntityCount(world)) return false;
+        uint8_t* inv = EntityById(world, inv_id);
+        if (!inv || *reinterpret_cast<uintptr_t*>(inv) != kInventoryVtable) return false;
+        uint8_t* head = *reinterpret_cast<uint8_t**>(inv + kInventoryList);
+        size_t len = 0;
+        int n = 0;
+        for (uint8_t* node = *reinterpret_cast<uint8_t**>(head); node && node != head && n < 200;
+             node = *reinterpret_cast<uint8_t**>(node), n++) {
+            uint16_t item = *reinterpret_cast<uint16_t*>(node + 10);
+            if (item == 0 || len + 16 >= size) continue;
+            uint8_t* e = EntityById(world, item);
+            len += sprintf_s(out + len, size - len, "%s%u:%d", len ? "," : "", item,
+                             e ? *reinterpret_cast<int*>(e + kItemCount) : -1);
+        }
+        if (len == 0) strcpy_s(out, size, "-");
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        strcpy_s(out, size, "?");
+        return false;
+    }
+}
+
+uint16_t FirstItem(uint8_t* world, uint16_t actor) {
+    char s[2048];
+    if (!InvString(world, actor, s, sizeof(s)) || s[0] == '-') return 0;
+    return static_cast<uint16_t>(atoi(s));
+}
+
+void SnapshotAll(uint8_t* world, int frame) {
+    int count = EntityCount(world), actors = 0;
+    for (int i = 1; i < count; i++) actors += IsActor(world, i);
+    Log("SNAP s=%ld frame=%d actors=%d entities=%d", g_snap_tag, frame, actors, count);
+    uint16_t squad[16];
+    int n = GetSquad(world, squad, 16);
+    char ids[128] = "";
+    size_t len = 0;
+    for (int i = 0; i < n; i++) len += sprintf_s(ids + len, sizeof(ids) - len, "%s%u", i ? "," : "", squad[i]);
+    Log("SQUAD s=%ld f=%d n=%d ids=%s", g_snap_tag, frame, n, ids);
+    // Entity table bookkeeping (used, next_free, seq per entry; free-list head World+0x74f): the copies must hand out
+    // the same slots to new entities.
+    uint32_t h = 2166136261u;
+    uint8_t* e = Entries(world);
+    void* dummy = *reinterpret_cast<void**>(e);
+    for (int i = 0; i < count; i++) {
+        void* p = *reinterpret_cast<void**>(e + i * 8);
+        uint32_t v = (p && p != dummy ? 1u : 0u) | (static_cast<uint32_t>(*reinterpret_cast<uint16_t*>(e + i * 8 + 6)) << 1);
+        h = (h ^ v) * 16777619u;
+        h = (h ^ *reinterpret_cast<uint16_t*>(e + i * 8 + 4)) * 16777619u;
+    }
+    h = (h ^ *reinterpret_cast<uint16_t*>(world + 0x74f)) * 16777619u;
+    Log("ETAB s=%ld f=%d n=%d hash=%08x", g_snap_tag, frame, count, h);
+    for (int i = 1; i < count; i++) {
+        if (!IsActor(world, i)) continue;
+        float* p = EntityPos(world, static_cast<uint16_t>(i));
+        Log("SNAP s=%ld f=%d id=%d pos=(%.3f,%.3f,%.3f) hp=%d", g_snap_tag, frame, i, p[0], p[1], p[2],
+            ActorHp(world, static_cast<uint16_t>(i)));
+        char inv[2048];
+        if (InvString(world, static_cast<uint16_t>(i), inv, sizeof(inv)))
+            Log("INV s=%ld f=%d id=%d items=%s", g_snap_tag, frame, i, inv);
+    }
+}
+
+// Every frame: log each actor's HP change, so copies can be compared hit by hit (snapshots are only every 50
+// frames). The first frame of a session records without logging.
+// Note: an earlier test hooked the World's random accessor 0x505b00 (&World+0x729, or a per-frame seed when the flag
+// 0x8bdd8b is set) to log draws outside the client tick processor. The World's own update (around 0x4fc2xx) runs
+// next to that call, not inside it, so those draws are normal; the per-frame RNG line below is the real check.
+volatile bool g_in_tick = false;
+
+void WatchHp(uint8_t* world, int frame, bool first) {
+    static int last[4096];
+    int count = EntityCount(world);
+    if (count > 4096) count = 4096;
+    for (int i = 1; i < count; i++) {
+        if (!IsActor(world, i)) continue;
+        int hp = ActorHp(world, static_cast<uint16_t>(i));
+        if (!first && hp != last[i]) Log("HPCHG s=%ld f=%d id=%d %d->%d", g_snap_tag, frame, i, last[i], hp);
+        last[i] = hp;
+    }
+}
+
+void SendCommand(uint8_t* client, uint8_t cmd, uint16_t actor, uint32_t e1, const float* loc, int32_t param) {
+    MoveMsg m = {};
+    m.type = 2;
+    m.count = 1;
+    m.cmd = cmd;
+    m.actor = actor;
+    m.e1 = e1;
+    if (loc) { m.x = loc[0]; m.y = loc[1]; m.z = loc[2]; }
+    m.param = param;
+    reinterpret_cast<void(__thiscall*)(void*, void*, int, int)>(kClientSend)(client, &m, sizeof(m), 1);
+}
+
+// Walk targets are waypoints: every Actor's position on the first in-game frame. Somebody was placed there by
+// the game, so it is walkable, and unlike live characters the waypoints do not drift towards the squad (the
+// first soak went idle: after a few walks no live character was 10-30 units away). A target is a waypoint
+// 10-40 units from the walker on the same floor height; `variant` picks among them (0 = farthest).
+float g_waypoints[128][3];
+int g_waypoint_count = 0;
+
+void RecordWaypoints(uint8_t* world) {
+    for (int i = 1; i < EntityCount(world) && g_waypoint_count < 128; i++) {
+        if (!IsActor(world, i)) continue;
+        memcpy(g_waypoints[g_waypoint_count++], EntityPos(world, static_cast<uint16_t>(i)), sizeof(float) * 3);
+    }
+    Log("bot: %d waypoints recorded", g_waypoint_count);
+}
+
+int PickWalkTarget(uint8_t* world, uint16_t walker, unsigned variant) {
+    float* a = EntityPos(world, walker);
+    int cand[128], nc = 0, far_i = -1;
+    float far_d = 0;
+    for (int i = 0; i < g_waypoint_count; i++) {
+        float* p = g_waypoints[i];
+        float dy = p[1] - a[1];
+        float d = sqrtf((p[0] - a[0]) * (p[0] - a[0]) + (p[2] - a[2]) * (p[2] - a[2]));
+        if (dy <= -1.0f || dy >= 1.0f || d < kMoveMin || d > kMoveMax) continue;
+        cand[nc++] = i;
+        if (d > far_d) { far_d = d; far_i = i; }
+    }
+    if (nc == 0) return -1;
+    return variant == 0 ? far_i : cand[variant % nc];
+}
+
+void BotMoveMember(uint8_t* client, uint8_t* world, int member, unsigned variant) {
+    uint16_t squad[16];
+    int n = GetSquad(world, squad, 16);
+    if (n <= member) {
+        Log("bot: FAIL squad has %d members, need %d", n, member + 1);
+        return;
+    }
+    uint16_t walker = squad[member];
+    int t = PickWalkTarget(world, walker, variant);
+    if (t < 0) {
+        Log("bot: FAIL no waypoint %.0f-%.0f units from squad member %u to walk to", kMoveMin, kMoveMax, walker);
+        return;
+    }
+    float* a = EntityPos(world, walker);
+    float* p = g_waypoints[t];
+    Log("bot: MOVE id=%u from (%.3f,%.3f,%.3f) towards waypoint %d at (%.3f,%.3f,%.3f)", walker, a[0], a[1], a[2], t,
+        p[0], p[1], p[2]);
+    SendCommand(client, 0, walker, 0, p, 4);
+}
+
+// The whole squad to a point, one command per member in one message, as the UI sends a squad move (a small grid of
+// targets around the point, as the owner's x6 squad moves had).
+void BotMoveSquad(uint8_t* client, uint8_t* world, const float* target) {
+    uint16_t squad[16];
+    int n = GetSquad(world, squad, 16);
+    uint8_t m[6 + 27 * 16] = {};
+    *reinterpret_cast<uint32_t*>(m) = 2;
+    *reinterpret_cast<uint16_t*>(m + 4) = static_cast<uint16_t>(n);
+    for (int i = 0; i < n; i++) {
+        uint8_t* r = m + 6 + 27 * i;
+        float loc[3] = {target[0] + (i % 3 - 1) * 1.25f, target[1], target[2] + (i / 3) * 1.25f};
+        r[0] = 0;
+        memcpy(r + 1, &squad[i], 2);
+        memcpy(r + 7, loc, 12);
+        int32_t param = 4;
+        memcpy(r + 23, &param, 4);
+    }
+    Log("bot: SQUAD MOVE %d members to (%.1f,%.1f,%.1f)", n, target[0], target[1], target[2]);
+    reinterpret_cast<void(__thiscall*)(void*, void*, int, int)>(kClientSend)(client, m, 6 + 27 * n, 1);
+}
+
+// Attack (command 0x02, target in e1) the nearest living character outside the squad, as the UI does.
+void BotAttack(uint8_t* client, uint8_t* world) {
+    uint16_t squad[16];
+    int n = GetSquad(world, squad, 16);
+    if (n < 1) {
+        Log("bot: FAIL squad is empty");
+        return;
+    }
+    float* a = EntityPos(world, squad[0]);
+    int best = -1;
+    float best_d = 1e9f;
+    for (int i = 1; i < EntityCount(world); i++) {
+        if (!IsActor(world, i) || InList(squad, n, i) || ActorHp(world, static_cast<uint16_t>(i)) <= 0) continue;
+        float* p = EntityPos(world, static_cast<uint16_t>(i));
+        float d = sqrtf((p[0] - a[0]) * (p[0] - a[0]) + (p[2] - a[2]) * (p[2] - a[2]));
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    if (best < 0) {
+        Log("bot: FAIL no living character to attack");
+        return;
+    }
+    Log("bot: ATTACK id=%u target=%d hp=%d distance %.2f", squad[0], best, ActorHp(world, static_cast<uint16_t>(best)), best_d);
+    SendCommand(client, 2, squad[0], FullId(world, static_cast<uint16_t>(best)), nullptr, 0);
+}
+
+// Map transition as a mission script does it: ActionEndMission's execute 0x680b60 (fastcall, ECX = action) reads
+// only its target name (FOTString at +0xb); "World Map" schedules the game screen's exit to the world map
+// (WGameMain+0x19d.. timer). Both bots call it on the same frame, like a trigger firing in the lockstep simulation.
+const uintptr_t kActionEndMissionExecute = 0x680b60;
+
+void BotEndMission(const char* target) {
+    static uint8_t action[0x40];
+    memset(action, 0, sizeof(action));
+    *reinterpret_cast<void**>(action + 0xb) = MakeFOTString(target);
+    Log("bot: END MISSION -> \"%s\" (as an ActionEndMission trigger does)", target);
+    reinterpret_cast<void(__fastcall*)(void*)>(kActionEndMissionExecute)(action);
+}
+
+// Talk: the owner's own click on the bunker's recruiting NPC (2026-10-21 live session, host log at 40.0 s): command
+// 0x17, squad member 0x03bc, NPC EntityID 0x0051000a; the other fields as the UI sent them.
+const uint8_t kOwnerTalkCommand[27] = {0x17, 0xbc, 0x03, 0x0a, 0x00, 0x51, 0x00, 0x00, 0x00, 0x00, 0x49, 0x01, 0x00, 0x00,
+                                       0x00, 0x00, 0x58, 0x6b, 0x5a, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00};
+uint16_t g_bot_changed_id = 0;
+
+// The talk command does nothing from across the room, and no direct move towards the NPC moved anyone (the owner's
+// spot next to it, a waypoint near it; squad members 0x03bc and 0 alike). The owner walked round first: their squad
+// moves from 16.3 s to 36.3 s (decoded from the live log) go down to z 320, across, and up to the NPC's open side.
+// Squad member 0 follows that route, one leg every 80 frames, then talks (the talk command's actor field patched).
+uint16_t g_bot_talker = 0;
+const float kOwnerRoute[][3] = {{357.7f, 32.0f, 326.9f}, {355.85f, 32.15f, 322.5f}, {346.7f, 32.0f, 319.3f},
+                                {340.7f, 32.0f, 318.3f}, {334.2f, 31.75f, 321.6f}, {332.73f, 32.09f, 335.16f}};
+const int kOwnerRouteLegs = sizeof(kOwnerRoute) / sizeof(kOwnerRoute[0]);
+
+void BotRouteLeg(uint8_t* client, uint8_t* world, int leg) {
+    if (leg == 0) {
+        uint16_t squad[16];
+        int n = GetSquad(world, squad, 16);
+        if (n < 1) {
+            Log("bot: FAIL squad is empty");
+            return;
+        }
+        g_bot_talker = squad[0];
+    }
+    float* a = EntityPos(world, g_bot_talker);
+    Log("bot: ROUTE leg %d: member %u at (%.3f,%.3f,%.3f) to (%.3f,%.3f,%.3f)", leg, g_bot_talker, a[0], a[1], a[2],
+        kOwnerRoute[leg][0], kOwnerRoute[leg][1], kOwnerRoute[leg][2]);
+    SendCommand(client, 0, g_bot_talker, 0, kOwnerRoute[leg], 4);
+}
+
+// target 0: the owner's NPC as sent; else the talk goes to that entity (EntityID patched in e1).
+void BotTalk(uint8_t* client, uint8_t* world, uint16_t target, int frame) {
+    uint8_t m[6 + 27] = {2, 0, 0, 0, 1, 0};
+    memcpy(m + 6, kOwnerTalkCommand, sizeof(kOwnerTalkCommand));
+    memcpy(m + 7, &g_bot_talker, 2);
+    if (target) {
+        uint32_t e1 = FullId(world, target);
+        memcpy(m + 9, &e1, 4);
+    }
+    Log("bot: TALK (the owner's talk command, to NPC %u, from member %u) at frame %d", target ? target : 81,
+        g_bot_talker, frame);
+    reinterpret_cast<void(__thiscall*)(void*, void*, int, int)>(kClientSend)(client, m, sizeof(m), 1);
+}
+
+// Trade: the bunker's merchant, NPC 96 (runtime run 2: the owner talked to entity 0x60, then bought and sold).
+// The talker walks the owner's first two route legs, then to the merchant's counter side, talks, and presses the
+// conversation's Barter button: 0x4d0000 (__thiscall(WSpeech*, button), ret 4; FTSE notes: barter 0x4d0000, gamble
+// 0x4d0090, recruit 0x4d0110). It sets the trading pair (0x8bc218 buyer, 0x8bc208 merchant, from WSpeech +0x100..
+// +0x106) and asks World+0x2b9 (vtable +0x28) to open it; the barter screen is mission-screen mode 6
+// (WBarter 0x453e00, which pauses the world while it is up).
+// The deal (BotDealOffer, BotDealPress): every Actor has a barter offer, a second Inventory entity whose EntityID is at
+// +0x100a (vtable slot 406, FTSE's GetUnk22EntityID). Dragging an item onto the table puts it there. The barter table
+// (WGameMain+0x11e, WBarterTable) has Offer 0x455830 (thiscall: the deal 0x4558a0 if table +0x104's value (+0x147) is
+// at least table +0x108's) and Done 0x455880 (SetMode(0)). The deal moves the buyer's offer to the merchant and the
+// merchant's to the buyer with RemoveInventory/AddToInventory (Entity vtable +0x508/+0x504). The bot fills both
+// offers with those functions (caps from the buyer, one item from the merchant) and presses Offer.
+// Observed (trade_host): the merchant holds 2 items of its own; opening the barter screen fills its inventory with the
+// shop's stock (30 stacks) and closing it takes the stock away again. What the other players must get is the trader's
+// game once the screens have closed (logged as INV SYNCED).
+const uint16_t kMerchant = 96;
+const float kMerchantApproach[3] = {359.5f, 32.0f, 320.5f};
+const uintptr_t kSpeechBarterButton = 0x4d0000;
+const uintptr_t kBarterOffer = 0x455830;
+const size_t kVtAddInventory = 0x504, kVtRemoveInventory = 0x508;
+const size_t kActorOffer = 0x100a, kEntitySprite = 0x105, kItemValue = 0x1b6;
+uint8_t* g_bot_barter_speech = nullptr;  // press Barter on this conversation from the mission screen's tick
+bool g_bot_deal_offered = false;         // both offers filled: press Offer
+
+struct InvResult { int32_t status; uint32_t e1; int32_t u2, u3; wchar_t* err; uint32_t e4; int32_t u5; };
+
+// Move `count` of `item` from one actor's inventory to another's; returns the moved item's id, 0 on failure.
+uint16_t MoveItem(uint8_t* world, uint16_t from, uint16_t to, uint16_t item, int count) {
+    typedef void*(__thiscall * InvFn)(void*, InvResult*, uint32_t, uint32_t*, int32_t, int32_t);
+    uint8_t* src = EntityById(world, from);
+    uint8_t* dst = EntityById(world, to);
+    InvResult r = {};
+    uint32_t moved = FullId(world, item);
+    reinterpret_cast<InvFn>((*reinterpret_cast<void***>(src))[kVtRemoveInventory / 4])(src, &r, moved, &moved, count, 0);
+    if (r.status != 0) {
+        Log("bot: remove %u from %u failed (status %d)", item, from, r.status);
+        return 0;
+    }
+    InvResult a = {};
+    uint32_t added = moved;
+    reinterpret_cast<InvFn>((*reinterpret_cast<void***>(dst))[kVtAddInventory / 4])(dst, &a, moved, &added, count, 0);
+    if (a.status != 0) {
+        Log("bot: add %u to %u failed (status %d)", moved >> 16, to, a.status);
+        return 0;
+    }
+    return static_cast<uint16_t>(moved >> 16);
+}
+
+void LogInv(uint8_t* world, const char* tag, uint16_t actor) {
+    char s[2048];
+    InvString(world, actor, s, sizeof(s));
+    Log("bot: INV %s id=%u items=%s", tag, actor, s);
+}
+
+void ItemName(uint8_t* world, uint16_t item, char* out, size_t size) {
+    out[0] = 0;
+    __try {
+        const wchar_t* w = *reinterpret_cast<wchar_t**>(EntityById(world, item) + kEntitySprite);
+        if (w) WideCharToMultiByte(CP_ACP, 0, w, -1, out, static_cast<int>(size), nullptr, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        strcpy_s(out, size, "?");
+    }
+}
+
+// An inventory as (item, count) pairs, from InvString.
+int InvItems(uint8_t* world, uint16_t owner, uint16_t* items, int* counts, int max) {
+    char s[2048];
+    if (!InvString(world, owner, s, sizeof(s)) || s[0] == '-') return 0;
+    int n = 0;
+    for (char* p = s; *p && n < max;) {
+        items[n] = static_cast<uint16_t>(strtoul(p, &p, 10));
+        counts[n++] = *p == ':' ? strtol(p + 1, &p, 10) : 0;
+        if (*p == ',') p++;
+    }
+    return n;
+}
+
+bool IsCaps(uint8_t* world, uint16_t item) {  // money: "sprites/items/Money/Ringpulls.spr" (value 1 each)
+    char name[128];
+    ItemName(world, item, name, sizeof(name));
+    _strlwr_s(name);
+    return strstr(name, "/money/") != nullptr;
+}
+
+int CapsOf(uint8_t* world, uint16_t owner, uint16_t* stack) {
+    uint16_t items[200];
+    int counts[200];
+    int n = InvItems(world, owner, items, counts, 200), total = 0;
+    for (int i = 0; i < n; i++)
+        if (IsCaps(world, items[i])) {
+            total += counts[i];
+            if (stack) *stack = items[i];
+        }
+    return total;
+}
+
+uint16_t OfferOf(uint8_t* world, uint16_t actor) {
+    return *reinterpret_cast<uint16_t*>(EntityById(world, actor) + kActorOffer + 2);
+}
+
+// Entity to memory, as the level editor's undo does (world_undo.cpp, 0x42ec00): a memory streambuf (0x14 bytes: base
+// 0x426830, vtable 0x7fde04, FOTString buffer at +0xc, -1 at +8, 0 at +0x10), an archive on it (0x704060
+// thiscall(archive, mode, streambuf, 1)), then the entity saver 0x5eabd0 cdecl(archive*, EntityID), which the game's
+// own save-entity-to-file 0x5ea630 calls the same way. Exploration: log what comes out.
+void ExploreSerialize(uint8_t* world, uint16_t id, int mode) {
+    __try {
+        uint32_t* sb = reinterpret_cast<uint32_t*>(reinterpret_cast<void*(__cdecl*)(size_t)>(0x6c4dd0)(0x14));
+        reinterpret_cast<void(__fastcall*)(void*)>(0x426830)(sb);
+        sb[2] = 0xffffffff;
+        sb[0] = 0x7fde40;
+        uint8_t* str = static_cast<uint8_t*>(MakeFOTString(""));
+        sb[3] = reinterpret_cast<uint32_t>(str);
+        (*reinterpret_cast<int*>(str - 0xc))++;
+        sb[4] = 0;
+        sb[0] = 0x7fde04;
+        static uint8_t ar[256];
+        memset(ar, 0, sizeof(ar));
+        reinterpret_cast<void(__thiscall*)(void*, int, void*, int)>(0x704060)(ar, mode, sb, 1);
+        char ok = reinterpret_cast<char(__cdecl*)(void*, uint32_t)>(0x5eabd0)(ar, FullId(world, id));
+        uint8_t* buf = reinterpret_cast<uint8_t*>(sb[3]);
+        int h[3] = {};
+        if (buf) memcpy(h, buf - 0xc, sizeof(h));
+        Log("bot: SERIALIZE entity %u mode %d: ok %d, sb %08x %08x %08x %08x %08x, buffer %p header %d %d %d", id, mode,
+            ok, sb[0], sb[1], sb[2], sb[3], sb[4], buf, h[0], h[1], h[2]);
+        if (buf) {
+            char hex[3 * 96 + 1] = "", txt[200] = "";
+            int n = 96;
+            for (int i = 0; i < n; i++) sprintf_s(hex + 3 * i, 4, "%02x ", buf[i]);
+            for (int i = 0; i < 190; i++) txt[i] = buf[i] >= 32 && buf[i] < 127 ? static_cast<char>(buf[i]) : '.';
+            Log("bot: SERIALIZE bytes: %s", hex);
+            Log("bot: SERIALIZE text: %s", txt);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("bot: SERIALIZE exception 0x%08x", GetExceptionCode());
+    }
+}
+
+int g_bot_caps_before = 0;
+void PressHandler(uintptr_t handler, uint8_t* owner, const char* what);  // below, with the recruit screen
+
+// Fill the offers: the merchant's first item that is not caps, and caps from the buyer (three times its value, at
+// least 20, at most what the buyer has).
+void BotDealOffer(uint8_t* world) {
+    uint16_t buyer = *reinterpret_cast<uint16_t*>(0x8bc21a), merchant = *reinterpret_cast<uint16_t*>(0x8bc20a);
+    uint16_t ob = OfferOf(world, buyer), om = OfferOf(world, merchant);
+    Log("bot: barter pair: buyer %u (offer inventory %u), merchant %u (offer inventory %u)", buyer, ob, merchant, om);
+    uint16_t items[200];
+    int counts[200];
+    int n = InvItems(world, merchant, items, counts, 200);
+    uint16_t buy = 0;  // the cheapest item that is not money
+    int cheapest = 0x7fffffff;
+    for (int i = 0; i < n; i++) {
+        int v = *reinterpret_cast<int*>(EntityById(world, items[i]) + kItemValue);
+        if (!IsCaps(world, items[i]) && v > 0 && v < cheapest) {
+            cheapest = v;
+            buy = items[i];
+        }
+    }
+    uint16_t caps = 0;
+    g_bot_caps_before = CapsOf(world, buyer, &caps);
+    char names[2048] = "";
+    size_t len = 0;
+    int nb = InvItems(world, buyer, items, counts, 200);
+    for (int i = 0; i < nb && len + 80 < sizeof(names); i++) {
+        char nm[64];
+        ItemName(world, items[i], nm, sizeof(nm));
+        len += sprintf_s(names + len, sizeof(names) - len, " %u=%s(%d,v%d)", items[i], nm, counts[i],
+                         *reinterpret_cast<int*>(EntityById(world, items[i]) + kItemValue));
+    }
+    Log("bot: buyer's items:%s", names);
+    if (!buy || !caps || !ob || !om) {
+        Log("bot: FAIL no deal possible (item %u, caps stack %u, offers %u/%u)", buy, caps, ob, om);
+        return;
+    }
+    char name[128];
+    ItemName(world, buy, name, sizeof(name));
+    int value = *reinterpret_cast<int*>(EntityById(world, buy) + kItemValue);
+    int pay = value * 3 < 20 ? 20 : value * 3;
+    if (pay > g_bot_caps_before) pay = g_bot_caps_before;
+    LogInv(world, "BEFORE", buyer);
+    LogInv(world, "BEFORE", merchant);
+    uint16_t a = MoveItem(world, merchant, om, buy, 1);
+    uint16_t b = MoveItem(world, buyer, ob, caps, pay);
+    Log("bot: OFFER the merchant's %u \"%s\" (value %d) for %d of the buyer's %d caps: offered %u and %u", buy, name,
+        value, pay, g_bot_caps_before, a, b);
+    g_bot_deal_offered = a && b;
+}
+
+void BotDealPress(uint8_t* gm, uint8_t* world) {
+    uint8_t* table = *reinterpret_cast<uint8_t**>(gm + 0x11e);
+    uint16_t buyer = *reinterpret_cast<uint16_t*>(0x8bc21a), merchant = *reinterpret_cast<uint16_t*>(0x8bc20a);
+    if (!table) {
+        Log("bot: FAIL no barter table");
+        return;
+    }
+    uint8_t* t104 = *reinterpret_cast<uint8_t**>(table + 0x104);
+    uint8_t* t108 = *reinterpret_cast<uint8_t**>(table + 0x108);
+    Log("bot: table values: +104 %d, +108 %d", t104 ? *reinterpret_cast<int*>(t104 + 0x147) : -1,
+        t108 ? *reinterpret_cast<int*>(t108 + 0x147) : -1);
+    LogInv(world, "OFFER", OfferOf(world, buyer));
+    LogInv(world, "OFFER", OfferOf(world, merchant));
+    PressHandler(kBarterOffer, table, "the barter table's Offer button");
+    int caps_after = CapsOf(world, buyer, nullptr);
+    LogInv(world, "AFTER", buyer);
+    LogInv(world, "AFTER", merchant);
+    LogInv(world, "OFFER AFTER", OfferOf(world, buyer));
+    LogInv(world, "OFFER AFTER", OfferOf(world, merchant));
+    Log("bot: DEAL buyer %u caps %d -> %d", buyer, g_bot_caps_before, caps_after);
+}
+
+// Recruit: the conversation's Recruit button 0x4d0110 (FTSE notes; __thiscall(WSpeech*, button), ret 4) on the
+// recruiting NPC (81, the owner's talk). Exploration: log the screen's window tree, and in every button each dword
+// that points into the code section (a button keeps its own copy of its callback {owner, handler}; handler
+// __fastcall(owner, edx, arg)), to find the recruit screen's own buttons.
+const uintptr_t kSpeechRecruitButton = 0x4d0110;
+uint8_t* g_bot_recruit_speech = nullptr;
+
+void DumpWindowTree(uint8_t* w, int depth) {
+    if (!w || depth > 8) return;
+    __try {
+        const char* name = RttiName(w);
+        char extra[512] = "";
+        size_t len = 0;
+        if (strstr(name, "Button") || strstr(name, "Btn")) {
+            for (int off = 0xf0; off < 0x160 && len + 24 < sizeof(extra); off++) {
+                uint32_t v = *reinterpret_cast<uint32_t*>(w + off);
+                if (v >= 0x401000 && v < 0x7bf000)
+                    len += sprintf_s(extra + len, sizeof(extra) - len, " +%x=%08x(after %08x)", off, v,
+                                     *reinterpret_cast<uint32_t*>(w + off - 4));
+            }
+        }
+        Log("ui: tree %*s%s %p vt %08x%s", depth * 2, "", name, w, *reinterpret_cast<uint32_t*>(w), extra);
+        for (uint8_t* c = *reinterpret_cast<uint8_t**>(w + 0x18); c; c = *reinterpret_cast<uint8_t**>(c + 0x24))
+            DumpWindowTree(c, depth + 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("ui: tree exception at %p", w);
+    }
+}
+
+// Recruit screen (mode 8, WSingleRecruit; first recruit run's window tree): a button keeps its handler at +0x112 and
+// the handler's owner at +0x10e (the conversation's: Done 0x4cffd0, Gamble 0x4d0090, Barter 0x4d0000, Recruit
+// 0x4d0110). WSingleRecruit's buttons, decompiled: 0x4d4fe0 (image button) adds the selected recruit (vtable +0x1a8
+// the selection, +0x1b4 add); 0x4d5010 (image button) removes a flagged squad member (+0x1b8); 0x4d4e70 opens the
+// character sheet; 0x4d4e60 (16 bytes before it): Done, presumably. Handlers are __fastcall(owner, edx, arg).
+const uintptr_t kRecruitAdd = 0x4d4fe0, kRecruitRemove = 0x4d5010, kRecruitDone = 0x4d4e60;
+uint8_t* g_bot_single_recruit = nullptr;
+
+void LogSquad(uint8_t* world, const char* tag) {
+    uint16_t squad[16];
+    int n = GetSquad(world, squad, 16);
+    char s[128] = "";
+    size_t len = 0;
+    for (int i = 0; i < n; i++) len += sprintf_s(s + len, sizeof(s) - len, "%s%u", i ? "," : "", squad[i]);
+    Log("bot: SQUAD %s n=%d ids=%s", tag, n, s);
+}
+
+void PressHandler(uintptr_t handler, uint8_t* owner, const char* what) {
+    Log("bot: pressing %s (%08x on %s)", what, handler, RttiName(owner));
+    reinterpret_cast<void(__fastcall*)(void*, void*, int)>(handler)(owner, nullptr, 0);
+}
+
+void BotRecruitSpeechTick(uint8_t* w) {
+    static int ticks = 0;
+    if (++ticks == 10) {
+        g_bot_done_step[1] = true;
+        g_bot_recruit_speech = w;
+    }
+}
+
+void BotRecruitGameMainTick(uint8_t* w) {
+    int mode = *reinterpret_cast<int*>(w + 0x156);
+    static DWORD pressed = 0;
+    static bool dumped = false, ended = false;
+    if (g_bot_recruit_speech) {
+        uint8_t* speech = g_bot_recruit_speech;
+        g_bot_recruit_speech = nullptr;
+        Log("bot: pressing the conversation's Recruit button (mode %d)", mode);
+        DumpWindowTree(speech, 0);
+        reinterpret_cast<void(__thiscall*)(void*, void*)>(kSpeechRecruitButton)(speech, nullptr);
+        Log("bot: Recruit button returned, mode %d", *reinterpret_cast<int*>(w + 0x156));
+        pressed = GetTickCount();
+        return;
+    }
+    if (!pressed) return;
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    static bool added = false, done = false;
+    DWORD t = GetTickCount() - pressed;
+    if (!dumped && t >= 1000) {
+        dumped = true;
+        Log("bot: RECRUIT screen: mode %d, recruit window %p", mode, g_bot_single_recruit);
+        LogSquad(world, "BEFORE");
+    }
+    static bool removed = false;
+    if (!removed && t >= 1200 && mode == 8 && g_bot_single_recruit) {
+        // The squad is full (6) in bunker.sav: dismiss the last member first, as a player would (select it, press
+        // the remove button). 0x4d5010 removes the squad member whose entity flags +0xb2 have bit 0x40.
+        removed = true;
+        uint16_t squad[16];
+        int n = GetSquad(world, squad, 16);
+        char flags[128] = "";
+        size_t len = 0;
+        for (int i = 0; i < n; i++)
+            len += sprintf_s(flags + len, sizeof(flags) - len, " %u:%02x", squad[i], EntityById(world, squad[i])[0xb2]);
+        Log("bot: squad entity flags +0xb2:%s", flags);
+        // Two dismissals, then one recruit: the recruit list's selection is the last dismissed member, so a single
+        // dismiss-and-add gives back the squad it started with and the other copies would have nothing to follow.
+        for (int k = 1; k <= 2 && n > 2; k++) {
+            for (int i = 0; i < n; i++) EntityById(world, squad[i])[0xb2] &= ~0x40;
+            EntityById(world, squad[n - k])[0xb2] |= 0x40;
+            Log("bot: selecting squad member %u to dismiss", squad[n - k]);
+            PressHandler(kRecruitRemove, g_bot_single_recruit, "the recruit screen's remove button");
+        }
+        EntityById(world, squad[0])[0xb2] |= 0x40;  // the talker is selected again, as it was
+        LogSquad(world, "AFTER REMOVE");
+    }
+    if (!added && t >= 1700 && mode == 8 && g_bot_single_recruit) {
+        added = true;
+        PressHandler(kRecruitAdd, g_bot_single_recruit, "the recruit screen's add button");
+        LogSquad(world, "AFTER ADD");
+    }
+    if (!done && t >= 2500 && mode == 8 && g_bot_single_recruit) {
+        done = true;
+        uint8_t* r = g_bot_single_recruit;
+        g_bot_single_recruit = nullptr;
+        PressHandler(kRecruitDone, r, "the recruit screen's Done button");
+        Log("bot: Done returned, mode %d", *reinterpret_cast<int*>(w + 0x156));
+        LogSquad(world, "AFTER DONE");
+    }
+    if (!ended && t >= 4500) {
+        ended = true;
+        if (mode != 0) {
+            Log("bot: recruit screen still up (mode %d): leaving it with SetMode(0)", mode);
+            g_end_game_mode = true;
+        }
+        Log("bot: recruiting finished");
+    }
+}
+
+void BotTradeSpeechTick(uint8_t* w) {  // the open conversation's tick (no game frames run meanwhile)
+    static int ticks = 0;
+    if (++ticks == 10) {
+        g_bot_done_step[1] = true;
+        g_bot_barter_speech = w;
+    }
+}
+
+void BotTradeGameMainTick(uint8_t* w) {  // the mission screen's tick, after its children's
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    int mode = *reinterpret_cast<int*>(w + 0x156);
+    static int barter_ticks = 0, wait = 0;
+    static DWORD barter_up = 0;  // the screen ticks many times per game frame (the world is paused): time it
+    if (g_bot_barter_speech) {
+        uint8_t* speech = g_bot_barter_speech;
+        g_bot_barter_speech = nullptr;
+        Log("bot: pressing the conversation's Barter button (mode %d)", mode);
+        LogInv(world, "BEFORE", g_bot_talker);
+        LogInv(world, "BEFORE", kMerchant);
+        reinterpret_cast<void(__thiscall*)(void*, void*)>(kSpeechBarterButton)(speech, nullptr);
+        Log("bot: Barter button returned, mode %d", *reinterpret_cast<int*>(w + 0x156));
+        wait = 1;
+        return;
+    }
+    if (mode == 6 || mode == 7) {
+        if (++barter_ticks == 1) {
+            barter_up = GetTickCount();
+            Log("bot: BARTER screen up (mode %d)", mode);
+        }
+        if (barter_ticks == 2 && _stricmp(g_test.scenario, "browse") != 0) BotDealOffer(world);  // browse: look only
+        if (g_bot_deal_offered && GetTickCount() - barter_up >= 700) {
+            g_bot_deal_offered = false;
+            BotDealPress(w, world);
+        }
+        if (barter_up && GetTickCount() - barter_up >= 2000) {
+            barter_up = 0;
+            Log("bot: leaving the barter screen");
+            g_end_game_mode = true;
+        }
+        return;
+    }
+    if (wait > 0 && barter_ticks == 0 && ++wait == 150) {
+        Log("bot: FAIL the barter screen did not open (mode %d)", mode);
+        g_end_game_mode = true;
+    }
+}
+
+void BotLocalChange(uint8_t* world) {  // stands in for a trade: a change only this copy makes
+    uint16_t squad[16];
+    if (GetSquad(world, squad, 16) < 1) {
+        Log("bot: FAIL squad is empty");
+        return;
+    }
+    g_bot_changed_id = squad[0];
+    int* hp = reinterpret_cast<int*>(EntityById(world, squad[0]) + kActorHp);
+    Log("bot: LOCAL CHANGE id=%u hp %d->%d", squad[0], *hp, *hp - 1);
+    *hp -= 1;
+}
+
+// Talk scenario, from the open conversation's window tick (no game frames run meanwhile): change this copy's game
+// once, then end the conversation 60 ticks later.
+void BotSpeechTick(uint8_t* w) {
+    static int ticks = 0;
+    if (ticks == 0) {
+        g_bot_done_step[1] = true;
+        BotLocalChange(*reinterpret_cast<uint8_t**>(kWorldPtr));
+    }
+    if (++ticks == 60) {
+        Log("bot: ending the conversation");
+        g_end_game_mode = true;  // as leaving the conversation does: the mission screen back to mode 0
+    }
+}
+
+DWORD WINAPI FinishSoon(LPVOID) {
+    Sleep(10000);
+    Log("bot: DONE (10 s into session %ld)", g_sessions_started);
+    if (g_log) fflush(g_log);
+    ExitProcess(0);
+}
+
+// Which screen is up: the shared window tick 0x6c5130 (slot 70 of most windows: own Update at vtable+0xc0,
+// then each child's tick at +0x118; children from +0x18, next sibling +0x24 read after the call) is
+// reimplemented byte-for-byte in behaviour, and logs each window class (MSVC RTTI behind the vtable) the first
+// time it ticks. Test mode only.
+const uintptr_t kWindowTick = 0x6c5130;
+const uint8_t kWindowTickPrologue[] = {0x56, 0x8b, 0xf1, 0x8b, 0x06, 0xff, 0x90, 0xc0, 0x00, 0x00, 0x00};
+
+const char* RttiName(void* obj) {
+    __try {
+        const uint32_t* vt = *reinterpret_cast<uint32_t**>(obj);
+        const uint32_t* col = reinterpret_cast<const uint32_t*>(vt[-1]);
+        return reinterpret_cast<const char*>(col[3] + 8);  // TypeDescriptor name, e.g. ".?AVWGameMain@@"
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return "?";
+    }
+}
+
+void NoteWindowClass(void* w) {
+    static uint32_t seen[96];
+    static int n = 0;
+    uint32_t vt = *reinterpret_cast<uint32_t*>(w);
+    for (int i = 0; i < n; i++)
+        if (seen[i] == vt) return;
+    if (n < 96) seen[n++] = vt;
+    Log("ui: window %s first ticks (session %ld)", RttiName(w), g_sessions_started);
+}
+
+// World map -> mission as a click on a location does (WWorldWindow mouse-down 0x6ba2a0 -> 0x6ba580): campaign
+// locations at *0x8bdd2c + 0x1cd (begin) / + 0x1d1 (end), 0x2f bytes each: +0x1c FOTString mission id,
+// +0x20 FOTString map, +0x24 state (0 = not available), +0x2d/+0x2e flags. Mode: 3 if the mission is done
+// (0x6a85d0), else 4 if +0x2d, else 1 (and, if !+0x2e, +0x24 = 2 and 0x6a87d0 marks it). Then
+// 0x6b6580(WCampaignWindow*, FOTString* map, mode): logs "entering mission", closes the world map with 4.
+const uintptr_t kGoToMap = 0x6b6580;       // void __thiscall(WCampaignWindow*, FOTString*, int), ret 8
+const uintptr_t kMissionDone = 0x6a85d0;   // char __thiscall(campaign*, FOTString*), ret 4
+const uintptr_t kMissionMark = 0x6a87d0;   // void __thiscall(campaign*, FOTString*), ret 4
+
+void BotWorldMapStartMission(uint8_t* campaign_window) {
+    uint8_t* campaign = *reinterpret_cast<uint8_t**>(kCampaignPtr);
+    uint8_t* begin = *reinterpret_cast<uint8_t**>(campaign + 0x1cd);
+    uint8_t* end = *reinterpret_cast<uint8_t**>(campaign + 0x1d1);
+    for (uint8_t* loc = begin; loc && loc < end; loc += 0x2f) {
+        if (*reinterpret_cast<int*>(loc + 0x24) == 0) continue;
+        char map[128] = "";
+        const wchar_t* w = *reinterpret_cast<wchar_t**>(loc + 0x20);
+        if (w) WideCharToMultiByte(CP_ACP, 0, w, -1, map, sizeof(map), nullptr, nullptr);
+        int mode = 3;
+        void** id = reinterpret_cast<void**>(loc + 0x1c);
+        if (!reinterpret_cast<char(__thiscall*)(void*, void**)>(kMissionDone)(campaign, id)) {
+            if (!loc[0x2d]) {
+                if (!loc[0x2e]) {
+                    *reinterpret_cast<int*>(loc + 0x24) = 2;
+                    reinterpret_cast<void(__thiscall*)(void*, void**)>(kMissionMark)(campaign, id);
+                }
+                mode = 1;
+            } else {
+                mode = 4;
+            }
+        }
+        Log("bot: WORLD MAP -> \"%s\" mode %d (as a click on its location does)", map, mode);
+        reinterpret_cast<void(__thiscall*)(void*, void**, int)>(kGoToMap)(campaign_window, reinterpret_cast<void**>(loc + 0x20), mode);
+        return;
+    }
+    Log("bot: FAIL no available location on the world map");
+}
+
+void BotDriveMultiSetup(uint8_t* w);  // netlog.cpp
+void WaitPopupTick(uint8_t* w);  // netlog.cpp
+void PrivateScreenTick(uint8_t* w);  // netlog.cpp
+void PrivateCloseStep();  // below
+bool PrivateScreensClosed();  // netlog.cpp
+extern uint8_t* g_private_speech;
+extern bool g_end_game_mode;
+extern uint8_t* g_client_ptr;
+
+void __fastcall WindowTickHook(uint8_t* w) {
+    NoteWindowClass(w);
+    typedef void(__thiscall * Fn)(void*);
+    reinterpret_cast<Fn>((*reinterpret_cast<void***>(w))[0xc0 / 4])(w);
+    for (uint8_t* c = *reinterpret_cast<uint8_t**>(w + 0x18); c; c = *reinterpret_cast<uint8_t**>(c + 0x24)) {
+        reinterpret_cast<Fn>((*reinterpret_cast<void***>(c))[0x118 / 4])(c);
+    }
+    JoinerFollowHost(w);  // after the tick, so the window is not closed mid-update
+    BotDriveMultiSetup(w);
+    WaitPopupTick(w);
+    PrivateScreenTick(w);
+    if ((g_coop_host || g_coop_join) && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
+        __try {
+            PrivateCloseStep();  // also while the world is held (no frames run)
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("co-op: exception 0x%08x closing the private screens", GetExceptionCode());
+        }
+    }
+    if (g_test.enabled && w == g_private_speech && _stricmp(g_test.scenario, "talk") == 0) BotSpeechTick(w);
+    if (g_test.enabled && _stricmp(g_test.scenario, "recruit") == 0) {
+        if (w == g_private_speech) BotRecruitSpeechTick(w);
+        if (*reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) BotRecruitGameMainTick(w);
+        static uintptr_t dumped[8];
+        static int nd = 0;
+        uintptr_t vt = *reinterpret_cast<uintptr_t*>(w);
+        bool seen = false;
+        for (int i = 0; i < nd; i++) seen |= dumped[i] == vt;
+        if (strstr(RttiName(w), "WSingleRecruit")) g_bot_single_recruit = w;
+        if (!seen && nd < 8 && strstr(RttiName(w), "Recruit")) {  // WRecruit ticks on its own: dump its children's trees
+            dumped[nd++] = vt;
+            Log("bot: recruit window %s ticks: its tree", RttiName(w));
+            DumpWindowTree(w, 0);
+        }
+    }
+    if (g_test.enabled && (_stricmp(g_test.scenario, "trade") == 0 || _stricmp(g_test.scenario, "browse") == 0)) {
+        if (w == g_private_speech) BotTradeSpeechTick(w);
+        if (*reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) BotTradeGameMainTick(w);
+    }
+    if (g_test.enabled && g_coop_host && _stricmp(g_test.scenario, "transition") == 0 &&
+        *reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) {
+        static int ticks = 0;  // let the world map settle (about 2 s) before choosing
+        if (++ticks == 60) BotWorldMapStartMission(w);
+    }
+    if (g_test.enabled && _stricmp(g_test.scenario, "exit") == 0 && *reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) {
+        static int ticks = 0;  // the joiner tries first (refused), the host chooses a little later
+        ++ticks;
+        if (ticks == 30 && g_coop_join) {
+            Log("bot: the joiner tries to choose a location on the world map");
+            BotWorldMapStartMission(w);
+        }
+        if (ticks == 90 && g_coop_host) BotWorldMapStartMission(w);
+    }
+}
+
+bool Once(int step) {
+    if (g_bot_done_step[step]) return false;
+    g_bot_done_step[step] = true;
+    return true;
+}
+
+void BotFinish() {
+    Log("bot: DONE");
+    if (g_log) fflush(g_log);
+    ExitProcess(0);
+}
+
+void BotStep(uint8_t* client, uint8_t* world, int frame) {
+    if (g_bot_t0 < 0) {
+        g_bot_t0 = frame;
+        Log("bot: in game, first frame %d, mode %s, scenario %s", frame, g_coop_host ? "host" : g_coop_join ? "join" : "off",
+            g_test.scenario);
+        RecordWaypoints(world);
+    }
+    int rel = frame - g_bot_t0;
+    // Per session: frames since the session's first in-game frame; snapshots every 50 of them, tagged s=<session>.
+    static LONG session = 0;
+    static int session_t0 = 0;
+    if (g_sessions_started != session) {
+        session = g_sessions_started;
+        session_t0 = frame;
+        g_bot_last_snap = -1;
+        Log("bot: session %ld first frame %d", session, frame);
+    }
+    int rel_s = frame - session_t0;
+    if (g_snap_tag > 0) WatchHp(world, frame, rel_s == 0);
+    if (g_snap_tag > 0) Log("RNG s=%ld f=%d v=%08x", g_snap_tag, frame, *reinterpret_cast<uint32_t*>(world + 0x729));
+    if (g_snap_tag > 0 && rel_s > 0 && rel_s % 50 == 0 && rel_s != g_bot_last_snap) {  // co-op sessions only
+        g_bot_last_snap = rel_s;
+        SnapshotAll(world, frame);
+    }
+    bool host_acts = _stricmp(g_test.actor, "host") == 0;
+    bool i_act = host_acts == g_coop_host;
+    const char* s = g_test.scenario;
+    if (_stricmp(s, "move") == 0) {
+        if (rel >= 30 && Once(0) && i_act) BotMoveMember(client, world, 0, 0);
+        if (rel >= 410) BotFinish();
+    } else if (_stricmp(s, "simul") == 0) {
+        // Same frame: the host orders member 0, the joiner orders member 1.
+        if (rel >= 30 && Once(0)) BotMoveMember(client, world, g_coop_host ? 0 : g_test.index, 0);
+        if (rel >= 410) BotFinish();
+    } else if (_stricmp(s, "attack") == 0) {
+        if (rel >= 30 && Once(0) && i_act) BotAttack(client, world);
+        if (rel >= 200 && Once(1) && i_act) BotAttack(client, world);
+        if (rel >= 510) BotFinish();
+    } else if (_stricmp(s, "soak") == 0) {
+        // Every 120 frames one side orders a squad member to a varying target, alternating host and joiner.
+        if (rel >= 30 && rel < g_test.soak_frames && (rel - 30) % 120 == 0) {
+            int round = (rel - 30) / 120;
+            bool hosts_turn = (round % 2) == 0;
+            if (hosts_turn == g_coop_host) BotMoveMember(client, world, round % 3, 1 + round * 7);
+        }
+        if (rel >= g_test.soak_frames + 20) BotFinish();
+    } else if (_stricmp(s, "resync") == 0) {
+        // Mid-mission re-sync (the mechanism behind map changes and mid-match join): the host quick-saves and
+        // quick-loads, the joiner follows from its mission screen; both keep going in session 2.
+        if (session == 1 && rel_s >= 60 && Once(0) && g_coop_host) RequestResync("bot: mid-mission re-sync");
+        if (session >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "transition") == 0) {
+        if (g_snap_tag == 1 && rel_s >= 60 && Once(0)) BotEndMission("World Map");
+        if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "dropin") == 0) {
+        // Drop-in: the host plays alone (generation 1) until a joiner arrives through the Multiplayer menu; the
+        // host re-syncs and both play generation 2. There the host moves member 0 and the joiner member 1.
+        if (g_snap_tag >= 2 && rel_s >= 30 && Once(0) && g_coop_host) BotMoveMember(client, world, 0, 0);
+        if (g_snap_tag >= 2 && rel_s >= 60 && Once(1) && g_coop_join) BotMoveMember(client, world, 1, 0);
+        if (g_snap_tag >= 2 && rel_s >= max(400, g_test.hold)) BotFinish();  // [test] hold: stay longer
+    } else if (_stricmp(s, "talk") == 0) {
+        // Bunker save: [test] actor starts the conversation the owner had with the recruiting NPC (the same command,
+        // byte for byte). Its copy keeps the conversation, the other copy must close it. While it is open the actor's
+        // copy changes one HP locally, as a trade would change an inventory; then it ends the conversation. The
+        // other copy must end up with that change: session 2 starts from the actor's game.
+        for (int leg = 0; leg < kOwnerRouteLegs; leg++)
+            if (g_snap_tag == 1 && rel_s >= 30 + 80 * leg && Once(5 + leg) && i_act) BotRouteLeg(client, world, leg);
+        const int talk_at = 30 + 80 * kOwnerRouteLegs + 40;
+        if (g_snap_tag == 1 && rel_s >= talk_at && Once(0) && i_act) {
+            float* a = EntityPos(world, g_bot_talker);
+            Log("bot: route done, member %u at (%.3f,%.3f,%.3f)", g_bot_talker, a[0], a[1], a[2]);
+            BotTalk(client, world, 0, frame);
+        }
+        if (g_snap_tag == 1 && rel_s >= talk_at + 500 && !g_bot_done_step[1] && i_act) {
+            Log("bot: FAIL no conversation opened 500 frames after the talk command");
+            BotFinish();
+        }
+        // While the conversation is open the game runs no frames: its window tick drives the bot (BotSpeechTick).
+        if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "recruit") == 0) {
+        // Bunker save: [test] actor's member 0 walks the owner's route to the recruiting NPC, talks, presses Recruit
+        // (BotRecruitGameMainTick). First run: exploration of the recruit screen's windows and buttons.
+        for (int leg = 0; leg < kOwnerRouteLegs; leg++)
+            if (g_snap_tag == 1 && rel_s >= 30 + 80 * leg && Once(5 + leg) && i_act) BotRouteLeg(client, world, leg);
+        const int talk_at = 30 + 80 * kOwnerRouteLegs + 40;
+        if (g_snap_tag == 1 && rel_s >= talk_at && Once(0) && i_act) BotTalk(client, world, 0, frame);
+        if (g_snap_tag == 1 && rel_s >= talk_at + 500 && !g_bot_done_step[1] && i_act) {
+            Log("bot: FAIL no conversation opened 500 frames after the talk command");
+            BotFinish();
+        }
+        if ((g_snap_tag >= 2 && rel_s >= 200) || (g_snap_tag == 1 && rel_s >= talk_at + 450)) BotFinish();  // no reload: session 1 goes on
+    } else if (_stricmp(s, "exit") == 0) {
+        // Bunker save: the whole squad walks onto the bunker's exit grid, where the owner left it in runtime run 3
+        // (squad moves to (369.3, 32, 345.5) and (370.0, 32, 343.2), then the world map). The mission's own exit
+        // trigger ends it. On the world map the joiner tries to choose a location (refused: only the host chooses),
+        // then the host chooses; everyone plays the new mission (WindowTickHook).
+        static const float legs[2][3] = {{369.3f, 32.0f, 345.5f}, {370.0f, 32.0f, 343.2f}};
+        for (int leg = 0; leg < 2; leg++)
+            if (g_snap_tag == 1 && rel_s >= 30 + 120 * leg && Once(5 + leg) && i_act) BotMoveSquad(client, world, legs[leg]);
+        if (g_snap_tag == 1 && rel_s >= 900 && Once(0)) Log("bot: FAIL the squad is not off the map 900 frames in");
+        if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "browse") == 0) {
+        // Bunker save: [test] actor walks to the merchant, talks, opens barter, buys nothing, leaves. No reload: only
+        // the entity bookkeeping (the shop's stock came and went) goes to the other copy as co-op commands. Meanwhile
+        // the other player tries to talk to the same merchant and must be refused (the NPC lock).
+        for (int leg = 0; leg < 2; leg++)
+            if (g_snap_tag == 1 && rel_s >= 30 + 80 * leg && Once(5 + leg) && i_act) BotRouteLeg(client, world, leg);
+        if (g_snap_tag == 1 && rel_s >= 190 && Once(7) && i_act) SendCommand(client, 0, g_bot_talker, 0, kMerchantApproach, 4);
+        const int talk_at = 310;
+        if (g_snap_tag == 1 && rel_s >= talk_at && Once(0) && i_act) BotTalk(client, world, kMerchant, frame);
+        if (g_snap_tag == 1 && rel_s >= talk_at + 8 && Once(2) && !i_act) {
+            uint16_t squad[16];
+            if (GetSquad(world, squad, 16) > 1) {
+                g_bot_talker = squad[1];
+                Log("bot: the other player tries to talk to the merchant too");
+                BotTalk(client, world, kMerchant, frame);
+            }
+        }
+        if (rel_s >= talk_at + 500) BotFinish();
+    } else if (_stricmp(s, "trade") == 0) {
+        // Bunker save. Both players move squad members around first (the other side member 1, the actor member 2),
+        // then [test] actor's member 0 walks to the merchant, talks, barters (BotTradeGameMainTick) and trades.
+        // Session 1 must match on both copies until the talk; session 2 (from the trader's game) everywhere.
+        if (g_snap_tag == 1 && rel_s >= 30 && Once(2) && !i_act) BotMoveMember(client, world, 1, 0);
+        if (g_snap_tag == 1 && rel_s >= 60 && Once(3) && i_act) BotMoveMember(client, world, 2, 0);
+        for (int leg = 0; leg < 2; leg++)
+            if (g_snap_tag == 1 && rel_s >= 30 + 80 * leg && Once(5 + leg) && i_act) BotRouteLeg(client, world, leg);
+        if (g_snap_tag == 1 && rel_s >= 190 && Once(7) && i_act) {
+            Log("bot: ROUTE to the merchant: member %u to (%.3f,%.3f,%.3f)", g_bot_talker, kMerchantApproach[0],
+                kMerchantApproach[1], kMerchantApproach[2]);
+            SendCommand(client, 0, g_bot_talker, 0, kMerchantApproach, 4);
+        }
+        const int talk_at = 310;
+        if (g_snap_tag == 1 && rel_s >= talk_at && Once(0) && i_act) {
+            float* a = EntityPos(world, g_bot_talker);
+            float* b = EntityPos(world, kMerchant);
+            Log("bot: at the merchant: member %u at (%.3f,%.3f,%.3f), merchant at (%.3f,%.3f,%.3f)", g_bot_talker,
+                a[0], a[1], a[2], b[0], b[1], b[2]);
+            BotTalk(client, world, kMerchant, frame);
+        }
+        if (g_snap_tag == 1 && rel_s >= talk_at + 500 && !g_bot_done_step[1] && i_act) {
+            Log("bot: FAIL no conversation opened 500 frames after the talk command");
+            BotFinish();
+        }
+        if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= talk_at + 450)) BotFinish();  // no reload: session 1 goes on
+    } else if (_stricmp(s, "watch") == 0 || _stricmp(s, "play") == 0) {
+        // A person plays; the bot only logs (snapshots, RNG, HP changes) so copies can be compared afterwards.
+        // play: unlike watch, the copies load [test] save themselves and the host waits for [test] joiners.
+    } else {
+        Log("bot: FAIL unknown scenario \"%s\"", s);
+        BotFinish();
+    }
+}
+
+#include "private_sync.inc"
+
+void PrivateCloseStep() {  // frame hook, and the mission screen's tick (the world may be held: no frames)
+    if (PrivateScreensClosed()) {
+        if (g_test.enabled && (_stricmp(g_test.scenario, "trade") == 0 || _stricmp(g_test.scenario, "recruit") == 0)) {
+            uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);  // what the others will get
+            LogInv(world, "SYNCED", g_bot_talker);
+            LogInv(world, "SYNCED", kMerchant);
+            LogSquad(world, "SYNCED");
+        }
+        if (PrivateScreensDiff() != kDiffFull) {
+            // nothing to reload: the co-op commands carried what changed
+        } else if (g_coop_host) {
+            RequestResync("the host's private screens closed");
+            Notice("Co-op: the host traded or changed the squad - saving and reloading for everyone");
+        } else if (g_coop_join) {
+            g_push_state = 1;
+            Notice("Co-op: sending your trades and squad changes to the host");
+        }
+    }
+}
+
+uint32_t __fastcall FrameTickHook(uint8_t* client) {
+    g_client_ptr = client;
+    __try {
+        ReapplyBookkeeping();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("co-op: exception 0x%08x re-applying delta bookkeeping", GetExceptionCode());
+    }
+    __try {
+        if (g_coop_host) {
+            if (const char* reason = NewJoinerNeedingResync()) {
+                RequestResync(reason);
+                Notice("Co-op: %s - saving and reloading to bring them in", reason);
+            }
+            NoticeLeftJoiners();
+            if (InterlockedExchange(&g_upload_ready, 0)) {
+                if (g_resync_state == 0) {
+                    Notice("Co-op: %s traded or changed the squad - reloading everyone from their game", g_upload_from);
+                    g_resync_reason = "a joiner's private screens closed";
+                    g_resync_state = 5;
+                } else {
+                    Log("host: a joiner's save arrived during a re-sync: dropped");
+                }
+            }
+        }
+        PrivateCloseStep();
+        JoinerPushStep();
+        ShowQueuedNotices(client);
+        HostResyncStep();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("host: exception 0x%08x in re-sync step", GetExceptionCode());
+    }
+    if (g_test.enabled) {
+        __try {
+            uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+            BotStep(client, world, *reinterpret_cast<int*>(world + kWorldFrame));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("bot: exception 0x%08x in frame step", GetExceptionCode());
+        }
+    }
+    g_in_tick = true;
+    uint32_t r = reinterpret_cast<uint32_t(__thiscall*)(uint8_t*)>(kClientTickProcessor)(client);
+    g_in_tick = false;
+    return r;
+}
