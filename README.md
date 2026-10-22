@@ -72,19 +72,23 @@ game's own multiplayer ports. Windows Firewall may ask to allow the game the fir
 
 Checked by the automated tests in `test/`:
 
-- Moving and fighting with the shared squad, with every copy in step.
+- Moving and fighting with the shared squad, with every copy in step, for 2 to 4 players.
 - Joining from the Multiplayer menu, and joining a game already in progress.
 - Saving and reloading mid-mission (the others follow), and mission → world map → next mission.
-- In the bunker: buying and selling, and recruiting or dismissing squad members, without any reload.
-  Only one player at a time can talk to a given merchant or recruiter.
+- In the bunker, without any reload: buying and selling (new items included) and quest variables a conversation
+  changes. Tested with 2, 3 and 4 players.
+- Recruiting and dismissing squad members (with one save and reload, see below).
+- One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
+  others are told someone got there first.
 - The world map: only the host picks where to go; the others follow.
+- Joining by the host's network address (tested on one PC through its LAN address).
 
 ## Known issues
 
 - While one player is in a conversation, trade or recruit screen, the other players' games pause until it closes.
-- A conversation that changes quest state still saves and reloads everyone.
-- Not tested yet: 3 or 4 players with the bunker sync, two separate PCs, buying an item that starts a new stack,
-  recruiting someone who is not already in the world.
+- Using the recruiter (recruiting or dismissing) saves and reloads everyone once, a few seconds. Live sync for it is
+  [issue #1](https://github.com/thennak3/fallout-tactics-coop/issues/1).
+- Not tested yet: two separate PCs, play over the internet.
 - Turn-based modes are untested; the tests use Continuous Turn-Based.
 
 ## Build from source

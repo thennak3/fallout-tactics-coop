@@ -25,7 +25,9 @@ uint8_t* Entries(uint8_t* world) { return *reinterpret_cast<uint8_t**>(world + k
 int EntityCount(uint8_t* world) {
     return static_cast<int>((*reinterpret_cast<uint8_t**>(world + kWorldEntities + 4) - Entries(world)) / 8);
 }
-uint8_t* EntityById(uint8_t* world, uint16_t id) { return *reinterpret_cast<uint8_t**>(Entries(world) + id * 8); }
+uint8_t* EntityById(uint8_t* world, uint16_t id) {  // an id outside the table gives the dummy entity (slot 0)
+    return *reinterpret_cast<uint8_t**>(Entries(world) + (id < EntityCount(world) ? id : 0) * 8);
+}
 float* EntityPos(uint8_t* world, uint16_t id) { return reinterpret_cast<float*>(EntityById(world, id) + kEntityPos); }
 int ActorHp(uint8_t* world, uint16_t id) { return *reinterpret_cast<int*>(EntityById(world, id) + kActorHp); }
 uint32_t FullId(uint8_t* world, uint16_t id) {  // EntityID {u16 seq, u16 id}; seq from the table entry +6
@@ -35,6 +37,9 @@ bool IsActor(uint8_t* world, int i) {
     uint8_t* e = EntityById(world, static_cast<uint16_t>(i));
     return e && e != *reinterpret_cast<uint8_t**>(Entries(world)) && *reinterpret_cast<uintptr_t*>(e) == kActorVtable;
 }
+// recruit: dismiss two, add one back (the list selects the last dismissed); recruitnew: add someone never recruited
+bool IsRecruitScenario() { return _stricmp(g_test.scenario, "recruit") == 0 || _stricmp(g_test.scenario, "recruitnew") == 0; }
+
 bool InList(const uint16_t* ids, int n, int id) {
     for (int i = 0; i < n; i++)
         if (ids[i] == id) return true;
@@ -88,6 +93,8 @@ uint16_t FirstItem(uint8_t* world, uint16_t actor) {
     return static_cast<uint16_t>(atoi(s));
 }
 
+uint32_t HashVars(uint8_t* world);  // private_sync.inc
+
 void SnapshotAll(uint8_t* world, int frame) {
     int count = EntityCount(world), actors = 0;
     for (int i = 1; i < count; i++) actors += IsActor(world, i);
@@ -111,6 +118,17 @@ void SnapshotAll(uint8_t* world, int frame) {
     }
     h = (h ^ *reinterpret_cast<uint16_t*>(world + 0x74f)) * 16777619u;
     Log("ETAB s=%ld f=%d n=%d hash=%08x", g_snap_tag, frame, count, h);
+    {  // every entry, to diff copies offline: used (0/1), next_free, seq as hex, 4096 entries at most
+        static char line[4096 * 12 + 64];
+        size_t len = 0;
+        for (int i = 0; i < count && i < 4096; i++) {
+            void* p = *reinterpret_cast<void**>(e + i * 8);
+            len += sprintf_s(line + len, sizeof(line) - len, "%d%04x%04x ", p && p != dummy ? 1 : 0,
+                             *reinterpret_cast<uint16_t*>(e + i * 8 + 4), *reinterpret_cast<uint16_t*>(e + i * 8 + 6));
+        }
+        Log("ETABX s=%ld f=%d %s", g_snap_tag, frame, line);
+    }
+    Log("VARS s=%ld f=%d hash=%08x", g_snap_tag, frame, HashVars(world));  // mission and campaign variables
     for (int i = 1; i < count; i++) {
         if (!IsActor(world, i)) continue;
         float* p = EntityPos(world, static_cast<uint16_t>(i));
@@ -447,6 +465,7 @@ void ExploreSerialize(uint8_t* world, uint16_t id, int mode) {
 
 int g_bot_caps_before = 0;
 void PressHandler(uintptr_t handler, uint8_t* owner, const char* what);  // below, with the recruit screen
+void BotChangeQuestVar(uint8_t* world);  // private_sync.inc
 
 // Fill the offers: the merchant's first item that is not caps, and caps from the buyer (three times its value, at
 // least 20, at most what the buyer has).
@@ -457,15 +476,32 @@ void BotDealOffer(uint8_t* world) {
     uint16_t items[200];
     int counts[200];
     int n = InvItems(world, merchant, items, counts, 200);
-    uint16_t buy = 0;  // the cheapest item that is not money
+    // The cheapest item that is not money, preferring a kind the buyer does not carry: it cannot merge into one of the
+    // buyer's stacks, so the merchant's entity itself (made when the barter screen opened, on this copy only) ends up
+    // in the buyer's inventory, and the delta must create it on the other copies.
+    uint16_t own[200];
+    int own_counts[200];
+    int nown = InvItems(world, buyer, own, own_counts, 200);
+    uint16_t buy = 0;
     int cheapest = 0x7fffffff;
+    bool buy_new = false;
     for (int i = 0; i < n; i++) {
         int v = *reinterpret_cast<int*>(EntityById(world, items[i]) + kItemValue);
-        if (!IsCaps(world, items[i]) && v > 0 && v < cheapest) {
+        if (IsCaps(world, items[i]) || v <= 0) continue;
+        char nm[64], mine[64];
+        ItemName(world, items[i], nm, sizeof(nm));
+        bool fresh = true;
+        for (int j = 0; j < nown && fresh; j++) {
+            ItemName(world, own[j], mine, sizeof(mine));
+            fresh = strcmp(nm, mine) != 0;
+        }
+        if ((fresh && !buy_new) || (fresh == buy_new && v < cheapest)) {
             cheapest = v;
             buy = items[i];
+            buy_new = fresh;
         }
     }
+    Log("bot: buying %s item kind", buy_new ? "a NEW" : "an already carried");
     uint16_t caps = 0;
     g_bot_caps_before = CapsOf(world, buyer, &caps);
     char names[2048] = "";
@@ -516,6 +552,7 @@ void BotDealPress(uint8_t* gm, uint8_t* world) {
     LogInv(world, "OFFER AFTER", OfferOf(world, buyer));
     LogInv(world, "OFFER AFTER", OfferOf(world, merchant));
     Log("bot: DEAL buyer %u caps %d -> %d", buyer, g_bot_caps_before, caps_after);
+    BotChangeQuestVar(world);
 }
 
 // Recruit: the conversation's Recruit button 0x4d0110 (FTSE notes; __thiscall(WSpeech*, button), ret 4) on the
@@ -622,6 +659,58 @@ void BotRecruitGameMainTick(uint8_t* w) {
         }
         EntityById(world, squad[0])[0xb2] |= 0x40;  // the talker is selected again, as it was
         LogSquad(world, "AFTER REMOVE");
+        // Recruit someone who was not just dismissed. The add button (0x4d4fe0: vtable +0x1a8 picks, +0x1b4 adds)
+        // picks from the recruit pool, a player in World+0x733 (stride 0x15d) whose members list is at +0x4b; the pick
+        // is the pool member flagged +0xb2 bit 0x40, as for remove. The dismissed members went to that pool flagged.
+        // The recruit list box (+0xfa): 0x6cde50 gives {u8, item* begin @+4, end @+8}; an item's +0x134 -> EntityID
+        // at +0x153 (seq) / +0x155 (id); 0x6cded0(listbox, index, flag) selects one (remove selects the member it
+        // dismissed that way). Select an entry that was not just dismissed.
+        __try {
+            uint8_t* lb = *reinterpret_cast<uint8_t**>(g_bot_single_recruit + 0xfa);
+            uint8_t* v = reinterpret_cast<uint8_t*(__thiscall*)(void*)>(0x6cde50)(lb);
+            uint8_t** it = *reinterpret_cast<uint8_t***>(v + 4);
+            uint8_t** end = *reinterpret_cast<uint8_t***>(v + 8);
+            char ents[256] = "";
+            size_t el = 0;
+            int pick_index = -1;
+            uint16_t pick_id = 0;
+            for (int i = 0; it && it + i < end && i < 32; i++) {
+                uint16_t id = *reinterpret_cast<uint16_t*>(*reinterpret_cast<uint8_t**>(it[i] + 0x134) + 0x155);
+                el += sprintf_s(ents + el, sizeof(ents) - el, "%s%u", i ? "," : "", id);
+                if (pick_index < 0 && id != squad[n - 1] && id != squad[n - 2] && !InList(squad, n, id)) {
+                    pick_index = i;
+                    pick_id = id;
+                }
+            }
+            Log("bot: recruit list entries: %s", ents);
+            if (pick_index >= 0 && _stricmp(g_test.scenario, "recruitnew") == 0) {  // recruit: re-add, no new character
+                reinterpret_cast<void(__thiscall*)(void*, int, int)>(0x6cded0)(lb, pick_index, 1);
+                Log("bot: RECRUIT choosing pool member %u (list entry %d, not one just dismissed)", pick_id, pick_index);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("bot: exception 0x%08x reading the recruit list", GetExceptionCode());
+        }
+        uint8_t* begin = *reinterpret_cast<uint8_t**>(world + kWorldPlayers);
+        int players = static_cast<int>((*reinterpret_cast<uint8_t**>(world + kWorldPlayers + 4) - begin) / kPlayerSize);
+        for (int p = 0; p < players && n > 2; p++) {
+            if (p == 1) continue;
+            uint8_t* head = *reinterpret_cast<uint8_t**>(begin + p * kPlayerSize + kPlayerMembers);
+            uint16_t pool[64];
+            int np = 0;
+            for (uint8_t* node = *reinterpret_cast<uint8_t**>(head); node && node != head && np < 64;
+                 node = *reinterpret_cast<uint8_t**>(node))
+                pool[np++] = *reinterpret_cast<uint16_t*>(node + 10);
+            char ids[256] = "";
+            size_t il = 0;
+            for (int i = 0; i < np && il + 8 < sizeof(ids); i++) il += sprintf_s(ids + il, sizeof(ids) - il, "%s%u", i ? "," : "", pool[i]);
+            Log("bot: player %d members (%d): %s", p, np, ids);
+            if (!InList(pool, np, squad[n - 1]) && !InList(pool, np, squad[n - 2])) continue;
+            uint16_t pick = 0;
+            for (int i = 0; i < np && !pick; i++)
+                if (pool[i] != squad[n - 1] && pool[i] != squad[n - 2] && IsActor(world, pool[i])) pick = pool[i];
+            Log("bot: player %d holds a dismissed member; a member that was not: %u", p, pick);
+            break;
+        }
     }
     if (!added && t >= 1700 && mode == 8 && g_bot_single_recruit) {
         added = true;
@@ -796,6 +885,7 @@ void WaitPopupTick(uint8_t* w);  // netlog.cpp
 void PrivateScreenTick(uint8_t* w);  // netlog.cpp
 void PrivateCloseStep();  // below
 bool PrivateScreensClosed();  // netlog.cpp
+void ReleaseTalkerHold();     // netlog.cpp
 extern uint8_t* g_private_speech;
 extern bool g_end_game_mode;
 extern uint8_t* g_client_ptr;
@@ -819,7 +909,7 @@ void __fastcall WindowTickHook(uint8_t* w) {
         }
     }
     if (g_test.enabled && w == g_private_speech && _stricmp(g_test.scenario, "talk") == 0) BotSpeechTick(w);
-    if (g_test.enabled && _stricmp(g_test.scenario, "recruit") == 0) {
+    if (g_test.enabled && IsRecruitScenario()) {
         if (w == g_private_speech) BotRecruitSpeechTick(w);
         if (*reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) BotRecruitGameMainTick(w);
         static uintptr_t dumped[8];
@@ -891,7 +981,9 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         SnapshotAll(world, frame);
     }
     bool host_acts = _stricmp(g_test.actor, "host") == 0;
-    bool i_act = host_acts == g_coop_host;
+    // [test] actor: host, join (the first joiner only) or all (every joiner: the race for one merchant).
+    bool i_act = _stricmp(g_test.actor, "all") == 0 ? g_coop_join
+                                                     : host_acts == g_coop_host && (g_coop_host || g_test.index == 1);
     const char* s = g_test.scenario;
     if (_stricmp(s, "move") == 0) {
         if (rel >= 30 && Once(0) && i_act) BotMoveMember(client, world, 0, 0);
@@ -945,7 +1037,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         }
         // While the conversation is open the game runs no frames: its window tick drives the bot (BotSpeechTick).
         if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
-    } else if (_stricmp(s, "recruit") == 0) {
+    } else if (IsRecruitScenario()) {
         // Bunker save: [test] actor's member 0 walks the owner's route to the recruiting NPC, talks, presses Recruit
         // (BotRecruitGameMainTick). First run: exploration of the recruit screen's windows and buttons.
         for (int leg = 0; leg < kOwnerRouteLegs; leg++)
@@ -1024,13 +1116,15 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
 
 void PrivateCloseStep() {  // frame hook, and the mission screen's tick (the world may be held: no frames)
     if (PrivateScreensClosed()) {
-        if (g_test.enabled && (_stricmp(g_test.scenario, "trade") == 0 || _stricmp(g_test.scenario, "recruit") == 0)) {
+        if (g_test.enabled && (_stricmp(g_test.scenario, "trade") == 0 || IsRecruitScenario())) {
             uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);  // what the others will get
             LogInv(world, "SYNCED", g_bot_talker);
             LogInv(world, "SYNCED", kMerchant);
             LogSquad(world, "SYNCED");
         }
-        if (PrivateScreensDiff() != kDiffFull) {
+        int diff = PrivateScreensDiff();
+        ReleaseTalkerHold();  // the delta is out: this world goes on (a re-sync needs frames too)
+        if (diff != kDiffFull) {
             // nothing to reload: the co-op commands carried what changed
         } else if (g_coop_host) {
             RequestResync("the host's private screens closed");
@@ -1046,6 +1140,7 @@ uint32_t __fastcall FrameTickHook(uint8_t* client) {
     g_client_ptr = client;
     __try {
         ReapplyBookkeeping();
+        if (g_test.enabled) DebugDumpActors();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("co-op: exception 0x%08x re-applying delta bookkeeping", GetExceptionCode());
     }

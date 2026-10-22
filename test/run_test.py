@@ -58,12 +58,17 @@ TESTS = {
     "trade_join": ("trade", "join", 4),  # the same with the joiner trading
     "recruit_host": ("recruit", "host", 4),  # bunker: the host talks to the recruiter and recruits; the joiner gets the squad
     "recruit_join": ("recruit", "join", 4),  # the same with the joiner recruiting
+    "recruitnew_host": ("recruitnew", "host", 4),  # bunker: the host recruits someone never recruited: save and reload
+    "recruitnew_join": ("recruitnew", "join", 4),  # the same from the joiner: its save goes to the host
+    "trade_race": ("trade", "all", 4),  # bunker, 3+ players: every joiner talks to the merchant at once; one wins and trades
     "browse_host": ("browse", "host", 6),  # bunker: the host opens barter, buys nothing: no reload; joiner is refused
     "browse_join": ("browse", "join", 6),  # the same with the joiner browsing; the host is refused
     "exit_host": ("exit", "host", 4),  # bunker: the host walks the squad onto the exit grid; world map, host picks
     "exit_join": ("exit", "join", 4),  # the same with the joiner walking the squad out; the host still picks
 }
 MENU_TESTS = {"menu_join", "dropin"}
+HOST_IP = "127.0.0.1"  # --host-ip: the address joiners connect to (this PC's LAN address tests the real network path)
+FORCE_FILE_SERVER = False  # set in main: trades with more than one joiner use the file-server path
 DROPIN_DELAY_S = 10  # dropin: start the joiner this long after the host, so the host is already playing
 
 
@@ -76,8 +81,10 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
               menu=False, joiners=1, index=1, hold=0):
     # menu: the copy starts with co-op off and the bot presses Multiplayer > Host or Join (mode names which).
     with open(os.path.join(folder, "ftcoop.ini"), "w", newline="\r\n") as f:
-        f.write(f"[coop]\nmode={'off' if menu else mode}\nhost=127.0.0.1\nshare_squad={1 if share_squad else 0}\n")
+        f.write(f"[coop]\nmode={'off' if menu else mode}\nhost={HOST_IP}\nshare_squad={1 if share_squad else 0}\n")
         f.write(f"fetch_save={1 if fetch else 0}\nfollow={1 if follow else 0}\n")
+        if FORCE_FILE_SERVER:  # trade with 3-4 players: the delta then goes through the host's file server
+            f.write("lockstep_chunks=10\n")
         f.write(f"[test]\nenabled=1\nsave={save}\nscenario={scenario}\nactor={actor}\njoiners={joiners}\n")
         f.write(f"timeout={timeout}\nsoak_frames={soak_frames}\n")
         if menu:
@@ -110,6 +117,12 @@ def inventories(log):
     return out
 
 
+def tables(log, tag):
+    """(session, frame) -> hash, for the ETAB and VARS lines"""
+    return {(int(m.group(1)), int(m.group(2))): m.group(3)
+            for m in re.finditer(tag + r" s=(\d+) f=(\d+) (?:n=\d+ )?hash=(\S+)", log)}
+
+
 def squads(log):
     """(session, frame) -> "id,id,..." (the campaign squad, in order)"""
     return {(int(m.group(1)), int(m.group(2))): m.group(3)
@@ -132,15 +145,19 @@ def main():
     ap.add_argument("--mutate-fetch", action="store_true", help="turn the save transfer off; fetch_save must FAIL")
     ap.add_argument("--mutate-follow", action="store_true", help="joiner never follows a new save; resync must FAIL")
     ap.add_argument("--joiners", type=int, default=1, choices=(1, 2, 3), help="joiner copies (players - 1)")
+    ap.add_argument("--host-ip", default="127.0.0.1", help="address the joiners connect to (default loopback)")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
     ap.add_argument("--save", default=None, help="save both copies start from (default New Save Game.sav)")
     args = ap.parse_args()
+    global HOST_IP, FORCE_FILE_SERVER
+    HOST_IP = args.host_ip
     extras = EXTRA_JOIN_DIRS[:args.joiners - 1]
     scenario, actor, min_frames = TESTS[args.test]
+    FORCE_FILE_SERVER = scenario == "trade" and args.joiners > 1
     global SAVE
     if args.save:
         SAVE = args.save
-    elif scenario in ("talk", "trade", "recruit", "browse", "exit"):
+    elif scenario in ("talk", "trade", "recruit", "recruitnew", "browse", "exit"):
         SAVE = "user/save/bunker.sav"
     if args.test == "soak":
         min_frames = args.soak_frames // 50 - 1
@@ -180,7 +197,7 @@ def main():
     # Back up the play settings. A file that still has a [test] section is a leftover from an interrupted run,
     # not the owner's settings: restore the plain play config instead (once this backed up a test ini).
     backups = {}
-    join_default = "[coop]\r\nmode=join\r\nhost=127.0.0.1\r\n"
+    join_default = f"[coop]\r\nmode=join\r\nhost={HOST_IP}\r\n"
     for d, default in [(HOST_DIR, "[coop]\r\nmode=host\r\n"), (JOIN_DIR, join_default)] + [(e, join_default) for e in extras]:
         ini = os.path.join(d, "ftcoop.ini")
         text = read(ini) if os.path.exists(ini) else None
@@ -233,11 +250,33 @@ def main():
 
     host, join = read(os.path.join(HOST_DIR, "netlog.txt")), read(os.path.join(JOIN_DIR, "netlog.txt"))
     extra_logs = [read(os.path.join(d, "netlog.txt")) for d in extras]
+    if actor == "all":  # the race: exactly one joiner gets the merchant; it is checked as the trader below
+        joiner_logs = [join] + extra_logs
+        winners = [i for i, l in enumerate(joiner_logs) if "co-op: .?AVWSpeech@@ opened for this player" in l]
+        check("race: every joiner talked to the merchant", len(extras) >= 1
+              and all("bot: TALK (the owner's talk command, to NPC 96" in l for l in joiner_logs))
+        check("race: exactly one joiner got the conversation", len(winners) == 1, f"winners {winners}")
+        losers = [l for i, l in enumerate(joiner_logs) if i not in winners]
+        # A loser either sent its talk and lost at the host (dropped; the winner's claim tells it), or got the
+        # winner's claim before sending and was refused on its own copy.
+        sent = [l for l in losers if "co-op: claim " in l and " sent for NPC 96" in l]
+        check("race: the host relayed one claim and dropped the talk of every loser that sent one",
+              len(re.findall(r"host: dropped player \d+'s talk to NPC 96", host)) == len(sent)
+              and len(re.findall(r"co-op: NPC 96 claimed by", host)) == 1, f"{len(sent)} of {len(losers)} losers sent")
+        check("race: every loser was told someone else got there first, and kept no conversation",
+              all("co-op: NPC 96 claimed by another player" in l and "opened for this player" not in l
+                  and ("notice: Co-op: another player got to them first" in l
+                       or "refused this player's talk to NPC 96" in l) for l in losers))
+        if len(winners) == 1 and winners[0] > 0:  # put the winner first
+            w = winners[0]
+            join, extra_logs[w - 1] = extra_logs[w - 1], join
+            codes[1], codes[w + 1] = codes[w + 1], codes[1]
+        actor = "join"
     check("both copies exited cleanly (code 0)", codes[:2] == [0, 0], f"host={codes[0]} joiner={codes[1]}")
     # Mode asserts: guard against a hollow pass where a copy silently ran single-player.
     hooks = "main-menu hook ok, pump hook ok"
     check("host became the co-op host", "co-op: hosting" in host and hooks in host)
-    check("joiner became a co-op joiner", "co-op: joining 127.0.0.1" in join and hooks in join)
+    check("joiner became a co-op joiner", f"co-op: joining {HOST_IP}" in join and hooks in join)
     if menu:
         check("Start Co-op button added to the Multiplayer screen", "menu: Start Co-op button added" in host)
         check("host pressed Start Co-op", "menu: Multiplayer > Start Co-op" in host and "co-op mode at start: off" in host)
@@ -269,7 +308,7 @@ def main():
     if scenario == "talk":  # session 1 differs on purpose once the talker changes its game; 2 must not
         shared = [k for k in shared if k[0] >= 2]
     talk_frame = free_frame = None
-    if scenario in ("trade", "recruit", "browse"):
+    if scenario in ("trade", "recruit", "recruitnew", "browse"):
         # Before the talk both copies match; from the talk the talker's game differs until the other copy applied the
         # talker's delta (no reload); from the frame after that, everything must match again.
         tf = re.search(r"bot: TALK .* at frame (\d+)", host if actor == "host" else join)
@@ -277,7 +316,7 @@ def main():
         ff = [int(x) for x in re.findall(r"co-op: NPC 9?6?\d* is free again \([^)]*\) at frame (-?\d+)", host + join)]
         free_frame = max(ff) if ff else None
         shared = [k for k in shared if k[0] >= 2 or (talk_frame is not None and k[1] < talk_frame)
-                  or (free_frame is not None and k[1] > free_frame + 1)]
+                  or (free_frame is not None and k[1] > free_frame + 1 and scenario != "recruitnew")]
     check(f"at least {min_frames} shared snapshot frames", len(shared) >= min_frames,
           f"{len(shared)} shared, host {len(s_host)}, joiner {len(s_join)}")
     mismatch = [f for f in shared if s_host[f] != s_join[f]]
@@ -304,6 +343,11 @@ def main():
     e_bad = [f for f in shared if e_host.get(f) != e_join.get(f) or not e_host.get(f)]
     check("same entity-table bookkeeping on both copies at every shared frame", bool(shared) and not e_bad,
           f"first mismatch {e_bad[0]}: host {e_host.get(e_bad[0])} joiner {e_join.get(e_bad[0])}" if e_bad
+          else f"{len(shared)} frames")
+    v_host, v_join = tables(host, "VARS"), tables(join, "VARS")
+    v_bad = [f for f in shared if v_host.get(f) != v_join.get(f) or not v_host.get(f)]
+    check("same quest variables on both copies at every shared frame", bool(shared) and not v_bad,
+          f"first mismatch {v_bad[0]}: host {v_host.get(v_bad[0])} joiner {v_join.get(v_bad[0])}" if v_bad
           else f"{len(shared)} frames")
     check("same squad on both copies at every shared frame", bool(shared) and not q_bad,
           f"first mismatch {q_bad[0]}: host {q_host.get(q_bad[0])} joiner {q_join.get(q_bad[0])}" if q_bad
@@ -418,42 +462,42 @@ def main():
         later = [k for k in shared if k[0] == 1]
         check("at least 6 shared frames, all identical (positions, HP, inventories, squad, entity table)",
               len(later) >= 6, f"{len(later)} frames")
-    elif scenario == "recruit":
+    elif scenario in ("recruit", "recruitnew"):
+        # A recruit visit is the old save and reload for now: the recruit screen makes its candidates as characters on
+        # the recruiter's copy only (recruit: dismiss two, take one back; recruitnew: someone never recruited).
         rec, other = (host, join) if actor == "host" else (join, host)
-        check(f"the {actor} talked to the recruiter and its copy saw its own talk command",
-              "bot: TALK (the owner's talk command, to NPC 81" in rec and "co-op: this player started a conversation" in rec)
-        if actor == "join":
-            check("host saw the joiner's talk command", re.search(r"host: player \d+ started a conversation", host) is not None)
-        check(f"the conversation stayed open on the {actor}'s copy", "co-op: .?AVWSpeech@@ opened for this player" in rec)
-        check("the other copy closed it", "AVWSpeech@@ opened for another player's conversation: closing it here" in other
-              and "opened for this player" not in other)
-        check("the conversation's Recruit button opened the recruit screen on the recruiter's copy only",
-              "bot: RECRUIT screen: mode 8" in rec and "RECRUIT" not in other
-              and not re.search(r"ui: window \S*SingleRecruit", other))
+        check(f"the {actor} talked to the recruiter and its copy kept the conversation",
+              "bot: TALK (the owner's talk command, to NPC 81" in rec and "co-op: .?AVWSpeech@@ opened for this player" in rec)
+        check("the other copy closed it", "AVWSpeech@@ opened for another player's conversation: closing it here" in other)
         sq = {m.group(1): m.group(2) for m in
               re.finditer(r"bot: SQUAD (BEFORE|AFTER REMOVE|AFTER ADD|AFTER DONE|SYNCED) n=\d+ ids=(\S*)", rec)}
-        check("the recruit screen's remove button dismissed a squad member",
-              bool(sq.get("AFTER REMOVE")) and len(sq["AFTER REMOVE"].split(",")) < len(sq.get("BEFORE", "").split(",")),
-              f"before {sq.get('BEFORE')}, after remove {sq.get('AFTER REMOVE')}")
-        check("the recruit screen's add button added a squad member",
-              bool(sq.get("AFTER ADD")) and len(sq["AFTER ADD"].split(",")) > len(sq.get("AFTER REMOVE", "").split(",")),
-              f"after remove {sq.get('AFTER REMOVE')}, after add {sq.get('AFTER ADD')}")
-        check("the new squad member was still there after Done and at the sync",
-              bool(sq.get("SYNCED")) and sq.get("SYNCED") == sq.get("AFTER ADD"), f"done {sq.get('AFTER DONE')}, synced {sq.get('SYNCED')}")
-        check("the squad the others must follow differs from the one they started with",
-              bool(sq.get("SYNCED")) and sq.get("SYNCED") != sq.get("BEFORE"), f"before {sq.get('BEFORE')}, synced {sq.get('SYNCED')}")
-        check("recruit screen closed, the recruiter brought the others up to date",
-              "bot: recruiting finished" in rec and "co-op: private screens closed, bringing the other players up to date" in rec)
-        check("no reload: no re-sync, no upload, no new generation",
-              "host: re-sync (" not in host and "join: quick-save for the host" not in join
-              and "join: following the host to generation 2" not in join)
-        ap = re.search(r"co-op: delta applied: (\d+) created, (\d+) destroyed, (\d+) stack counts, (\d+) inventories, (\d+) HP, (\d+) conflicts(.*)", other)
-        check("the other copy applied the delta without conflicts", bool(ap) and ap.group(6) == "0" and "MALFORMED" not in ap.group(7),
-              ap.group(0) if ap else "no delta applied line")
-        after_frames = [k for k in shared if free_frame is not None and k[1] > free_frame + 1]
-        check("at least 4 shared frames after the delta, all identical", len(after_frames) >= 4, f"{len(after_frames)} frames")
-        seen = {q_host.get(k) for k in after_frames} | {q_join.get(k) for k in after_frames}
-        check("after the delta both copies have the new squad", bool(after_frames) and seen == {sq.get("SYNCED")},
+        pk = re.search(r"bot: RECRUIT choosing pool member (\d+)", rec)
+        if scenario == "recruitnew":
+            check("the recruit is someone new from the list, not a member just dismissed",
+                  bool(pk) and pk.group(1) in sq.get("AFTER ADD", "").split(",")
+                  and pk.group(1) not in sq.get("BEFORE", "").split(","),
+                  f"picked {pk.group(1) if pk else None}, after add {sq.get('AFTER ADD')}")
+        else:
+            check("the recruit screen dismissed and added squad members",
+                  bool(sq.get("AFTER REMOVE")) and bool(sq.get("AFTER ADD"))
+                  and len(sq["AFTER REMOVE"].split(",")) < len(sq.get("BEFORE", "").split(","))
+                  and sq.get("SYNCED") != sq.get("BEFORE"), f"before {sq.get('BEFORE')}, synced {sq.get('SYNCED')}")
+        check("the recruiter's copy chose the save and reload",
+              "co-op: private screens changed the squad at the recruit screen: full re-sync" in rec
+              and "unlock (full re-sync follows)" in rec)
+        if actor == "host":
+            check("host re-synced from its game", "host: re-sync (the host's private screens closed): quick-save" in host)
+        else:
+            check("joiner quick-saved and uploaded its game", "join: quick-save for the host" in join
+                  and re.search(r"join: uploaded our save to the host \(\d+ bytes\)", join) is not None)
+            check("host received the joiner's save and loaded it",
+                  re.search(r"host: received .*'s save \(\d+ bytes\)", host) is not None
+                  and 'loading save "user/save/ftcoop_upload.sav", serving it to joiners as generation 2' in host)
+        check("joiner followed the host to generation 2", "join: following the host to generation 2" in join)
+        g2 = [k for k in shared if k[0] == 2]
+        check("at least 4 shared generation-2 frames, all identical", len(g2) >= 4, f"{len(g2)} frames")
+        seen = {q_host.get(k) for k in g2} | {q_join.get(k) for k in g2}
+        check("generation 2 has the new squad on both copies", bool(g2) and seen == {sq.get("SYNCED")},
               f"want {sq.get('SYNCED')}, seen {sorted(seen, key=str)}")
     elif scenario == "trade":
         trader, other = (host, join) if actor == "host" else (join, host)
@@ -494,6 +538,15 @@ def main():
         member = int(tr.group(1)) if tr else None
         check("the trader's squad member kept the trade after the barter screen closed",
               member in synced and synced[member] == after.get(member), f"synced {synced.get(member)}")
+        check("the trader bought a kind of item it did not carry (a new stack)", "bot: buying a NEW item kind" in trader)
+        nw = re.search(r"co-op: private screens changed: .*delta: (\d+) new", trader)
+        check("the trader's delta carries the new entity", bool(nw) and int(nw.group(1)) >= 1, nw.group(0) if nw else "no diff line")
+        qv = re.search(r'bot: QUEST VAR (\w+) \d+ "([^"]+)" "[^"]*" -> "([^"]+)" \(reads "([^"]*)"\)', trader)
+        check("the trader changed a quest variable while bartering", bool(qv) and qv.group(3) == qv.group(4),
+              qv.group(0) if qv else "no QUEST VAR line")
+        if qv:
+            check("the other copy set the same quest variable from the delta",
+                  f'co-op: delta: {qv.group(1)} variable "{qv.group(2)}" = "{qv.group(3)}"' in other)
         check("barter closed, the trader brought the others up to date",
               "bot: leaving the barter screen" in trader
               and "co-op: private screens closed, bringing the other players up to date" in trader
@@ -501,9 +554,14 @@ def main():
         check("no reload: no re-sync, no upload, no new generation",
               "host: re-sync (" not in host and "join: quick-save for the host" not in join
               and "join: following the host to generation 2" not in join)
+        if FORCE_FILE_SERVER:
+            check("the delta went through the host's file server (over the lockstep limit set for the test)",
+                  "on the host's file server for the others to fetch" in trader
+                  and re.search(r"co-op: fetched the delta from the host's file server: [1-9]\d* bytes", other) is not None)
         ap = re.search(r"co-op: delta applied: (\d+) created, (\d+) destroyed, (\d+) stack counts, (\d+) inventories, (\d+) HP, (\d+) conflicts(.*)", other)
         check("the other copy applied the delta without conflicts", bool(ap) and ap.group(6) == "0" and "MALFORMED" not in ap.group(7),
               ap.group(0) if ap else "no delta applied line")
+        check("the other copy created the new entity", bool(ap) and int(ap.group(1)) >= 1, ap.group(0) if ap else "")
         after_frames = [k for k in shared if free_frame is not None and k[1] > free_frame + 1]
         check("at least 4 shared frames after the delta, all identical", len(after_frames) >= 4, f"{len(after_frames)} frames")
         for uid, want in sorted(synced.items()):
@@ -583,13 +641,25 @@ def main():
             check(f"{who} ordered its own unit and it travelled > {MIN_MOVE} on the host",
                   uid is not None and uid not in uids and dist > MIN_MOVE, f"unit {uid}, {dist:.2f}")
         check(f"{who} exited cleanly (code 0)", codes[n] == 0, f"code {codes[n]}")
-        check(f"{who} became a co-op joiner and connected", "co-op: joining 127.0.0.1" in log
+        check(f"{who} became a co-op joiner and connected", f"co-op: joining {HOST_IP}" in log
               and "join: connected to the host's session" in log)
         s_x = snapshots(log)
         sh = sorted(set(s_host) & set(s_x))
+        if scenario in ("trade", "recruit", "recruitnew", "browse"):  # the same frames as for the first joiner
+            sh = [k for k in sh if k in set(shared)]
         bad = [f for f in sh if s_host[f] != s_x[f]]
         check(f"{who}: at least {min_frames} shared snapshot frames, every actor identical to the host",
               len(sh) >= min_frames and not bad, f"{len(sh)} shared, {len(bad)} differ")
+        i_x, q_x, e_x, v_x = inventories(log), squads(log), tables(log, "ETAB"), tables(log, "VARS")
+        for what, a, b in (("inventories", i_host, i_x), ("squad", q_host, q_x), ("entity table", e_host, e_x),
+                           ("quest variables", v_host, v_x)):
+            bad = [f for f in sh if a.get(f) != b.get(f)]
+            check(f"{who}: same {what} as the host at every shared frame", bool(sh) and not bad,
+                  f"first mismatch {bad[0]}" if bad else f"{len(sh)} frames")
+        if scenario == "trade":  # recruit visits are a reload for now: no delta
+            ap = re.search(r"co-op: delta applied: .* (\d+) conflicts(.*)", log)
+            check(f"{who}: applied the delta without conflicts", bool(ap) and ap.group(1) == "0" and "MALFORMED" not in ap.group(2),
+                  ap.group(0) if ap else "no delta applied line")
         check(f"{who}: no out-of-sync report or crash",
               "type=207(" not in log and not re.search(r"EXCEPTION 0xc0000005|bot: FAIL|bot: TIMEOUT", log))
     if extras:
@@ -603,7 +673,7 @@ def main():
     r_host = rng(host)
     for who, log in [("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
         r_x = rng(log)
-        common = sorted(k for k in set(r_host) & set(r_x) if scenario not in ("talk", "trade", "recruit", "browse") or k[0] >= 2
+        common = sorted(k for k in set(r_host) & set(r_x) if scenario not in ("talk", "trade", "recruit", "recruitnew", "browse") or k[0] >= 2
                         or (talk_frame is not None and k[1] < talk_frame)
                         or (free_frame is not None and k[1] > free_frame + 1))
         diff = [k for k in common if r_host[k] != r_x[k]]
