@@ -59,7 +59,7 @@ TESTS = {
     "trade_join": ("trade", "join", 4),  # the same with the joiner trading
     "recruit_host": ("recruit", "host", 4),  # bunker: the host talks to the recruiter and recruits; the joiner gets the squad
     "recruit_join": ("recruit", "join", 4),  # the same with the joiner recruiting
-    "recruitnew_host": ("recruitnew", "host", 4),  # bunker: the host recruits someone never recruited: save and reload
+    "recruitnew_host": ("recruitnew", "host", 4),  # bunker: the host recruits someone never recruited; no reload
     "recruitnew_join": ("recruitnew", "join", 4),  # the same from the joiner: its save goes to the host
     "trade2_host": ("trade2", "host", 4),  # bunker: the host trades, then the joiner trades with the same merchant and sells
     "trade_race": ("trade", "all", 4),  # bunker, 3+ players: every joiner talks to the merchant at once; one wins and trades
@@ -325,7 +325,7 @@ def main():
         ff = [int(x) for x in re.findall(r"co-op: NPC 9?6?\d* is free again \([^)]*\) at frame (-?\d+)", host + join)]
         free_frame = max(ff) if ff else None
         shared = [k for k in shared if k[0] >= 2 or (talk_frame is not None and k[1] < talk_frame)
-                  or (free_frame is not None and k[1] > free_frame + 1 and scenario != "recruitnew")]
+                  or (free_frame is not None and k[1] > free_frame + 1)]
     check(f"at least {min_frames} shared snapshot frames", len(shared) >= min_frames,
           f"{len(shared)} shared, host {len(s_host)}, joiner {len(s_join)}")
     mismatch = [f for f in shared if s_host[f] != s_join[f]]
@@ -495,8 +495,7 @@ def main():
         check("at least 6 shared frames, all identical (positions, HP, inventories, squad, entity table)",
               len(later) >= 6, f"{len(later)} frames")
     elif scenario in ("recruit", "recruitnew"):
-        # A recruit visit is the old save and reload for now: the recruit screen makes its candidates as characters on
-        # the recruiter's copy only (recruit: dismiss two, take one back; recruitnew: someone never recruited).
+        # A recruit visit, no reload (recruit: dismiss two, take one back; recruitnew: someone never recruited).
         rec, other = (host, join) if actor == "host" else (join, host)
         check(f"the {actor} talked to the recruiter and its copy kept the conversation",
               "bot: TALK (the owner's talk command, to NPC 81" in rec and "co-op: .?AVWSpeech@@ opened for this player" in rec)
@@ -514,22 +513,25 @@ def main():
                   bool(sq.get("AFTER REMOVE")) and bool(sq.get("AFTER ADD"))
                   and len(sq["AFTER REMOVE"].split(",")) < len(sq.get("BEFORE", "").split(","))
                   and sq.get("SYNCED") != sq.get("BEFORE"), f"before {sq.get('BEFORE')}, synced {sq.get('SYNCED')}")
-        check("the recruiter's copy chose the save and reload",
-              "co-op: private screens changed the squad at the recruit screen: full re-sync" in rec
-              and "unlock (full re-sync follows)" in rec)
-        if actor == "host":
-            check("host re-synced from its game", "host: re-sync (the host's private screens closed): quick-save" in host)
-        else:
-            check("joiner quick-saved and uploaded its game", "join: quick-save for the host" in join
-                  and re.search(r"join: uploaded our save to the host \(\d+ bytes\)", join) is not None)
-            check("host received the joiner's save and loaded it",
-                  re.search(r"host: received .*'s save \(\d+ bytes\)", host) is not None
-                  and 'loading save "user/save/ftcoop_upload.sav", serving it to joiners as generation 2' in host)
-        check("joiner followed the host to generation 2", "join: following the host to generation 2" in join)
-        g2 = [k for k in shared if k[0] == 2]
-        check("at least 4 shared generation-2 frames, all identical", len(g2) >= 4, f"{len(g2)} frames")
-        seen = {q_host.get(k) for k in g2} | {q_join.get(k) for k in g2}
-        check("generation 2 has the new squad on both copies", bool(g2) and seen == {sq.get("SYNCED")},
+        # Every copy makes the recruit screen's candidates on the same frame (every copy is held while it is up): the
+        # recruiter's copy with its window, the others without one. The changes then go out as a delta: no reload.
+        made_r = re.search(r"recruit: the screen's constructor: (\d+) made([^;]*);", rec)
+        made_o = re.search(r"recruit: another player's recruit screen, made here: (\d+) made([^;]*);", other)
+        check("the other copy made the recruit screen's candidates too, the same entities in the same slots",
+              bool(made_r) and bool(made_o) and made_r.groups() == made_o.groups() and int(made_r.group(1)) > 0,
+              f"{made_r.group(1) if made_r else None} on the recruiter's copy, {made_o.group(1) if made_o else None} on the other")
+        check("the other copy closed its screen before applying the delta",
+              "co-op: the other player's recruit screen closed here too" in other)
+        check("no reload: no re-sync, no upload, no new generation",
+              "host: re-sync (" not in host and "join: quick-save for the host" not in join
+              and "join: following the host to generation 2" not in join and "full re-sync" not in rec)
+        ap = re.search(r"co-op: delta applied: .* (\d+) conflicts", other)
+        check("the other copy applied the delta without conflicts", bool(ap) and ap.group(1) == "0",
+              ap.group(0) if ap else "no delta applied line")
+        after = [k for k in shared if free_frame is not None and k[1] > free_frame + 1]
+        check("at least 4 shared frames after the visit, all identical", len(after) >= 4, f"{len(after)} frames")
+        seen = {q_host.get(k) for k in after} | {q_join.get(k) for k in after}
+        check("after the visit both copies have the new squad", bool(after) and seen == {sq.get("SYNCED")},
               f"want {sq.get('SYNCED')}, seen {sorted(seen, key=str)}")
     elif scenario == "trade2":
         # Two visits to the same quartermaster: first the host trades, then the joiner (and it sells an item too).
@@ -741,7 +743,7 @@ def main():
             bad = [f for f in sh if a.get(f) != b.get(f)]
             check(f"{who}: same {what} as the host at every shared frame", bool(sh) and not bad,
                   f"first mismatch {bad[0]}" if bad else f"{len(sh)} frames")
-        if scenario == "trade":  # recruit visits are a reload for now: no delta
+        if scenario in ("trade", "recruit", "recruitnew"):
             ap = re.search(r"co-op: delta applied: .* (\d+) conflicts(.*)", log)
             check(f"{who}: applied the delta without conflicts", bool(ap) and ap.group(1) == "0" and "MALFORMED" not in ap.group(2),
                   ap.group(0) if ap else "no delta applied line")
