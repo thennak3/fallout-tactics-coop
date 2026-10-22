@@ -311,10 +311,8 @@ def main():
     # Whole-map oracle: every Actor, every shared snapshot frame.
     s_host, s_join = snapshots(host), snapshots(join)
     shared = sorted(set(s_host) & set(s_join))
-    if scenario == "talk":  # session 1 differs on purpose once the talker changes its game; 2 must not
-        shared = [k for k in shared if k[0] >= 2]
     talk_frame = free_frame = None
-    if scenario in ("trade", "trade2", "recruit", "recruitnew", "browse"):
+    if scenario in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse"):
         # Before the talk both copies match; from the talk the talker's game differs until the other copy applied the
         # talker's delta (no reload); from the frame after that, everything must match again.
         tf = re.search(r"bot: TALK .* at frame (\d+)", host if actor == "host" else join)
@@ -440,24 +438,25 @@ def main():
         check("conversation ended, the talker brought the others up to date",
               "bot: ending the conversation" in talker
               and "co-op: private screens closed, bringing the other players up to date" in talker)
-        if actor == "host":
-            check("host re-synced from its game", "host: re-sync (the host's private screens closed): quick-save" in host)
-        else:
-            check("joiner quick-saved and uploaded its game", "join: quick-save for the host" in join
-                  and re.search(r"join: uploaded our save to the host \(\d+ bytes\)", join) is not None)
-            check("host received the joiner's save and loaded it",
-                  re.search(r"host: received .*'s save \(\d+ bytes\)", host) is not None
-                  and 'loading save "user/save/ftcoop_upload.sav", serving it to joiners as generation 2' in host)
-            quick_after = sha(join_quick) if os.path.exists(join_quick) else None
-            check("joiner's own QuickSave.sav unchanged", join_quick_before == quick_after
-                  and ("restored the player's QuickSave.sav" in join or "removed the re-sync's" in join))
-        check("joiner followed the host to generation 2", "join: following the host to generation 2" in join)
+        check("no reload: no re-sync, no upload, no new generation",
+              "host: re-sync (" not in host and "join: quick-save for the host" not in join
+              and "join: following the host to generation 2" not in join)
+        qv = re.search(r'bot: QUEST VAR (\w+) \d+ "([^"]+)" "[^"]*" -> "([^"]+)" \(reads "([^"]*)"\)', talker)
+        check(f"the {actor} changed a quest variable in the conversation", bool(qv) and qv.group(3) == qv.group(4),
+              qv.group(0) if qv else "no QUEST VAR line")
+        if qv:
+            check("the other copy set the same quest variable from the delta",
+                  f'co-op: delta: {qv.group(1)} variable "{qv.group(2)}" = "{qv.group(3)}"' in other)
+        ap = re.search(r"co-op: delta applied: .* (\d+) conflicts", other)
+        check("the other copy applied the delta without conflicts and freed the NPC",
+              bool(ap) and ap.group(1) == "0" and re.search(r"co-op: NPC \d+ is free again \(delta\)", other) is not None,
+              ap.group(0) if ap else "no delta applied line")
         if ch:
             uid, hp1 = int(ch.group(1)), int(ch.group(3))
-            g2 = [k for k in shared if k[0] == 2]
-            hps = {s_host[k].get(uid, (0, 0, 0, None))[3] for k in g2} | {s_join[k].get(uid, (0, 0, 0, None))[3] for k in g2}
-            check(f"session 2 carries the {actor}'s change on both copies (unit {uid} hp {hp1})",
-                  bool(g2) and hps == {hp1}, f"hp seen {sorted(hps, key=str)}")
+            after = [k for k in shared if free_frame is not None and k[1] > free_frame + 1]
+            hps = {s_host[k].get(uid, (0, 0, 0, None))[3] for k in after} | {s_join[k].get(uid, (0, 0, 0, None))[3] for k in after}
+            check(f"after the conversation both copies carry the {actor}'s change (unit {uid} hp {hp1})",
+                  len(after) >= 4 and hps == {hp1}, f"{len(after)} frames, hp seen {sorted(hps, key=str)}")
     elif scenario == "browse":
         tr, other = (host, join) if actor == "host" else (join, host)
         check(f"the {actor} talked to the merchant, its copy kept the conversation",

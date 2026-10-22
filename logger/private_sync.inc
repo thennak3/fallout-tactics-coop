@@ -1227,6 +1227,14 @@ void ApplyDelta(const uint8_t* data, int len) {
             } else if (SetGameVar(v.keys[i], val, c != 0)) {
                 Log("co-op: delta: %s variable \"%s\" = \"%s\"", c ? "campaign" : "mission", key, val);
                 vars++;
+                // Our own screens are open too (one shops while another talks): the variable's new value goes into
+                // our snapshot, so our own diff at close carries only what this player changed.
+                extern bool g_private_open;
+                VarList now;
+                if (g_private_open && i < g_snap_nvars[c] && GetVarList(world, c, &now) && i < now.n) {
+                    g_snap_var_h[c][i] = VarHash(now, i);
+                    Log("co-op: our open screens' snapshot takes the other player's \"%s\"", key);
+                }
             }
         } else if (op == 'N') {
             uint16_t slot = r.U16();
@@ -1568,20 +1576,25 @@ void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
         Log("co-op: NPC %u is busy with %s", npc, mine ? "this player" : "another player");
         // A recruiter (FTSE slot 252, IsRecruitMaster) changes the squad everyone plays: everyone waits, as before.
         // Anyone else, with shop_no_pause: nobody waits, and the talker's own world keeps running.
-        extern bool g_shop_no_pause, g_conv_light, g_suppress_pause;
+        extern bool g_shop_no_pause, g_my_conv_light, g_other_conv_light, g_suppress_pause;
         extern int g_suppressed;
         uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
         uint8_t* who = world && npc < EntityCount(world) ? EntityById(world, npc) : nullptr;
         bool recruiter = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f0 / 4])(who);
         bool quartermaster = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f4 / 4])(who);
-        g_conv_light = g_shop_no_pause && quartermaster && !recruiter;
-        g_diff_mode = g_conv_light ? 1 : 0;
-        if (g_conv_light && mine) {
-            g_suppress_pause = true;
-            g_suppressed = 0;
+        bool light = g_shop_no_pause && quartermaster && !recruiter;
+        if (mine) {
+            g_my_conv_light = light;
+            g_diff_mode = light ? 1 : 0;
+            if (light) {
+                g_suppress_pause = true;
+                g_suppressed = 0;
+            }
+        } else {
+            g_other_conv_light = light;
         }
         Log("co-op: NPC %u is %s: %s", npc, recruiter ? "a recruiter" : quartermaster ? "a quartermaster" : "someone else",
-            g_conv_light ? "nobody waits" : "everyone waits while the conversation is up");
+            light ? "nobody waits" : "everyone waits while the conversation is up");
         if (!mine) g_last_other_npc = npc;
     }
     g_actor_act(actor, edx, cmd);

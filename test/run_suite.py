@@ -23,6 +23,8 @@ SUITE = [
     ("transition (mission -> world map -> mission)", ["transition", "--timeout", "90"], "PASS"),
     ("menu_join (roles from the Multiplayer menu)", ["menu_join", "--timeout", "90"], "PASS"),
     ("dropin (joiner arrives mid-session)", ["dropin", "--timeout", "120"], "PASS"),
+    ("talk_host (bunker: the host talks, changes HP and a quest variable; the joiner gets a delta, no reload)", ["talk_host"], "PASS"),
+    ("talk_join (the same from the joiner)", ["talk_join"], "PASS"),
     ("browse_host (bunker: the host opens barter, buys nothing; no reload; the joiner is refused the merchant)", ["browse_host"], "PASS"),
     ("browse_join (the same from the joiner; the host waits for it)", ["browse_join"], "PASS"),
     ("trade_host (bunker: both move, the host barters with the merchant, no reload: the joiner gets the delta)", ["trade_host"], "PASS"),
