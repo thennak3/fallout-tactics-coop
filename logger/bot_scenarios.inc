@@ -1280,6 +1280,21 @@ uint32_t __fastcall FrameTickHook(uint8_t* client) {
         ReapplyBookkeeping();
         RunDeferredCreates();  // shop_sync.inc
         DotsFrame();           // dots.inc
+        if (g_test.enabled) {  // exploration: a hash of every actor's position, every frame (+0x117 differs per copy)
+            static int last = -1;
+            uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr);
+            int f = w ? *reinterpret_cast<int*>(w + kWorldFrame) : -1;
+            if (w && f != last && f >= 2200 && f <= 2700) {
+                uint32_t h = 2166136261u;
+                for (int i = 1; i < EntityCount(w); i++) {
+                    if (!IsActor(w, i)) continue;
+                    h = Fnv(h, EntityPos(w, static_cast<uint16_t>(i)), 12);
+                    h = Fnv(h, reinterpret_cast<uint8_t*>(&i), 4);
+                }
+                Log("POSH f=%d %08x", f, h);
+            }
+            last = f;
+        }
         if (g_test.enabled) DebugDumpActors();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("co-op: exception 0x%08x re-applying delta bookkeeping", GetExceptionCode());

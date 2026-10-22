@@ -149,6 +149,7 @@ def main():
     ap.add_argument("--mutate-follow", action="store_true", help="joiner never follows a new save; resync must FAIL")
     ap.add_argument("--joiners", type=int, default=1, choices=(1, 2, 3), help="joiner copies (players - 1)")
     ap.add_argument("--host-ip", default="127.0.0.1", help="address the joiners connect to (default loopback)")
+    ap.add_argument("--inline-delta", action="store_true", help="3-4 player trades: send the deal through lockstep, not the file server")
     ap.add_argument("--shop-pause", action="store_true", help="the old way: a shop holds every copy while it is open")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
     ap.add_argument("--save", default=None, help="save both copies start from (default New Save Game.sav)")
@@ -158,7 +159,7 @@ def main():
     SHOP_NO_PAUSE = not args.shop_pause
     extras = EXTRA_JOIN_DIRS[:args.joiners - 1]
     scenario, actor, min_frames = TESTS[args.test]
-    FORCE_FILE_SERVER = scenario == "trade" and args.joiners > 1
+    FORCE_FILE_SERVER = scenario == "trade" and args.joiners > 1 and not args.inline_delta
     global SAVE
     if args.save:
         SAVE = args.save
@@ -756,6 +757,14 @@ def main():
     for name, log in (("host", host), ("joiner", join)):
         check(f"{name}: no out-of-sync report (msg 0xcf)", "type=207(" not in log)
         check(f"{name}: no crash or bot failure", not re.search(r"EXCEPTION 0xc0000005|bot: FAIL|bot: TIMEOUT", log))
+    if extra_logs:  # selection dots with 3-4 players: a colour each, and every copy shows every player
+        colours = ["red", "blue", "yellow", "green"][:2 + len(extra_logs)]
+        given = re.findall(r"host: .*'s colour is (\w+)", host)
+        check(f"the host gave the joiners {', '.join(colours[1:])}, one each", sorted(given) == sorted(colours[1:]), given)
+        for who, log in [("host", host), ("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
+            shows = [re.findall(r"(?:^|\| )(\w+) [\d,]+", m.group(1)) for m in re.finditer(r"dots: (.*)", log)]
+            check(f"{who}'s squad bar showed all {len(colours)} players' dots", colours in shows,
+                  shows[-1] if shows else "no dots line")
     return report(args, checks, (host, join, *extra_logs))
 
 

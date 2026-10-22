@@ -319,6 +319,13 @@ void CoopCommandAtFrame(const uint8_t* r) {
         Log("co-op: shop closed at frame %d (%s)", frame, f.mine ? "ours" : "the others' deal applied here");
     } else {
         Log("co-op: a conversation's changes applied at frame %d (%s)", frame, f.mine ? "ours" : "theirs");
+        // Its NPC is free from this frame on every copy: freed on arrival, the talker's copy (its own command
+        // comes back first) let the NPC move a frame early, and the copies drifted apart (trade_host, 4 players).
+        uint16_t npc;
+        memcpy(&npc, r + 5, 2);
+        if (NpcLock* l = FindLock(npc)) l->npc = 0;
+        if (npc == g_host_hold_npc) HostReleaseHold("the other player is done");
+        Log("co-op: NPC %u is free again (at its frame) at frame %d", npc, frame);
     }
 }
 

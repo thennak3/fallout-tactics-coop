@@ -58,7 +58,9 @@ your original `binkw32.dll`.
 - **Friends:** Multiplayer, select **[Co-op] <host name>** in the session list, then **Join**. A message shows
   while you wait. Your game then copies the host's save and loads it.
 - Friends can join a game already in progress. The host's game saves and reloads once to bring them in.
-- Everyone controls the whole squad. Agree among yourselves who moves whom.
+- Everyone controls the whole squad. Agree among yourselves who moves whom. A coloured dot on each squad portrait
+  shows which players have that character selected: the host is red, then blue, yellow and green in the order
+  players joined.
 - On the world map, only the host chooses where to go; everyone else follows.
 
 ### Networking
@@ -77,6 +79,9 @@ Checked by the automated tests in `test/`:
 - Saving and reloading mid-mission (the others follow), and mission → world map → next mission.
 - In the bunker, without any reload: buying and selling (new items included) and quest variables a conversation
   changes. Tested with 2, 3 and 4 players.
+- Shopping pauses nobody: the other players keep playing while one shops. While a shop is open, the shopper's
+  character can't be ordered by the others, and the recruiter waits until the shop closes.
+- The selection dots (tested with 2 players).
 - Recruiting and dismissing squad members (with one save and reload, see below).
 - One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
   others are told someone got there first.
@@ -85,7 +90,9 @@ Checked by the automated tests in `test/`:
 
 ## Known issues
 
-- While one player is in a conversation, trade or recruit screen, the other players' games pause until it closes.
+- While one player talks to anyone other than a merchant, or uses the recruiter, the other players' games pause until
+  the conversation closes. Shops don't pause anyone (for the old behaviour, put the lines `[coop]` and
+  `shop_no_pause=0` in a file `ftcoop.ini` next to `BOS.exe`, on every player's PC).
 - Using the recruiter (recruiting or dismissing) saves and reloads everyone once, a few seconds. Live sync for it is
   [issue #1](https://github.com/thennak3/fallout-tactics-coop/issues/1).
 - Not tested yet: two separate PCs, play over the internet.
