@@ -184,8 +184,8 @@ void HeadlessShopClose(uint8_t* world) {
 
 void __fastcall BarterButtonHook(uint8_t* speech, void* /*edx*/, void* button) {
     auto original = reinterpret_cast<void(__thiscall*)(void*, void*)>(g_barter_trampoline);
-    extern bool g_conv_light;
-    if (!g_conv_light || g_shop_exec || !(g_coop_host || g_coop_join)) {
+    extern bool g_my_conv_light;
+    if (!g_my_conv_light || g_shop_exec || !(g_coop_host || g_coop_join)) {
         original(speech, button);
         return;
     }
@@ -253,7 +253,8 @@ void __fastcall QmDtorHook(uint8_t* self, void* /*edx*/) {
         g_diff_mode = 2;
         g_done_kind = kShopClose;
         PrivateScreensDiff();
-        g_diff_mode = g_conv_light ? 1 : 0;
+        extern bool g_my_conv_light;
+        g_diff_mode = g_my_conv_light ? 1 : 0;
         g_done_kind = kSyncDone;
     }
     if (closing) LogShopState(*reinterpret_cast<uint8_t**>(kWorldPtr), "before the close");

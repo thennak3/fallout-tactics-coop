@@ -903,6 +903,7 @@ void BotSpeechTick(uint8_t* w) {
     if (ticks == 0) {
         g_bot_done_step[1] = true;
         BotLocalChange(*reinterpret_cast<uint8_t**>(kWorldPtr));
+        BotChangeQuestVar(*reinterpret_cast<uint8_t**>(kWorldPtr));  // what a story conversation changes
     }
     if (++ticks == 60) {
         Log("bot: ending the conversation");
@@ -1137,8 +1138,9 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             Log("bot: FAIL no conversation opened 500 frames after the talk command");
             BotFinish();
         }
-        // While the conversation is open the game runs no frames: its window tick drives the bot (BotSpeechTick).
-        if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
+        // While the conversation is open the talker's window tick drives the bot (BotSpeechTick). The changes reach
+        // the others as a delta at the conversation's end, no reload: both copies play on in session 1.
+        if (g_snap_tag == 1 && rel_s >= talk_at + 450) BotFinish();
     } else if (IsRecruitScenario()) {
         // Bunker save: [test] actor's member 0 walks the owner's route to the recruiting NPC, talks, presses Recruit
         // (BotRecruitGameMainTick). First run: exploration of the recruit screen's windows and buttons.

@@ -544,7 +544,10 @@ bool g_private_recruit = false;         // the recruit screen was among them (pr
 // keeps running (the conversation's own pause, World+0x2db via 0x4fc800, is swallowed on that copy) and no other copy
 // holds.
 bool g_shop_no_pause = false;
-bool g_conv_light = false;              // the last talk was to someone who is not a recruiter
+// A conversation with a quartermaster who is not a recruiter (shop_no_pause): nobody waits. Kept apart for this
+// player's own conversation and the last other player's, which can overlap (one shops while another talks).
+bool g_my_conv_light = false;
+bool g_other_conv_light = false;
 bool g_suppress_pause = false;          // this copy swallows pause-counter changes (its light conversation is up)
 int g_suppressed = 0;                   // their balance: +1 per pause swallowed, -1 per unpause
 uint8_t* g_pause_trampoline = nullptr;  // the game's pause-counter change, 0x4fc800 (__thiscall(World*, bool), ret 4)
@@ -678,7 +681,7 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
             if (closed != w) {
                 closed = w;
                 Log("co-op: %s opened for another player's conversation: closing it here", RttiName(w));
-                if (!g_conv_light) HostHoldForOther();  // every other copy waits on this frame (private_sync.inc)
+                if (!g_other_conv_light) HostHoldForOther();  // every other copy waits on this frame (private_sync.inc)
             }
             g_end_game_mode = true;
             return;
@@ -694,7 +697,7 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
         // This copy's world waits too, as every other copy's does, until the diff is made: it used to run one frame
         // after the screens closed and before the diff, while the others ran that frame only after applying the delta,
         // and NPCs walking in that frame then went their own way on this copy (recruit_host, 3 players).
-        if (world && !g_talker_hold && !g_conv_light) {
+        if (world && !g_talker_hold && !g_my_conv_light) {
             if (g_test.enabled)
                 Log("co-op: pause counter World+0x2db = %d at the conversation (before this copy's hold)",
                     *reinterpret_cast<int*>(world + 0x2db));
