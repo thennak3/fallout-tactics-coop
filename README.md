@@ -59,7 +59,7 @@ your original `binkw32.dll`.
   while you wait. Your game then copies the host's save and loads it.
 - Friends can join a game already in progress. The host's game saves and reloads once to bring them in.
 - Everyone controls the whole squad. Agree among yourselves who moves whom. Coloured dots above each name tab
-  shows which players have that character selected: the host is red, then blue, yellow and green in the order
+  show which players have that character selected: the host is red, then blue, yellow and green in the order
   players joined.
 - On the world map, only the host chooses where to go; everyone else follows.
 
