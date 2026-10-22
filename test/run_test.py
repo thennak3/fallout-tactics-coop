@@ -60,6 +60,7 @@ TESTS = {
     "recruit_join": ("recruit", "join", 4),  # the same with the joiner recruiting
     "recruitnew_host": ("recruitnew", "host", 4),  # bunker: the host recruits someone never recruited: save and reload
     "recruitnew_join": ("recruitnew", "join", 4),  # the same from the joiner: its save goes to the host
+    "trade2_host": ("trade2", "host", 4),  # bunker: the host trades, then the joiner trades with the same merchant and sells
     "trade_race": ("trade", "all", 4),  # bunker, 3+ players: every joiner talks to the merchant at once; one wins and trades
     "browse_host": ("browse", "host", 6),  # bunker: the host opens barter, buys nothing: no reload; joiner is refused
     "browse_join": ("browse", "join", 6),  # the same with the joiner browsing; the host is refused
@@ -69,6 +70,7 @@ TESTS = {
 MENU_TESTS = {"menu_join", "dropin"}
 HOST_IP = "127.0.0.1"  # --host-ip: the address joiners connect to (this PC's LAN address tests the real network path)
 FORCE_FILE_SERVER = False  # set in main: trades with more than one joiner use the file-server path
+SHOP_NO_PAUSE = True  # a shop pauses nobody (the default); --shop-pause: the old held conversation
 DROPIN_DELAY_S = 10  # dropin: start the joiner this long after the host, so the host is already playing
 
 
@@ -83,6 +85,7 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
     with open(os.path.join(folder, "ftcoop.ini"), "w", newline="\r\n") as f:
         f.write(f"[coop]\nmode={'off' if menu else mode}\nhost={HOST_IP}\nshare_squad={1 if share_squad else 0}\n")
         f.write(f"fetch_save={1 if fetch else 0}\nfollow={1 if follow else 0}\n")
+        f.write(f"shop_no_pause={1 if SHOP_NO_PAUSE else 0}\n")
         if FORCE_FILE_SERVER:  # trade with 3-4 players: the delta then goes through the host's file server
             f.write("lockstep_chunks=10\n")
         f.write(f"[test]\nenabled=1\nsave={save}\nscenario={scenario}\nactor={actor}\njoiners={joiners}\n")
@@ -146,18 +149,20 @@ def main():
     ap.add_argument("--mutate-follow", action="store_true", help="joiner never follows a new save; resync must FAIL")
     ap.add_argument("--joiners", type=int, default=1, choices=(1, 2, 3), help="joiner copies (players - 1)")
     ap.add_argument("--host-ip", default="127.0.0.1", help="address the joiners connect to (default loopback)")
+    ap.add_argument("--shop-pause", action="store_true", help="the old way: a shop holds every copy while it is open")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
     ap.add_argument("--save", default=None, help="save both copies start from (default New Save Game.sav)")
     args = ap.parse_args()
-    global HOST_IP, FORCE_FILE_SERVER
+    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE
     HOST_IP = args.host_ip
+    SHOP_NO_PAUSE = not args.shop_pause
     extras = EXTRA_JOIN_DIRS[:args.joiners - 1]
     scenario, actor, min_frames = TESTS[args.test]
     FORCE_FILE_SERVER = scenario == "trade" and args.joiners > 1
     global SAVE
     if args.save:
         SAVE = args.save
-    elif scenario in ("talk", "trade", "recruit", "recruitnew", "browse", "exit"):
+    elif scenario in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse", "exit"):
         SAVE = "user/save/bunker.sav"
     if args.test == "soak":
         min_frames = args.soak_frames // 50 - 1
@@ -308,7 +313,7 @@ def main():
     if scenario == "talk":  # session 1 differs on purpose once the talker changes its game; 2 must not
         shared = [k for k in shared if k[0] >= 2]
     talk_frame = free_frame = None
-    if scenario in ("trade", "recruit", "recruitnew", "browse"):
+    if scenario in ("trade", "trade2", "recruit", "recruitnew", "browse"):
         # Before the talk both copies match; from the talk the talker's game differs until the other copy applied the
         # talker's delta (no reload); from the frame after that, everything must match again.
         tf = re.search(r"bot: TALK .* at frame (\d+)", host if actor == "host" else join)
@@ -344,6 +349,10 @@ def main():
     check("same entity-table bookkeeping on both copies at every shared frame", bool(shared) and not e_bad,
           f"first mismatch {e_bad[0]}: host {e_host.get(e_bad[0])} joiner {e_join.get(e_bad[0])}" if e_bad
           else f"{len(shared)} frames")
+    st_host, st_join = tables(host, "STOCK"), tables(join, "STOCK")
+    st_bad = [f for f in shared if st_host.get(f) != st_join.get(f) or not st_host.get(f)]
+    check("same campaign stock list (what the quartermaster sells) on both copies at every shared frame",
+          bool(shared) and not st_bad, f"first mismatch {st_bad[0]}" if st_bad else f"{len(shared)} frames")
     v_host, v_join = tables(host, "VARS"), tables(join, "VARS")
     v_bad = [f for f in shared if v_host.get(f) != v_join.get(f) or not v_host.get(f)]
     check("same quest variables on both copies at every shared frame", bool(shared) and not v_bad,
@@ -445,9 +454,16 @@ def main():
         check("the other player's talk to the busy merchant was refused on its copy",
               "bot: the other player tries to talk to the merchant too" in other
               and "co-op: refused this player's talk to NPC 96" in other)
-        ch = re.search(r"co-op: private screens changed: inventories (\w+), squad (\w+); delta: 0 new, 0 gone, 0 stack counts, 0 inventories, 0 HP", tr)
-        check("the trader's copy found nothing changed but entity bookkeeping",
-              bool(ch) and ch.groups() == ("no", "no"), ch.group(0) if ch else "no diff line")
+        if SHOP_NO_PAUSE:  # the shop's stock was made on every copy: browsing changes nothing anyone needs
+            sh = re.search(r"co-op: shop: the deal is (\d+) ops \((\d+) table entries\)", tr)
+            check("the trader's copy found no deal to send, only the table's bookkeeping",
+                  bool(sh) and int(sh.group(1)) - (1 if int(sh.group(2)) else 0) == 0, sh.group(0) if sh else "no deal line")
+            check("the other copy made the shop's stock itself and closed it at the shop's close",
+                  "stock made here without a window" in other and "co-op: shop closed" in other)
+        else:
+            ch = re.search(r"co-op: private screens changed: inventories (\w+), squad (\w+); delta: 0 new, 0 gone, 0 stack counts, 0 inventories, 0 HP", tr)
+            check("the trader's copy found nothing changed but entity bookkeeping",
+                  bool(ch) and ch.groups() == ("no", "no"), ch.group(0) if ch else "no diff line")
         check("no reload: no re-sync, no upload, no new generation",
               "host: re-sync (" not in host and "join: quick-save for the host" not in join
               and "join: following the host to generation 2" not in join)
@@ -499,6 +515,27 @@ def main():
         seen = {q_host.get(k) for k in g2} | {q_join.get(k) for k in g2}
         check("generation 2 has the new squad on both copies", bool(g2) and seen == {sq.get("SYNCED")},
               f"want {sq.get('SYNCED')}, seen {sorted(seen, key=str)}")
+    elif scenario == "trade2":
+        # Two visits to the same quartermaster: first the host trades, then the joiner (and it sells an item too).
+        # Closing a shop rebuilds the campaign's stock list from what is left; the second shop is made from that list.
+        for who, log in (("host", host), ("joiner", join)):
+            check(f"the {who} opened the shop once for itself and once for the other player",
+                  len(re.findall(r"co-op: shop of NPC 96 open for this player", log)) == 1
+                  and len(re.findall(r"co-op: shop of NPC 96 open for another player", log)) == 1)
+            ds = re.findall(r"bot: DEAL buyer \d+ caps (\d+) -> (\d+)", log)
+            check(f"the {who}'s deal went through", len(ds) == 1 and int(ds[0][0]) > int(ds[0][1]), str(ds))
+            ap = re.findall(r"co-op: delta applied: .* (\d+) conflicts", log)
+            check(f"the {who} applied the other player's deal without conflicts", len(ap) >= 1 and all(c == "0" for c in ap), str(ap))
+        check("the second deal also sold one of the buyer's items", "bot: SELL the buyer's" in join)
+        so = [re.search(r"stock made here without a window \((\d+) items\)", l) for l in (host, join)]
+        check("both shops were made on the other copy with stock", all(so) and all(int(m.group(1)) > 0 for m in so),
+              str([m.group(1) if m else None for m in so]))
+        check("no reload: no re-sync, no upload, no new generation",
+              "host: re-sync (" not in host and "join: quick-save for the host" not in join
+              and "join: following the host to generation 2" not in join)
+        check("nobody held the game", "co-op: holding the game" not in host + join)
+        after_frames = [k for k in shared if free_frame is not None and k[1] > free_frame + 1]
+        check("at least 4 shared frames after the second shop, all identical", len(after_frames) >= 4, f"{len(after_frames)} frames")
     elif scenario == "trade":
         trader, other = (host, join) if actor == "host" else (join, host)
         s1 = [k for k in shared if k[0] == 1]
@@ -540,7 +577,27 @@ def main():
               member in synced and synced[member] == after.get(member), f"synced {synced.get(member)}")
         check("the trader bought a kind of item it did not carry (a new stack)", "bot: buying a NEW item kind" in trader)
         nw = re.search(r"co-op: private screens changed: .*delta: (\d+) new", trader)
-        check("the trader's delta carries the new entity", bool(nw) and int(nw.group(1)) >= 1, nw.group(0) if nw else "no diff line")
+        check("the trader's delta carries the new entity",
+              (bool(nw) and int(nw.group(1)) >= 1) or "co-op: shop: new stack" in trader, nw.group(0) if nw else "")
+        if SHOP_NO_PAUSE:  # the shop paused nobody: every other copy made the stock itself and kept running
+            so = re.search(r"co-op: shop of NPC 96 open for another player at frame (\d+): stock made here without a window \((\d+) items\)", other)
+            sc = re.search(r"co-op: shop closed at frame (\d+) \(the others' deal applied here\)", other)
+            check("the other copy made the shop's stock itself, without a window", bool(so) and int(so.group(2)) > 0,
+                  so.group(0) if so else "no headless shop line")
+            check("the other copy kept running while the shop was open (it closed frames later)",
+                  bool(so and sc) and int(sc.group(1)) > int(so.group(1)) + 5,
+                  f"open {so.group(1) if so else None}, close {sc.group(1) if sc else None}")
+            check("nobody held the game for the shop", "co-op: holding the game" not in host + join
+                  and "pause counter World+0x2db = 1 at the conversation" not in trader)
+            check("the other copy could not order the trading character (refused, with a notice)",
+                  "bot: tries to move the trading squad member" in other
+                  and re.search(r"co-op: refused this player's order \w+ for squad member \d+: it is trading", other) is not None
+                  and "notice: Co-op: that character is trading" in other)
+            check("the other copy could not talk to the recruiter while the shop was open",
+                  "co-op: refused this player's talk to recruiter 81: a player is trading" in other
+                  and "notice: Co-op: a player is trading - recruit when they are done" in other)
+            check("the shopper's own pauses were swallowed and balanced",
+                  "co-op: swallowed the game's pause" in trader and "(balance 0)" in trader and "NOT ZERO" not in trader)
         qv = re.search(r'bot: QUEST VAR (\w+) \d+ "([^"]+)" "[^"]*" -> "([^"]+)" \(reads "([^"]*)"\)', trader)
         check("the trader changed a quest variable while bartering", bool(qv) and qv.group(3) == qv.group(4),
               qv.group(0) if qv else "no QUEST VAR line")
@@ -645,7 +702,7 @@ def main():
               and "join: connected to the host's session" in log)
         s_x = snapshots(log)
         sh = sorted(set(s_host) & set(s_x))
-        if scenario in ("trade", "recruit", "recruitnew", "browse"):  # the same frames as for the first joiner
+        if scenario in ("trade", "trade2", "recruit", "recruitnew", "browse"):  # the same frames as for the first joiner
             sh = [k for k in sh if k in set(shared)]
         bad = [f for f in sh if s_host[f] != s_x[f]]
         check(f"{who}: at least {min_frames} shared snapshot frames, every actor identical to the host",
@@ -673,7 +730,7 @@ def main():
     r_host = rng(host)
     for who, log in [("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
         r_x = rng(log)
-        common = sorted(k for k in set(r_host) & set(r_x) if scenario not in ("talk", "trade", "recruit", "recruitnew", "browse") or k[0] >= 2
+        common = sorted(k for k in set(r_host) & set(r_x) if scenario not in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse") or k[0] >= 2
                         or (talk_frame is not None and k[1] < talk_frame)
                         or (free_frame is not None and k[1] > free_frame + 1))
         diff = [k for k in common if r_host[k] != r_x[k]]
