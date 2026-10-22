@@ -1112,6 +1112,23 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         // quick-loads, the joiner follows from its mission screen; both keep going in session 2.
         if (session == 1 && rel_s >= 60 && Once(0) && g_coop_host) RequestResync("bot: mid-mission re-sync");
         if (session >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "drift") == 0) {
+        // The safety net: the joiner moves an NPC on its copy only (a desync on purpose); the host must notice from
+        // the joiner's position hashes, re-sync, and both play on in step in session 2.
+        if (session == 1 && rel_s >= 100 && Once(0) && g_coop_join) {
+            uint16_t squad[16];
+            int n = GetSquad(world, squad, 16);
+            for (int i = 1; i < EntityCount(world); i++) {
+                bool ours = false;
+                for (int k = 0; k < n; k++) ours |= squad[k] == i;
+                if (!IsActor(world, i) || ours) continue;
+                float* p = EntityPos(world, static_cast<uint16_t>(i));
+                p[0] += 3.0f;
+                Log("bot: DRIFT moved NPC %d on this copy only, at frame %d", i, frame);
+                break;
+            }
+        }
+        if (session >= 2 && rel_s >= 200) BotFinish();
     } else if (_stricmp(s, "transition") == 0) {
         if (g_snap_tag == 1 && rel_s >= 60 && Once(0)) BotEndMission("World Map");
         if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
@@ -1275,6 +1292,8 @@ void PrivateCloseStep() {  // frame hook, and the mission screen's tick (the wor
 }
 
 void DotsFrame();  // dots.inc
+void DriftFrame(uint8_t* world);  // drift.inc
+void DriftCheckHost();
 
 uint32_t __fastcall FrameTickHook(uint8_t* client) {
     g_client_ptr = client;
@@ -1282,6 +1301,10 @@ uint32_t __fastcall FrameTickHook(uint8_t* client) {
         ReapplyBookkeeping();
         RunDeferredCreates();  // shop_sync.inc
         DotsFrame();           // dots.inc
+        if (uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr)) {
+            DriftFrame(w);
+            if (g_coop_host) DriftCheckHost();
+        }
         if (g_test.enabled) {  // exploration: a hash of every actor's position, every frame (+0x117 differs per copy)
             static int last = -1;
             uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr);

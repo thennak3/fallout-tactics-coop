@@ -49,7 +49,8 @@ TESTS = {
     "soak": ("soak", "host", 0),  # minimum computed from --soak-frames
     "fetch_save": ("move", "host", 7),  # joiner loads a different save; only the transfer can sync it
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
-    "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
+    "resync": ("resync", "host", 7),
+    "drift_host": ("drift", "host", 4),  # the joiner moves an NPC on its copy only; the host notices and re-syncs  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
     "menu_join": ("move", "join", 7),  # both pick their role in the Multiplayer menu (Host / Join), not ftcoop.ini
     "dropin": ("dropin", "host", 4),  # host plays alone; a joiner arrives later through the menu; host re-syncs
     "talk_host": ("talk", "host", 4),  # bunker save: the host talks to an NPC, changes its game, ends: joiner gets it
@@ -312,6 +313,10 @@ def main():
     s_host, s_join = snapshots(host), snapshots(join)
     shared = sorted(set(s_host) & set(s_join))
     talk_frame = free_frame = None
+    if scenario == "drift":  # session 1 differs on purpose from the joiner's nudge; session 2 must not
+        nd = re.search(r"bot: DRIFT moved NPC \d+ on this copy only, at frame (\d+)", join)
+        talk_frame = int(nd.group(1)) if nd else None
+        shared = [k for k in shared if k[0] >= 2 or (talk_frame is not None and k[1] < talk_frame)]
     if scenario in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse"):
         # Before the talk both copies match; from the talk the talker's game differs until the other copy applied the
         # talker's delta (no reload); from the frame after that, everything must match again.
@@ -675,6 +680,18 @@ def main():
         s2 = [k for k in shared if k[0] == 2]
         check("at least 4 shared snapshot frames in session 2, all identical",
               len(s2) >= 4 and all(s_host[k] == s_join[k] for k in s2), f"{len(s2)} session-2 frames")
+    elif scenario == "drift":
+        check("the joiner's bot moved an NPC on its copy only", talk_frame is not None)
+        dd = re.findall(r"co-op: drift: .*'s game differs from ours at frame (\d+)", host)
+        check("the host saw the joiner's game differ, from the next checked frame",
+              bool(dd) and talk_frame is not None and int(dd[0]) - talk_frame <= 2 * 25, dd[:3])
+        check("the host re-synced for it", re.search(r"host: re-sync \(.*drifted out of step\): quick-save", host) is not None
+              and "notice: Co-op: " in host)
+        check("joiner followed the host to generation 2", "join: following the host to generation 2" in join)
+        s2 = [k for k in shared if k[0] == 2]
+        check("at least 4 shared snapshot frames in session 2, all identical",
+              len(s2) >= 4 and all(s_host[k] == s_join[k] for k in s2), f"{len(s2)} session-2 frames")
+        check("no drift in session 2", not re.search(r"drift: .* \(generation 2\)", host))
     elif scenario == "soak":
         n_h, n_j = len(re.findall(r"bot: MOVE id=", host)), len(re.findall(r"bot: MOVE id=", join))
         expected = max(1, (args.soak_frames - 30) // 240)
@@ -741,7 +758,7 @@ def main():
     r_host = rng(host)
     for who, log in [("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
         r_x = rng(log)
-        common = sorted(k for k in set(r_host) & set(r_x) if scenario not in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse") or k[0] >= 2
+        common = sorted(k for k in set(r_host) & set(r_x) if scenario not in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse", "drift") or k[0] >= 2
                         or (talk_frame is not None and k[1] < talk_frame)
                         or (free_frame is not None and k[1] > free_frame + 1))
         diff = [k for k in common if r_host[k] != r_x[k]]

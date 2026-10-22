@@ -251,7 +251,7 @@ void ServeDelta(SOCKET c, const char* req) {  // host, file server thread
 void ServeSelection(SOCKET c, const char* req);  // dots.inc
 
 void ServeOne(SOCKET c) {
-    char req[200];
+    char req[400];
     if (!RecvLine(c, req, sizeof(req))) return;
     if (strncmp(req, "SEL ", 4) == 0) {
         ServeSelection(c, req);

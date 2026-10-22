@@ -74,7 +74,10 @@ const char* ParseSlots(const char* p, PlayerSel& s) {  // "922,959,..." up to a 
     return p;
 }
 
-// Host, file server thread: "SEL <joiner id> <slots>" -> "SELS <your colour> <colour>:<slots> ...".
+void DriftFromJoiner(unsigned id, const char* name, const char* p);  // drift.inc
+int FormatDrift(char* out, size_t cap);
+
+// Host, file server thread: "SEL <joiner id> <slots>[ H<drift hashes>]" -> "SELS <your colour> <colour>:<slots> ...".
 void ServeSelection(SOCKET c, const char* req) {
     unsigned id = 0;
     int used = 0;
@@ -82,6 +85,7 @@ void ServeSelection(SOCKET c, const char* req) {
     PlayerSel sel = {};
     ParseSlots(req + used, sel);
     int colour = -1;
+    char who[32] = "a player";
     EnterCriticalSection(&g_serve_lock);
     DWORD now = GetTickCount();
     for (int i = 0; i < g_joiner_count; i++) {
@@ -100,8 +104,10 @@ void ServeSelection(SOCKET c, const char* req) {
             }
         }
         if (j.colour) colour = j.colour;
+        strcpy_s(who, j.name);
     }
     LeaveCriticalSection(&g_serve_lock);
+    DriftFromJoiner(id, who, req + used);
     char line[400];
     int n = sprintf_s(line, "SELS %d", colour);
     AcquireSRWLockExclusive(&g_dots_lock);
@@ -124,11 +130,12 @@ DWORD WINAPI SelectionPoller(LPVOID) {
     for (;;) {
         Sleep(200);
         if (!g_coop_join || g_join_state != 'P') continue;
-        char req[200];
+        char req[400];
         int rl = sprintf_s(req, "SEL %08x ", g_joiner_id);
         AcquireSRWLockShared(&g_dots_lock);
         rl += FormatSlots(req + rl, sizeof(req) - rl, g_my_sel);
         ReleaseSRWLockShared(&g_dots_lock);
+        rl += FormatDrift(req + rl, sizeof(req) - rl);
         rl += sprintf_s(req + rl, sizeof(req) - rl, "\n");
         SOCKET s = ConnectHost();
         char line[400];
