@@ -372,6 +372,17 @@ def main():
             d = (travelled(s_host, uid), travelled(s_join, uid))
             check(f"moved unit {uid} travelled > {MIN_MOVE} on both copies", min(d) > MIN_MOVE,
                   f"host {d[0]:.2f}, joiner {d[1]:.2f}")
+        # Selection dots: the joiner is blue; when it narrows its selection, both copies' bars show it.
+        check("the host gave the joiner the colour blue", re.search(r"host: .*'s colour is blue", host) is not None)
+        check("the joiner's bot narrowed its selection", "bot: the joiner selects only its 2nd and 3rd characters" in join)
+        if "bot: the joiner selects only its 2nd and 3rd characters" in join:
+            sq = re.search(r"dots: red ([\d,]+) \| blue ([\d,]+)", host)
+            narrowed = [m.group(1) for m in re.finditer(r"dots: red [\d,]+ \| blue ([\d,]+)", host)]
+            full = sq.group(1).split(",") if sq else []
+            want = ",".join(full[1:3])
+            check("the host's bar shows the joiner's new selection (blue on its 2nd and 3rd characters)",
+                  bool(want) and want in narrowed, f"wanted blue {want}; host showed {narrowed}")
+            check("the joiner's bar shows the same", f"| blue {want} " in join, want)
     elif scenario == "simul":
         mv_h, mv_j = re.search(r"bot: MOVE id=(\d+)", host), re.search(r"bot: MOVE id=(\d+)", join)
         check("both bots issued a move on the same frame", bool(mv_h and mv_j))

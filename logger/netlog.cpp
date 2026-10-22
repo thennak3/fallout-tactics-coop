@@ -857,6 +857,7 @@ volatile LONG g_snap_tag = 0;  // save generation of the current co-op session (
 bool g_session_coop = false;  // host: the current session came from a co-op lobby
 DWORD g_main_thread_id = 0;
 #include "bot_scenarios.inc"
+#include "dots.inc"
 
 
 // On a hang, log where the game's main thread is: EIP and BOS.exe return addresses on its stack.
@@ -1498,6 +1499,7 @@ void Init() {
     Log("co-op: world-map hook %s (only the host chooses where to go)", gotomap ? "ok" : "FAILED");
     Log("co-op: actor-command hook %s (co-op commands, NPC locks)",
         PatchSlot(kActorActSlot, kActorAct, (void*)&ActorActHook, &g_actor_act) ? "ok" : "FAILED");
+    InstallDots();
     bool menu = PatchSlot(kMainMenuUpdateSlot, kWindowUpdateStub, (void*)&MainMenuUpdateHook, &g_mainmenu_update);
     bool pump = PatchCall(kPumpHandlerCall, kPumpHandler, (void*)&PumpHandlerHook);
     Log("co-op: main-menu hook %s, pump hook %s", menu ? "ok" : "FAILED", pump ? "ok" : "FAILED");
@@ -1535,6 +1537,7 @@ void Init() {
             join_btn ? "ok" : "FAILED");
     }
     g_test.enabled = GetPrivateProfileIntA("test", "enabled", 0, ".\\ftcoop.ini") != 0;
+    if (g_test.enabled) StartShotThread();
     if (GetPrivateProfileIntA("ui", "skip_intro", g_test.enabled ? 1 : 0, ".\\ftcoop.ini") != 0) {
         *reinterpret_cast<uint8_t*>(kIntroShownFlag) = 1;
         Log("ui: skipping the startup movies ([ui] skip_intro)");
