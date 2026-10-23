@@ -35,7 +35,9 @@
 // winner from the claim it relays (four bots talking to the merchant at once: all three joiners took it as theirs). A copy refuses its own player's talk to a locked NPC; the host drops
 // a talk to a locked NPC from anyone else (two players clicking at the same moment).
 const uint8_t kCoopCmd = 0x30;
-enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6, kRecruitOpen = 7 };  // 5, 6: shop_sync.inc; 7: recruit_sync.inc
+enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6, kRecruitOpen = 7, kLevelOpen = 8,
+       kLevelClose = 9 };  // 8, 9: recruit_sync.inc (the level-up lock)
+void HandleLevelRecord(const uint8_t* r);  // recruit_sync.inc  // 5, 6: shop_sync.inc; 7: recruit_sync.inc
 bool g_recruit_synced = false;  // a recruit screen is up and every copy made its candidates (recruit_sync.inc)
 void HandleRecruitOpen(const uint8_t* r);  // recruit_sync.inc
 void CloseHeadlessRecruit();
@@ -57,9 +59,22 @@ SlotState g_snap_slots[kMaxSlots];
 int g_snap_count = 0;
 uint16_t g_snap_head = 0;
 uint32_t g_snap_vars = 0, g_snap_inv = 0, g_snap_squad = 0;
+uint32_t g_snap_serial = 0;  // the entity serial counter at the snapshot
+// 'B' leaves out the free-list head and the serial counter (0xffff and 0: none) when the delta changes no table entry
+// and this copy did not change them: a conversation's delta from a snapshot taken while another player's shop stock
+// existed here carried that moment's head, and the shopper, its shop closed by then, got a stale head for good
+// (shoptalk). With entries changed the head always goes: every copy writes it again once the destroys have finished,
+// which is what makes their free lists agree whatever order the destroys ran in (recruit).
+uint16_t BookHead(uint16_t head, int entries) { return !entries && head == g_snap_head ? 0xffff : head; }
+uint32_t BookSerial(uint32_t serial, int entries) { return !entries && serial == g_snap_serial ? 0 : serial; }
 bool g_snap_taken = false;
 uint16_t g_private_npc = 0;  // whom this copy's player is talking to
-struct ActorSnap { uint16_t id; int hp; float pos[3]; char inv[2048]; };
+// A character's numbers: four attribute tables (each Stats, Traits, Skills, OTraits, Perks, with their vtables, the
+// same on every copy) from +0x2a7, 0x339 apart (scan of a squad member for those classes' vtables). The byte at
+// +0xf8a, where a fifth table would start, is not theirs: it differed between copies after a level-up (a pointer's
+// low byte, by its look), so the region ends before it.
+const int kActorAttr = 0x2a7, kActorAttrLen = 4 * 0x339 - 1;
+struct ActorSnap { uint16_t id; int hp; float pos[3]; char inv[2048]; uint8_t attr[kActorAttrLen]; };
 const int kMaxActorSnaps = 256;
 ActorSnap g_snap_actors[kMaxActorSnaps];
 
@@ -226,6 +241,7 @@ void TakePrivateSnapshot() {
     if (!world) return;
     ReadSlots(world, g_snap_slots, &g_snap_count);
     g_snap_head = *reinterpret_cast<uint16_t*>(world + kWorldFreeHead);
+    g_snap_serial = *reinterpret_cast<uint32_t*>(kEntitySerial);
     g_snap_vars = HashVars(world);
     for (int c = 0; c < 2; c++) {
         VarList v;
@@ -243,6 +259,7 @@ void TakePrivateSnapshot() {
         a.hp = ActorHp(world, a.id);
         memcpy(a.pos, EntityPos(world, a.id), sizeof(a.pos));
         if (!InvString(world, a.id, a.inv, sizeof(a.inv))) a.inv[0] = 0;
+        memcpy(a.attr, EntityById(world, a.id) + kActorAttr, kActorAttrLen);
     }
     g_snap_taken = true;
     LogAiFlags("at the snapshot");
@@ -467,6 +484,7 @@ uint32_t Decompress(const uint8_t* src, uint32_t n, uint8_t* dst, uint32_t cap) 
 // that paused nobody: the world ran meanwhile); 2 a shop's deal only (shop_sync.inc: the buyer's and merchant's
 // inventories). And the kind of its last record (kShopClose for a shop).
 int g_diff_mode = 0;
+void SetFullDiff() { g_diff_mode = 0; }
 uint8_t g_done_kind = kSyncDone;
 struct ShopState;
 extern ShopState g_shop;
@@ -488,7 +506,7 @@ int PrivateScreensDiff() {
         ReadSlots(world, now, &count);
         uint16_t head = *reinterpret_cast<uint16_t*>(world + kWorldFreeHead);
         uint32_t vars = HashVars(world), inv = HashInventories(world), squad = HashSquad(world);
-        int news = 0, gone = 0, counts = 0, invs = 0, hps = 0, moved = 0, nvars = 0;
+        int news = 0, gone = 0, counts = 0, invs = 0, hps = 0, moved = 0, nvars = 0, attrs = 0;
         // 'V' campaign index key value: a changed mission or campaign variable (a dialogue choice, a script).
         const char* var_fail = nullptr;
         for (int c = 0; c < 2 && vars != g_snap_vars && !var_fail; c++) {
@@ -664,6 +682,34 @@ int PrivateScreensDiff() {
                     w.U32(static_cast<uint32_t>(hp));
                     hps++;
                 }
+                // 'A': the bytes of a squad member's attribute tables that changed (a level-up: a perk, skill points),
+                // in runs; differences under 8 bytes apart go in one run.
+                if (squad_member && before) {
+                    const uint8_t* now_attr = EntityById(world, id) + kActorAttr;
+                    for (int o = 0; o < kActorAttrLen;) {
+                        if (now_attr[o] == before->attr[o]) {
+                            o++;
+                            continue;
+                        }
+                        int end = o + 1, same = 0;
+                        for (int k = end; k < kActorAttrLen && same < 8; k++) {
+                            if (now_attr[k] != before->attr[k]) {
+                                end = k + 1;
+                                same = 0;
+                            } else {
+                                same++;
+                            }
+                        }
+                        w.U8('A');
+                        w.U16(id);
+                        w.U16(static_cast<uint16_t>(o));
+                        w.U16(static_cast<uint16_t>(end - o));
+                        w.Put(now_attr + o, end - o);
+                        Log("co-op: delta: character %u's attributes +0x%x, %d bytes", id, kActorAttr + o, end - o);
+                        attrs++;
+                        o = end;
+                    }
+                }
                 float* pos = EntityPos(world, id);
                 float jump = before ? fabsf(pos[0] - before->pos[0]) + fabsf(pos[1] - before->pos[1]) +
                                          fabsf(pos[2] - before->pos[2])
@@ -712,8 +758,8 @@ int PrivateScreensDiff() {
             w.U8('B');
             g_delta_b_off = w.len;
             w.U16(static_cast<uint16_t>(count));
-            w.U16(head);
-            w.U32(*reinterpret_cast<uint32_t*>(kEntitySerial));
+            w.U16(BookHead(head, nb));
+            w.U32(BookSerial(*reinterpret_cast<uint32_t*>(kEntitySerial), nb));
             w.U16(static_cast<uint16_t>(nb));
             for (int i = 0; i < count; i++)
                 if (now[i].next_free != g_snap_slots[i].next_free || now[i].seq != g_snap_slots[i].seq || pending[i]) {
@@ -747,7 +793,7 @@ int PrivateScreensDiff() {
                 Log("co-op: delta over %d bytes: full re-sync", kMaxDelta);
                 result = kDiffFull;
             } else if (result != kDiffFull) {
-                bool any = news || gone || counts || invs || hps || nvars || squad != g_snap_squad || moved ||
+                bool any = news || gone || counts || invs || hps || attrs || nvars || squad != g_snap_squad || moved ||
                            head != g_snap_head;
                 result = any ? kDiffApplied : kDiffNone;
             }
@@ -900,8 +946,8 @@ void ApplyBookkeeping(uint8_t* world, const uint8_t* p) {
             *reinterpret_cast<uint16_t*>(e + slot * 8 + 6) = seq;
         }
     }
-    *reinterpret_cast<uint16_t*>(world + kWorldFreeHead) = head;
-    *reinterpret_cast<uint32_t*>(kEntitySerial) = serial;
+    if (head != 0xffff) *reinterpret_cast<uint16_t*>(world + kWorldFreeHead) = head;
+    if (serial) *reinterpret_cast<uint32_t*>(kEntitySerial) = serial;
 }
 
 // Main thread, at the start of every frame: the deferred destroys of the last delta have run; write its bookkeeping
@@ -1150,7 +1196,7 @@ void ApplyDelta(const uint8_t* data, int len) {
     DeltaReader r = {data, data + len, false};
     uint8_t* e = Entries(world);
     void* dummy = *reinterpret_cast<void**>(e);
-    int created = 0, destroyed = 0, counts = 0, invs = 0, hps = 0, vars = 0, conflicts = 0;
+    int created = 0, destroyed = 0, counts = 0, invs = 0, hps = 0, vars = 0, conflicts = 0, attrs = 0;
     static uint16_t slots[256], seqs[256];
     int n = 0;
     for (uint8_t op = r.U8(); !r.bad && op != 'E'; op = r.U8()) {
@@ -1247,6 +1293,16 @@ void ApplyDelta(const uint8_t* data, int len) {
                 *reinterpret_cast<int*>(ent + kItemCount) = count;
                 counts++;
             }
+        } else if (op == 'A') {
+            uint16_t id = r.U16(), off = r.U16(), len = r.U16();
+            if (!r.Has(len)) break;
+            if (IsActor(world, id) && off + len <= kActorAttrLen) {
+                memcpy(EntityById(world, id) + kActorAttr + off, r.p, len);
+                attrs++;
+            } else {
+                conflicts++;
+            }
+            r.p += len;
         } else if (op == 'H') {
             uint16_t id = r.U16();
             int hp = static_cast<int>(r.U32());
@@ -1330,8 +1386,8 @@ void ApplyDelta(const uint8_t* data, int len) {
                     *reinterpret_cast<uint16_t*>(e + slot * 8 + 6) = seq;
                 }
             }
-            *reinterpret_cast<uint16_t*>(world + kWorldFreeHead) = head;
-            *reinterpret_cast<uint32_t*>(kEntitySerial) = serial;
+            if (head != 0xffff) *reinterpret_cast<uint16_t*>(world + kWorldFreeHead) = head;
+            if (serial) *reinterpret_cast<uint32_t*>(kEntitySerial) = serial;
             if (count != EntityCount(world)) {
                 Log("co-op: entity table size here %d, the talker's %u", EntityCount(world), count);
                 conflicts++;
@@ -1342,7 +1398,7 @@ void ApplyDelta(const uint8_t* data, int len) {
         }
     }
     Log("co-op: delta applied: %d created, %d destroyed, %d stack counts, %d inventories, %d HP, %d conflicts, "
-        "%d variables%s", created, destroyed, counts, invs, hps, conflicts, vars, r.bad ? ", MALFORMED" : "");
+        "%d variables, %d attribute runs%s", created, destroyed, counts, invs, hps, conflicts, vars, attrs, r.bad ? ", MALFORMED" : "");
 }
 
 // ---- receiving: every copy, on the same frame (Actor vtable slot 510, ActOnControllerCommand) ----
@@ -1496,6 +1552,10 @@ void HandleCoopCommand(const uint8_t* r) {
     }
     if (kind == kRecruitOpen) {
         HandleRecruitOpen(r);
+        return;
+    }
+    if (kind == kLevelOpen || kind == kLevelClose) {
+        HandleLevelRecord(r);
         return;
     }
     if (kind == kSyncDone) CloseHeadlessRecruit();  // the recruiter's screen closed before its diff: ours too, first
@@ -1836,8 +1896,8 @@ int ShopDealDiff(DeltaWriter& w, uint8_t* world, const SlotState* now, int count
     }
     w.U8('B');
     w.U16(static_cast<uint16_t>(count));
-    w.U16(*reinterpret_cast<uint16_t*>(world + kWorldFreeHead));
-    w.U32(*reinterpret_cast<uint32_t*>(kEntitySerial));
+    w.U16(BookHead(*reinterpret_cast<uint16_t*>(world + kWorldFreeHead), nbook));
+    w.U32(BookSerial(*reinterpret_cast<uint32_t*>(kEntitySerial), nbook));
     w.U16(static_cast<uint16_t>(nbook));
     for (int i = 0; i < count; i++) {
         uint8_t* ent = now[i].used ? *reinterpret_cast<uint8_t**>(Entries(world) + i * 8) : nullptr;

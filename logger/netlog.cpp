@@ -578,7 +578,7 @@ PrivateKind PrivateKindOf(uint8_t* w) {
     const char* name = RttiName(w);
     PrivateKind k = strstr(name, "WSpeech") ? kSpeechScreen
                     : (strstr(name, "Barter") || strstr(name, "Recruit") || strstr(name, "SquadWindow") ||
-                       strstr(name, "SquadSelection")) ? kTradeScreen : kNotPrivate;
+                       strstr(name, "SquadSelection") || strstr(name, "WCharacter")) ? kTradeScreen : kNotPrivate;
     if (n < 128) {
         vts[n] = vt;
         kinds[n++] = k;
@@ -604,11 +604,16 @@ bool RefuseLockedTalk(uint8_t* msg, int len);  // private_sync.inc
 void SendTalkClaim(void* client, const uint8_t* msg, int len);  // private_sync.inc
 
 int RefuseShopperOrders(uint8_t* msg, int len);  // shop_sync.inc
+int RefuseDuringLevelUp(uint8_t* msg, int len);  // recruit_sync.inc
+bool LevelLockedScreen(uint8_t* w);              // recruit_sync.inc
+void LevelScreenOpened(uint8_t* w);
 
 char __fastcall ClientSendHook(void* self, void* /*edx*/, const uint8_t* msg, int len, int reliable) {
     if (g_coop_host || g_coop_join) {
         len = RefuseShopperOrders(const_cast<uint8_t*>(msg), len);
         if (!len) return 1;  // nothing left: not sent
+        len = RefuseDuringLevelUp(const_cast<uint8_t*>(msg), len);
+        if (!len) return 1;
     }
     if ((g_coop_host || g_coop_join) && HasTalkCommand(msg, len) && RefuseLockedTalk(const_cast<uint8_t*>(msg), len))
         return 1;  // a talk to an NPC another player is talking to: not sent
@@ -646,6 +651,7 @@ void __fastcall GoToMapHook(void* window, void* /*edx*/, void** map, int mode) {
 const uintptr_t kGameMainSetMode = 0x471ad0;
 bool g_end_game_mode = false;
 void TakePrivateSnapshot();  // private_sync.inc
+void SetFullDiff();          // private_sync.inc
 void HostHoldForOther();     // private_sync.inc
 void HostHoldTimeout();      // private_sync.inc
 extern uint16_t g_private_npc, g_local_talk_npc;
@@ -669,8 +675,22 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
         return;
     }
     PrivateKind kind = PrivateKindOf(w);
-    if (kind == kNotPrivate) return;
     DWORD now = GetTickCount();
+    // A quest giver opens the Pipboy (its mission briefing) instead of a conversation, on every copy (the talk runs
+    // everywhere). Opened right after a relayed talk claim, it is that conversation: the talker's own, everyone
+    // else's closed with a notice. The Pipboy opened from its button is left alone.
+    static uint8_t* talk_pipboy = nullptr;
+    if (kind == kNotPrivate && (w == talk_pipboy ||
+                                (!g_private_open && g_claim_tick && now - g_claim_tick < kTalkWindowMs && strstr(RttiName(w), "WPipboy")))) {
+        if (w != talk_pipboy) Log("co-op: the Pipboy opened from a talk (a quest giver's briefing)");
+        talk_pipboy = w;
+        kind = kSpeechScreen;
+    }
+    if (kind == kNotPrivate) return;
+    if (!g_private_open && strstr(RttiName(w), "WCharacter") && LevelLockedScreen(w)) {
+        g_end_game_mode = true;  // another player is levelling up this character: our screen of them closes
+        return;
+    }
     if (!g_private_open) {
         bool mine = kind == kTradeScreen || now - g_local_talk_tick < kTalkWindowMs ||
                     (g_coop_host && now - g_remote_talk_tick >= kTalkWindowMs);  // nobody's: a script's, the host's
@@ -681,6 +701,7 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
             if (closed != w) {
                 closed = w;
                 Log("co-op: %s opened for another player's conversation: closing it here", RttiName(w));
+                if (w == talk_pipboy) Notice("Co-op: another player got a mission briefing - it is in your Pipboy");
                 if (!g_other_conv_light) HostHoldForOther();  // every other copy waits on this frame (private_sync.inc)
             }
             g_end_game_mode = true;
@@ -688,6 +709,11 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
         }
         g_private_open = true;
         g_private_recruit = false;
+        if (strstr(RttiName(w), "WCharacter")) {  // the character screen (a level-up), opened without a conversation
+            SetFullDiff();
+            g_my_conv_light = false;
+            LevelScreenOpened(w);  // the others: not this character's screen, not the recruiter, until it closes
+        }
         g_local_talk_tick = 0;
         Log("co-op: %s opened for this player", RttiName(w));
         g_private_npc = g_local_talk_npc;
@@ -1506,6 +1532,7 @@ void Init() {
         PatchSlot(kActorActSlot, kActorAct, (void*)&ActorActHook, &g_actor_act) ? "ok" : "FAILED");
     InstallDots();
     InstallRecruitHooks();
+    InstallLevelUpHooks();
     bool menu = PatchSlot(kMainMenuUpdateSlot, kWindowUpdateStub, (void*)&MainMenuUpdateHook, &g_mainmenu_update);
     bool pump = PatchCall(kPumpHandlerCall, kPumpHandler, (void*)&PumpHandlerHook);
     Log("co-op: main-menu hook %s, pump hook %s", menu ? "ok" : "FAILED", pump ? "ok" : "FAILED");

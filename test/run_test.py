@@ -49,8 +49,15 @@ TESTS = {
     "soak": ("soak", "host", 0),  # minimum computed from --soak-frames
     "fetch_save": ("move", "host", 7),  # joiner loads a different save; only the transfer can sync it
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
-    "resync": ("resync", "host", 7),
-    "drift_host": ("drift", "host", 4),  # the joiner moves an NPC on its copy only; the host notices and re-syncs  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
+    "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
+    "drift_host": ("drift", "host", 4),  # the joiner moves an NPC on its copy only; the host notices and re-syncs
+    "survey": ("survey", "host", 0),  # exploration: the NPCs next to the first two squad members (use with --save)
+    "quest_host": ("quest", "host", 4),  # QuestBarter.sav: the host talks to the quest giver; the joiner gets the changes
+    "quest_join": ("quest", "join", 4),  # the same from the joiner
+    "shoptalk": ("shoptalk", "host", 4),  # QuestBarter.sav: the host shops; the joiner's talk waits until the shop is done
+    "levelup_host": ("levelup", "host", 4),  # QuestBarter.sav: the host levels up (a perk); the joiner gets the stats
+    "levelup_join": ("levelup", "join", 4),  # the same from the joiner
+    "levelrace": ("levelup", "all", 4),  # QuestBarter.sav: both press Level on the same frame; one screen wins
     "menu_join": ("move", "join", 7),  # both pick their role in the Multiplayer menu (Host / Join), not ftcoop.ini
     "dropin": ("dropin", "host", 4),  # host plays alone; a joiner arrives later through the menu; host re-syncs
     "talk_host": ("talk", "host", 4),  # bunker save: the host talks to an NPC, changes its game, ends: joiner gets it
@@ -166,6 +173,8 @@ def main():
         SAVE = args.save
     elif scenario in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse", "exit"):
         SAVE = "user/save/bunker.sav"
+    elif scenario in ("quest", "shoptalk", "levelup"):
+        SAVE = "user/save/QuestBarter.sav"
     if args.test == "soak":
         min_frames = args.soak_frames // 50 - 1
     checks = []
@@ -257,7 +266,7 @@ def main():
 
     host, join = read(os.path.join(HOST_DIR, "netlog.txt")), read(os.path.join(JOIN_DIR, "netlog.txt"))
     extra_logs = [read(os.path.join(d, "netlog.txt")) for d in extras]
-    if actor == "all":  # the race: exactly one joiner gets the merchant; it is checked as the trader below
+    if actor == "all" and scenario == "trade":  # the race: exactly one joiner gets the merchant; checked as the trader below
         joiner_logs = [join] + extra_logs
         winners = [i for i, l in enumerate(joiner_logs) if "co-op: .?AVWSpeech@@ opened for this player" in l]
         check("race: every joiner talked to the merchant", len(extras) >= 1
@@ -317,10 +326,11 @@ def main():
         nd = re.search(r"bot: DRIFT moved NPC \d+ on this copy only, at frame (\d+)", join)
         talk_frame = int(nd.group(1)) if nd else None
         shared = [k for k in shared if k[0] >= 2 or (talk_frame is not None and k[1] < talk_frame)]
-    if scenario in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse"):
+    if scenario in ("talk", "quest", "shoptalk", "levelup", "trade", "trade2", "recruit", "recruitnew", "browse"):
         # Before the talk both copies match; from the talk the talker's game differs until the other copy applied the
         # talker's delta (no reload); from the frame after that, everything must match again.
-        tf = re.search(r"bot: TALK .* at frame (\d+)", host if actor == "host" else join)
+        # (a level-up does not hold the others: its changes land there up to a second later, so those frames are skipped)
+        tf = re.search(r"bot: (?:TALK|LEVEL pressing the Level button) .* at frame (\d+)", host if actor != "join" else join)
         talk_frame = int(tf.group(1)) if tf else None
         ff = [int(x) for x in re.findall(r"co-op: NPC 9?6?\d* is free again \([^)]*\) at frame (-?\d+)", host + join)]
         free_frame = max(ff) if ff else None
@@ -362,6 +372,10 @@ def main():
     check("same quest variables on both copies at every shared frame", bool(shared) and not v_bad,
           f"first mismatch {v_bad[0]}: host {v_host.get(v_bad[0])} joiner {v_join.get(v_bad[0])}" if v_bad
           else f"{len(shared)} frames")
+    a_host, a_join = tables(host, "ATTR"), tables(join, "ATTR")
+    a_bad = [f for f in shared if a_host.get(f) != a_join.get(f) or not a_host.get(f)]
+    check("same character attributes (stats, skills, perks) on both copies at every shared frame", bool(shared) and not a_bad,
+          f"first mismatch {a_bad[0]}" if a_bad else f"{len(shared)} frames")
     check("same squad on both copies at every shared frame", bool(shared) and not q_bad,
           f"first mismatch {q_bad[0]}: host {q_host.get(q_bad[0])} joiner {q_join.get(q_bad[0])}" if q_bad
           else f"{len(shared)} frames")
@@ -682,6 +696,72 @@ def main():
         s2 = [k for k in shared if k[0] == 2]
         check("at least 4 shared snapshot frames in session 2, all identical",
               len(s2) >= 4 and all(s_host[k] == s_join[k] for k in s2), f"{len(s2)} session-2 frames")
+    elif scenario == "quest":
+        talker, other = (host, join) if actor == "host" else (join, host)
+        check(f"the {actor} talked to the quest giver and got the briefing (the Pipboy) on its copy",
+              "to NPC 266" in talker and "co-op: .?AVWPipboy@@ opened for this player" in talker)
+        check("the other copy closed its briefing and told its player",
+              "co-op: .?AVWPipboy@@ opened for another player's conversation: closing it here" in other
+              and "notice: Co-op: another player got a mission briefing" in other)
+        check("no reload: no re-sync, no upload, no new generation",
+              "host: re-sync (" not in host and "join: quick-save for the host" not in join
+              and "join: following the host to generation 2" not in join)
+        qv = re.search(r'bot: QUEST VAR (\w+) \d+ "([^"]+)" "[^"]*" -> "([^"]+)"', talker)
+        check("the other copy set the conversation's quest variable from the delta",
+              bool(qv) and f'co-op: delta: {qv.group(1)} variable "{qv.group(2)}" = "{qv.group(3)}"' in other,
+              qv.group(0) if qv else "no QUEST VAR line")
+        ap = re.search(r"co-op: delta applied: .* (\d+) conflicts", other)
+        check("the other copy applied it without conflicts", bool(ap) and ap.group(1) == "0", ap.group(0) if ap else "")
+    elif scenario == "shoptalk":
+        check("the host opened its shop", "co-op: shop of NPC 96 open for this player" in host)
+        check("the joiner's talk to the quest giver during the shop was refused, with a notice",
+              "bot: the joiner talks to the quest giver while the host shops" in join
+              and "co-op: refused this player's talk to NPC 266: a player is trading" in join
+              and "notice: Co-op: a player is trading - talk to them when they are done" in join)
+        check("after the shop the joiner talked to the quest giver and got the briefing",
+              "bot: the shop is done: the joiner talks to the quest giver again" in join
+              and "co-op: .?AVWPipboy@@ opened for this player" in join)
+        aps = [m.group(1) for log in (host, join) for m in re.finditer(r"co-op: delta applied: .* (\d+) conflicts", log)]
+        check("both changes (the deal, the conversation) applied on the other copy without conflicts",
+              len(aps) >= 2 and set(aps) == {"0"}, aps)
+        check("no reload: no re-sync, no upload, no new generation",
+              "host: re-sync (" not in host and "join: quick-save for the host" not in join
+              and "join: following the host to generation 2" not in join)
+    elif scenario == "levelup" and actor == "all":
+        won = [who for who, log in (("host", host), ("joiner", join)) if re.search(r"co-op: character screen of \d+ is ours", log)]
+        lost = [who for who, log in (("host", host), ("joiner", join)) if "another player's came first" in log]
+        check("both players opened the same character's screen at once; exactly one got it", len(won) == 1 and len(lost) == 1,
+              f"won {won}, lost {lost}")
+        if lost:
+            loser = host if lost[0] == "host" else join
+            check("the other was told and its screen closed",
+                  "notice: Co-op: another player is levelling up that character" in loser and "ending mission-screen mode 3" in loser)
+        check("no reload: no re-sync, no upload, no new generation",
+              "host: re-sync (" not in host and "join: quick-save for the host" not in join
+              and "join: following the host to generation 2" not in join)
+    elif scenario == "levelup":
+        lv, other = (host, join) if actor == "host" else (join, host)
+        # A joiner levelling up leaves the host playing: the host must be refused that character's screen and the
+        # recruiter. The host levelling up holds every game (records flow only through the host's ticks), so a joiner
+        # can neither learn of the lock nor act until it is over; its same-character screen is the race (levelrace).
+        if actor == "join":
+            check("while it levelled up, the other player's screen of that character closed again, with a notice",
+                  "bot: the other player opens the same character's screen while it levels up" in other
+                  and "co-op: refused this player's character screen of" in other
+                  and "notice: Co-op: another player is levelling up that character" in other)
+            check("and its talk to the recruiter was refused, with a notice",
+                  "co-op: refused this player's talk to recruiter" in other
+                  and "notice: Co-op: a player is levelling up - recruit when they are done" in other)
+        check(f"the {actor} opened the character screen for a level-up and chose a perk",
+              "co-op: .?AVWCharacter@@ opened for this player" in lv and "perk dialog: pressing Done" in lv)
+        runs = re.findall(r"co-op: delta: character \d+'s attributes", lv)
+        ap = re.search(r"co-op: delta applied: .* (\d+) conflicts, \d+ variables, (\d+) attribute runs", other)
+        check("the level-up's attribute changes went to the other copy and applied without conflicts",
+              bool(runs) and bool(ap) and ap.group(1) == "0" and int(ap.group(2)) == len(runs),
+              f"{len(runs)} runs sent; {ap.group(0) if ap else 'no delta applied line'}")
+        check("no reload: no re-sync, no upload, no new generation",
+              "host: re-sync (" not in host and "join: quick-save for the host" not in join
+              and "join: following the host to generation 2" not in join)
     elif scenario == "drift":
         check("the joiner's bot moved an NPC on its copy only", talk_frame is not None)
         dd = re.findall(r"co-op: drift: .*'s game differs from ours at frame (\d+)", host)
@@ -760,7 +840,7 @@ def main():
     r_host = rng(host)
     for who, log in [("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
         r_x = rng(log)
-        common = sorted(k for k in set(r_host) & set(r_x) if scenario not in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse", "drift") or k[0] >= 2
+        common = sorted(k for k in set(r_host) & set(r_x) if scenario not in ("talk", "quest", "shoptalk", "levelup", "trade", "trade2", "recruit", "recruitnew", "browse", "drift") or k[0] >= 2
                         or (talk_frame is not None and k[1] < talk_frame)
                         or (free_frame is not None and k[1] > free_frame + 1))
         diff = [k for k in common if r_host[k] != r_x[k]]
