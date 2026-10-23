@@ -327,6 +327,8 @@ void QueueFrameDelta(uint8_t kind, bool ok, bool mine, const uint8_t* data, int 
     g_frame_count++;
 }
 
+bool TakeWorldFix(const uint8_t** data, int* len);  // drift.inc
+
 // ActorActHook: a co-op command at its frame, on every copy.
 void CoopCommandAtFrame(const uint8_t* r) {
     uint8_t kind = r[3];
@@ -349,6 +351,14 @@ void CoopCommandAtFrame(const uint8_t* r) {
     g_shop_new_n = 0;
     TableStepMark(world);
     if (!f.mine && f.ok && f.len) ApplyDelta(f.data, f.len);
+    uint16_t marker;
+    memcpy(&marker, r + 5, 2);
+    const uint8_t* fix = nullptr;
+    int fix_len = 0;
+    if (f.mine && marker == 0xffff && TakeWorldFix(&fix, &fix_len)) {  // the host's own drift correction, at its frame
+        ApplyDelta(fix, fix_len);
+        Log("co-op: drift correction applied here too at frame %d", frame);
+    }
     if (!f.mine && kind == kShopClose) TableStepLog(world, "the deal applied here");
     g_applying_at_frame = false;
     if (kind == kShopClose) {

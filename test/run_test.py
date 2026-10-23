@@ -52,7 +52,8 @@ TESTS = {
     "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
     "drift_host": ("drift", "host", 4),
     "joinload": ("joinload", "join", 5),
-    "play": ("play", "host", 4),  # a person plays both copies (--save, --hold-frames); the bots only log and compare  # the joiner presses quick-load mid-mission: refused (only the host loads)  # the joiner moves an NPC on its copy only; the host notices and re-syncs
+    "play": ("play", "host", 4),
+    "invscreen": ("invscreen", "host", 10),  # exploration: the host sits in its inventory (--hold-frames: seconds; 0 = control)  # a person plays both copies (--save, --hold-frames); the bots only log and compare  # the joiner presses quick-load mid-mission: refused (only the host loads)  # the joiner moves an NPC on its copy only; the host notices and re-syncs
     "survey": ("survey", "host", 0),  # exploration: the NPCs next to the first two squad members (use with --save)
     "quest_host": ("quest", "host", 4),  # QuestBarter.sav: the host talks to the quest giver; the joiner gets the changes
     "quest_join": ("quest", "join", 4),  # the same from the joiner
@@ -327,7 +328,10 @@ def main():
     if scenario == "drift":  # session 1 differs on purpose from the joiner's nudge; session 2 must not
         nd = re.search(r"bot: DRIFT moved NPC \d+ on this copy only, at frame (\d+)", join)
         talk_frame = int(nd.group(1)) if nd else None
-        shared = [k for k in shared if k[0] >= 2 or (talk_frame is not None and k[1] < talk_frame)]
+        fx = re.search(r"co-op: drift correction applied here too at frame (\d+)", host)
+        fix_frame = int(fx.group(1)) if fx else None
+        shared = [k for k in shared if k[0] >= 2 or (talk_frame is not None and k[1] < talk_frame)
+                  or (fix_frame is not None and k[1] > fix_frame)]
     if scenario in ("talk", "quest", "shoptalk", "levelup", "trade", "trade2", "recruit", "recruitnew", "browse"):
         # Before the talk both copies match; from the talk the talker's game differs until the other copy applied the
         # talker's delta (no reload); from the frame after that, everything must match again.
@@ -777,13 +781,17 @@ def main():
         dd = re.findall(r"co-op: drift: .*'s game differs from ours at frame (\d+)", host)
         check("the host saw the joiner's game differ, from the next checked frame",
               bool(dd) and talk_frame is not None and int(dd[0]) - talk_frame <= 2 * 25, dd[:3])
-        check("the host re-synced for it", re.search(r"host: re-sync \(.*drifted out of step\): quick-save", host) is not None
-              and "notice: Co-op: " in host)
-        check("joiner followed the host to generation 2", "join: following the host to generation 2" in join)
-        s2 = [k for k in shared if k[0] == 2]
-        check("at least 4 shared snapshot frames in session 2, all identical",
-              len(s2) >= 4 and all(s_host[k] == s_join[k] for k in s2), f"{len(s2)} session-2 frames")
-        check("no drift in session 2", not re.search(r"drift: .* \(generation 2\)", host))
+        check("the host sent its positions instead of reloading", "co-op: drift: sent every actor's position and HP" in host
+              and "host: re-sync (" not in host and "join: following the host to generation 2" not in join)
+        fx = re.search(r"co-op: drift correction applied here too at frame (\d+)", host)
+        ap = re.search(r"co-op: a conversation's changes applied at frame (\d+) \(theirs\)", join)
+        check("both copies took the correction at the same frame", bool(fx) and bool(ap) and fx.group(1) == ap.group(1),
+              f"host {fx.group(1) if fx else None}, joiner {ap.group(1) if ap else None}")
+        after = [k for k in shared if fx and k[1] > int(fx.group(1))]
+        check("at least 4 shared frames after it, all identical", len(after) >= 4
+              and all(s_host[k] == s_join[k] for k in after), f"{len(after)} frames")
+        check("no drift after the correction", not re.search(r"drift: .*differs from ours at frame (\d+)", host)
+              or all(int(m) <= int(fx.group(1)) for m in re.findall(r"differs from ours at frame (\d+)", host)) if fx else False)
     elif scenario == "soak":
         n_h, n_j = len(re.findall(r"bot: MOVE id=", host)), len(re.findall(r"bot: MOVE id=", join))
         expected = max(1, (args.soak_frames - 30) // 240)
