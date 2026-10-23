@@ -520,6 +520,32 @@ bool g_join_pending = false;
 bool g_join_ignore_server = false;  // joiner: on the world map, ignore the old session until it follows
 bool g_follow = true;  // [coop] follow=0: never follow the host to a new save (mutation test)
 
+// A joiner plays the host's game: its own load (the Load menu, the quick-load key) would put it in another game, so
+// only the host loads. In a mission or on the world map a load sets the file to load (0x8bddb4) and closes the screen
+// with 0x10 (WGameMain vtable +0x38, WCampaignWindow +0x34, the base window's 0x6c6260 / 0x6c61f0); the load check
+// runs only after the screen is gone, too late. So that close is refused on a joiner unless the file is the host's
+// save (following the host closes the same way).
+void Notice(const char* fmt, ...);  // below
+typedef void(__fastcall* ScreenCloseFn)(void*, void*, int);
+ScreenCloseFn g_gamemain_close = nullptr, g_campaign_close = nullptr;
+
+bool RefuseJoinerLoad(int result) {
+    if (result != 0x10 || !g_coop_join || g_loaded_gen <= 0) return false;
+    const wchar_t* w = *reinterpret_cast<const wchar_t**>(kFileToLoad);
+    char name[260] = "";
+    if (w) WideCharToMultiByte(CP_ACP, 0, w, -1, name, sizeof(name), nullptr, nullptr);
+    if (!name[0] || _stricmp(name, kReceivedName) == 0) return false;
+    Log("join: refused this player's load of \"%s\": only the host loads a game in co-op", name);
+    Notice("Co-op: only the host can load a game - ask them to load it");
+    return true;
+}
+void __fastcall GameMainCloseHook(void* self, void* edx, int result) {
+    if (!RefuseJoinerLoad(result)) g_gamemain_close(self, edx, result);
+}
+void __fastcall CampaignCloseHook(void* self, void* edx, int result) {
+    if (!RefuseJoinerLoad(result)) g_campaign_close(self, edx, result);
+}
+
 void JoinerFollowHost(uint8_t* window) {
     // The old world map window keeps ticking during the next mission: only count it while no mission screen exists.
     if (g_coop_join && g_fetch_save && *reinterpret_cast<uintptr_t*>(window) == kCampaignWindowVtable &&

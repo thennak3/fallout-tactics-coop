@@ -27,6 +27,7 @@ SUITE = [
     ("levelup_host (the host levels up: a perk; the joiner gets the stats)", ["levelup_host", "--timeout", "120"], "PASS"),
     ("levelup_join (the joiner levels up; the host is refused that character's screen and the recruiter)", ["levelup_join", "--timeout", "120"], "PASS"),
     ("levelrace (both open the same character's screen at once: one wins)", ["levelrace", "--timeout", "120"], "PASS"),
+    ("joinload (the joiner presses quick-load mid-mission: refused, only the host loads)", ["joinload", "--timeout", "120"], "PASS"),
     ("transition (mission -> world map -> mission)", ["transition", "--timeout", "90"], "PASS"),
     ("menu_join (roles from the Multiplayer menu)", ["menu_join", "--timeout", "90"], "PASS"),
     ("dropin (joiner arrives mid-session)", ["dropin", "--timeout", "120"], "PASS"),
