@@ -41,6 +41,24 @@ bool IsActor(uint8_t* world, int i) {
 bool IsRecruitScenario() { return _stricmp(g_test.scenario, "recruit") == 0 || _stricmp(g_test.scenario, "recruitnew") == 0; }
 // trade: one player trades; trade2: then the other player trades with the same merchant and also sells an item
 bool IsTradeScenario() { return _stricmp(g_test.scenario, "trade") == 0 || _stricmp(g_test.scenario, "trade2") == 0; }
+DWORD g_bot_level_tick = 0;
+
+void DumpWindowTree(uint8_t* w, int depth);  // below
+
+bool g_bot_level_request = false;
+
+// levelup: one skill point spent on squad member 0, as the character screen's spinner does: its first skill
+// (attribute table 0, Skills at +0x363, values from +0x367) one higher.
+void BotLevelSkill() {
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    uint16_t squad[16];
+    if (!world || GetSquad(world, squad, 16) < 1) return;
+    int* skill = reinterpret_cast<int*>(EntityById(world, squad[0]) + 0x367);
+    Log("bot: LEVEL SKILL member %u +0x367 %d -> %d", squad[0], *skill, *skill + 1);
+    ++*skill;
+}  // levelup: when the bot pressed the Level button (the screen may hold the world)
+uint32_t Fnv(uint32_t h, const void* p, size_t n);  // private_sync.inc
+bool IsShopTalk() { return _stricmp(g_test.scenario, "shoptalk") == 0; }  // QuestBarter.sav: host shops, joiner talks
 int g_bot_deals = 0;  // deals this copy's bot made
 
 bool InList(const uint16_t* ids, int n, int id) {
@@ -133,6 +151,13 @@ void SnapshotAll(uint8_t* world, int frame) {
         Log("ETABX s=%ld f=%d %s", g_snap_tag, frame, line);
     }
     Log("VARS s=%ld f=%d hash=%08x", g_snap_tag, frame, HashVars(world));  // mission and campaign variables
+    {  // the squad's attribute tables (stats, skills, perks: a level-up)
+        uint16_t sq[16];
+        int nsq = GetSquad(world, sq, 16);
+        uint32_t h = 2166136261u;
+        for (int k = 0; k < nsq; k++) h = Fnv(h, EntityById(world, sq[k]) + 0x2a7, 4 * 0x339 - 1);  // private_sync.inc
+        Log("ATTR s=%ld f=%d hash=%08x", g_snap_tag, frame, h);
+    }
     {  // the campaign's stock list (what a quartermaster sells): templates and counts
         uint32_t sh = 2166136261u;
         __try {
@@ -362,6 +387,7 @@ void BotTalk(uint8_t* client, uint8_t* world, uint16_t target, int frame) {
 // shop's stock (30 stacks) and closing it takes the stock away again. What the other players must get is the trader's
 // game once the screens have closed (logged as INV SYNCED).
 const uint16_t kMerchant = 96;
+const uint16_t kQuestGiver = 266;  // QuestBarter.sav: General Barnaky (B01_GenBarnaky.ent)
 const float kMerchantApproach[3] = {359.5f, 32.0f, 320.5f};
 const uintptr_t kSpeechBarterButton = 0x4d0000;
 const uintptr_t kBarterOffer = 0x455830;
@@ -609,7 +635,9 @@ void DumpWindowTree(uint8_t* w, int depth) {
                                      *reinterpret_cast<uint32_t*>(w + off - 4));
             }
         }
-        Log("ui: tree %*s%s %p vt %08x%s", depth * 2, "", name, w, *reinterpret_cast<uint32_t*>(w), extra);
+        const int* rc = reinterpret_cast<const int*>(w + 0xc3);
+        Log("ui: tree %*s%s %p vt %08x rect %d,%d,%d,%d%s", depth * 2, "", name, w, *reinterpret_cast<uint32_t*>(w),
+            rc[0], rc[1], rc[2], rc[3], extra);
         for (uint8_t* c = *reinterpret_cast<uint8_t**>(w + 0x18); c; c = *reinterpret_cast<uint8_t**>(c + 0x24))
             DumpWindowTree(c, depth + 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -987,6 +1015,8 @@ void BotDriveMultiSetup(uint8_t* w);  // netlog.cpp
 void WaitPopupTick(uint8_t* w);  // netlog.cpp
 void PrivateScreenTick(uint8_t* w);  // netlog.cpp
 void PrivateCloseStep();  // below
+void LevelScreenClosed();  // recruit_sync.inc
+bool AnyLevelLock();
 bool PrivateScreensClosed();  // netlog.cpp
 void ReleaseTalkerHold();     // netlog.cpp
 extern uint8_t* g_private_speech;
@@ -1011,7 +1041,9 @@ void __fastcall WindowTickHook(uint8_t* w) {
             Log("co-op: exception 0x%08x closing the private screens", GetExceptionCode());
         }
     }
-    if (g_test.enabled && w == g_private_speech && _stricmp(g_test.scenario, "talk") == 0) BotSpeechTick(w);
+    if (g_test.enabled && w == g_private_speech &&
+        (_stricmp(g_test.scenario, "talk") == 0 || _stricmp(g_test.scenario, "quest") == 0 || (IsShopTalk() && g_coop_join)))
+        BotSpeechTick(w);
     if (g_test.enabled && IsRecruitScenario()) {
         if (w == g_private_speech) BotRecruitSpeechTick(w);
         if (*reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) BotRecruitGameMainTick(w);
@@ -1027,9 +1059,61 @@ void __fastcall WindowTickHook(uint8_t* w) {
             DumpWindowTree(w, 0);
         }
     }
-    if (g_test.enabled && (IsTradeScenario() || _stricmp(g_test.scenario, "browse") == 0)) {
+    if (g_test.enabled && (IsTradeScenario() || _stricmp(g_test.scenario, "browse") == 0 || (IsShopTalk() && g_coop_host))) {
         if (w == g_private_speech) BotTradeSpeechTick(w);
         if (*reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) BotTradeGameMainTick(w);
+    }
+    // levelup: the other player, while the levelling player's screen is open (from the mission screen's tick: with
+    // the host levelling up, no frames run anywhere): the same character's screen (closed again, with a notice) and
+    // the recruiter (refused).
+    if (g_test.enabled && _stricmp(g_test.scenario, "levelup") == 0 && _stricmp(g_test.actor, "all") != 0 &&
+        (_stricmp(g_test.actor, "host") == 0) != g_coop_host && AnyLevelLock() &&
+        *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
+        static bool screen_tried = false, recruit_tried = false;
+        uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+        if (!screen_tried) {
+            screen_tried = true;
+            Log("bot: the other player opens the same character's screen while it levels up");
+            g_bot_level_request = true;
+        } else if (!recruit_tried && *reinterpret_cast<int*>(w + 0x156) == 0 && world && g_client_ptr) {
+            recruit_tried = true;
+            uint16_t squad[16];
+            if (GetSquad(world, squad, 16) > 0) g_bot_talker = squad[0];
+            Log("bot: the other player tries the recruiter while a character levels up");
+            BotTalk(g_client_ptr, world, 0, *reinterpret_cast<int*>(world + kWorldFrame));
+        }
+    }
+    if (g_test.enabled && g_bot_level_request && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
+        g_bot_level_request = false;
+        g_bot_level_tick = GetTickCount();  // before: the perk dialog's own loop runs inside this call
+        reinterpret_cast<void(__thiscall*)(void*, int)>(0x471aa0)(w, 3);
+        Log("bot: LEVEL pressed: mode %d", *reinterpret_cast<int*>(w + 0x156));
+        g_bot_level_tick = GetTickCount();
+    }
+    if (g_test.enabled && g_bot_level_tick && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
+        static bool dumped = false, closed = false;
+        DWORD t = GetTickCount() - g_bot_level_tick;
+        (void)dumped;  // (a direct skill poke was tried here: the screen's Done writes its own copy over it)
+        static DWORD last_press = 0;
+        if (t > 3000 && !closed && GetTickCount() - last_press > 1000) {  // the screen's Done (0x4678b0), until it closes
+            last_press = GetTickCount();
+            uint8_t* done = nullptr;
+            for (uint8_t* c = *reinterpret_cast<uint8_t**>(w + 0x18); c; c = *reinterpret_cast<uint8_t**>(c + 0x24))
+                if (strstr(RttiName(c), "WCharacter"))
+                    for (uint8_t* b = *reinterpret_cast<uint8_t**>(c + 0x18); b; b = *reinterpret_cast<uint8_t**>(b + 0x24))
+                        if (*reinterpret_cast<uintptr_t*>(b + 0x112) == 0x4678b0) done = b;
+            if (done) {
+                Log("bot: LEVEL pressing the character screen's Done");
+                reinterpret_cast<void(__fastcall*)(void*, void*, void*)>(0x4678b0)(*reinterpret_cast<void**>(done + 0x10e), nullptr, done);
+            } else if (*reinterpret_cast<int*>(w + 0x156) != 3) {
+                closed = true;
+                Log("bot: LEVEL the character screen is closed");
+            } else {
+                closed = true;
+                Log("bot: FAIL no Done button on the character screen; leaving it");
+                g_end_game_mode = true;
+            }
+        }
     }
     if (g_test.enabled && g_coop_host && _stricmp(g_test.scenario, "transition") == 0 &&
         *reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) {
@@ -1088,7 +1172,65 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
     bool i_act = _stricmp(g_test.actor, "all") == 0 ? g_coop_join
                                                      : host_acts == g_coop_host && (g_coop_host || g_test.index == 1);
     const char* s = g_test.scenario;
-    if (_stricmp(s, "move") == 0) {
+    if (_stricmp(s, "survey") == 0) {
+        // Exploration: who stands next to the first squad members (a new save: which NPCs to talk to).
+        if (rel >= 30 && Once(0) && g_coop_host) {
+            uint16_t squad[16];
+            int n = GetSquad(world, squad, 16);
+            for (int m = 0; m < n && m < 2; m++) {
+                float* a = EntityPos(world, squad[m]);
+                struct Near { float d; int id; } best[4] = {{1e9f, 0}, {1e9f, 0}, {1e9f, 0}, {1e9f, 0}};
+                for (int i = 1; i < EntityCount(world); i++) {
+                    bool ours = false;
+                    for (int k = 0; k < n; k++) ours |= squad[k] == i;
+                    if (!IsActor(world, i) || ours) continue;
+                    float* b = EntityPos(world, static_cast<uint16_t>(i));
+                    float d = (a[0] - b[0]) * (a[0] - b[0]) + (a[2] - b[2]) * (a[2] - b[2]);
+                    for (int k = 0; k < 4; k++)
+                        if (d < best[k].d) {
+                            for (int j = 3; j > k; j--) best[j] = best[j - 1];
+                            best[k] = {d, i};
+                            break;
+                        }
+                }
+                Log("bot: SURVEY member %d (%u) at (%.2f,%.2f,%.2f)", m, squad[m], a[0], a[1], a[2]);
+                for (const Near& nb : best) {
+                    if (!nb.id) continue;
+                    uint8_t* e = EntityById(world, static_cast<uint16_t>(nb.id));
+                    char name[80] = "";
+                    __try {
+                        const wchar_t* nm = *reinterpret_cast<wchar_t**>(e + 0x199);
+                        for (int c = 0; nm && nm[c] && c < 79; c++) name[c] = nm[c] < 0x80 ? static_cast<char>(nm[c]) : '?';
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    }
+                    bool qm = reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(e))[0x3f4 / 4])(e);
+                    bool rm = reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(e))[0x3f0 / 4])(e);
+                    Log("bot: SURVEY   NPC %d %s \"%s\" at distance %.2f%s%s", nb.id, RttiName(e), name, sqrtf(nb.d),
+                        qm ? " quartermaster" : "", rm ? " recruiter" : "");
+                }
+            }
+        }
+        if (rel >= 35 && Once(2) && g_coop_host) {  // where a character keeps its numbers
+            static const struct { uint32_t vt; const char* name; } kinds[] = {
+                {0x809434, "Stats"}, {0x824bc4, "Skills"}, {0x824c04, "Perks"}, {0x824be4, "Traits"},
+                {0x824bf4, "OTraits"}, {0x809594, "Status"}, {0x824c24, "ActorStatus"}};
+            uint16_t squad[16];
+            if (GetSquad(world, squad, 16) > 0) {
+                uint8_t* e = EntityById(world, squad[0]);
+                char line[600] = "";
+                int n = 0;
+                for (int off = 0; off < 0x3000 && n < 560; off++)
+                    for (const auto& k : kinds)
+                        if (*reinterpret_cast<uint32_t*>(e + off) == k.vt) n += sprintf_s(line + n, sizeof(line) - n, " %s@+%x", k.name, off);
+                Log("bot: SURVEY member %u's stat objects:%s", squad[0], line[0] ? line : " none inside");
+            }
+        }
+        if (rel >= 40 && Once(1) && g_coop_host) {  // the mission screen's windows: which button is "Level"
+            uint8_t* gm = *reinterpret_cast<uint8_t**>(kGameMainPtr);
+            if (gm) DumpWindowTree(gm, 0);
+        }
+        if (rel >= 60) BotFinish();
+    } else if (_stricmp(s, "move") == 0) {
         if (rel >= 30 && Once(0) && i_act) BotMoveMember(client, world, 0, 0);
         if (rel >= 410) BotFinish();
     } else if (_stricmp(s, "simul") == 0) {
@@ -1201,6 +1343,63 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             }
         }
         if (rel_s >= talk_at + 500) BotFinish();
+    } else if (_stricmp(s, "levelup") == 0) {
+        // QuestBarter.sav: a squad member can level up; the bar shows a "Level" effect button (WEffectButton, handler
+        // 0x479e60 __fastcall(WGameMain*, edx, button): by the button's effect name, "objectiveComplete" opens the Pipboy
+        // (mode 11), "sneak" a command, anything else SetMode(3)). [test] actor presses it as a click does.
+        bool race = _stricmp(g_test.actor, "all") == 0;  // levelrace: both press on the same frame
+        if (rel_s >= 30 && Once(0) && (i_act || race)) {
+            uint8_t* gm = *reinterpret_cast<uint8_t**>(kGameMainPtr);
+            uint8_t* level = nullptr;
+            for (uint8_t* c = gm ? *reinterpret_cast<uint8_t**>(gm + 0x18) : nullptr; c; c = *reinterpret_cast<uint8_t**>(c + 0x24))
+                if (strstr(RttiName(c), "WEffectButton") && *reinterpret_cast<int*>(c + 0xc3) >= 0) level = c;
+            if (!level) {
+                Log("bot: FAIL no visible effect button (the Level button)");
+            } else {
+                // The handler takes the effect's data (arg +4 -> an object whose +0x2c is its name), not the button;
+                // for a level-up it ends in 0x471aa0(3) on the mission screen, called here directly.
+                // SetMode runs from the mission screen's own tick (called from the frame step it never returned).
+                Log("bot: LEVEL pressing the Level button %p (0x471aa0(3), from the mission screen's tick) at frame %d", level, frame);
+                g_bot_level_request = true;
+            }
+        }
+        if (rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "quest") == 0) {
+        // QuestBarter.sav: [test] actor's member 0 stands next to General Barnaky (NPC 266, the bunker's quest giver)
+        // and talks to him; the conversation's changes (the game's own, and a quest variable and an HP the bot
+        // changes while it is open) reach the others as a delta.
+        if (rel_s >= 30 && Once(0) && i_act) {
+            uint16_t squad[16];
+            if (GetSquad(world, squad, 16) > 0) g_bot_talker = squad[0];
+            BotTalk(client, world, kQuestGiver, frame);
+        }
+        if (rel_s >= 530 && !g_bot_done_step[1] && i_act && Once(1)) Log("bot: FAIL no conversation opened 500 frames after the talk command");
+        if (rel_s >= 480) BotFinish();
+    } else if (IsShopTalk()) {
+        // QuestBarter.sav: one player shops while another talks. The host's member 1 trades with the quartermaster
+        // (NPC 96, no pause); while that shop is open the joiner's member 0 talks to General Barnaky (NPC 266), which
+        // holds everyone, the shopper's world too. Both finish; everything must match, with no reload.
+        if (rel_s >= 30 && Once(0) && g_coop_host) {
+            uint16_t squad[16];
+            if (GetSquad(world, squad, 16) > 1) g_bot_talker = squad[1];
+            BotTalk(client, world, kMerchant, frame);
+        }
+        // The joiner tries the quest giver while the host shops (refused: a conversation would hold the shopper too),
+        // then again once the shop has closed.
+        uint16_t shop_buyer = 0;
+        static bool tried = false;
+        if (g_coop_join && g_test.hold != 1 && ShopOpenForOther(&shop_buyer) && Once(1)) {  // [test] hold=1: no talk
+            uint16_t squad[16];
+            if (GetSquad(world, squad, 16) > 0) g_bot_talker = squad[0];
+            Log("bot: the joiner talks to the quest giver while the host shops");
+            BotTalk(client, world, kQuestGiver, frame);
+            tried = true;
+        }
+        if (g_coop_join && tried && !ShopOpenForOther(&shop_buyer) && Once(2)) {
+            Log("bot: the shop is done: the joiner talks to the quest giver again");
+            BotTalk(client, world, kQuestGiver, frame);
+        }
+        if (rel_s >= 700) BotFinish();
     } else if (IsTradeScenario()) {
         // Bunker save. Both players move squad members around first (the other side member 1, the actor member 2),
         // then [test] actor's member 0 walks to the merchant, talks, barters (BotTradeGameMainTick) and trades.
@@ -1264,13 +1463,14 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
 
 void PrivateCloseStep() {  // frame hook, and the mission screen's tick (the world may be held: no frames)
     if (PrivateScreensClosed()) {
-        if (g_test.enabled && (IsTradeScenario() || IsRecruitScenario())) {
+        if (g_test.enabled && (IsTradeScenario() || IsRecruitScenario() || IsShopTalk())) {
             uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);  // what the others will get
             LogInv(world, "SYNCED", g_bot_talker);
             LogInv(world, "SYNCED", kMerchant);
             LogSquad(world, "SYNCED");
         }
         int diff = PrivateScreensDiff();
+        LevelScreenClosed();  // a character screen's lock goes once its changes are out
         ReleaseTalkerHold();  // the delta is out: this world goes on (a re-sync needs frames too)
         extern bool g_suppress_pause;
         extern int g_suppressed;

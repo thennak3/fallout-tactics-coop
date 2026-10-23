@@ -17,6 +17,29 @@ struct ShopState {
     uint32_t orig_inventory;   // the merchant's own inventory, back at close
 };
 ShopState g_shop = {};
+
+// Exploration (test mode): entity-table entries a step changed (used, next_free, seq), against the last mark.
+SlotState g_step_before[kMaxSlots];
+int g_step_n = 0, g_step_frames = 0;
+void TableStepMark(uint8_t* world) {
+    if (g_test.enabled && world) ReadSlots(world, g_step_before, &g_step_n);
+}
+void TableStepLog(uint8_t* world, const char* what) {
+    if (!g_test.enabled || !world) return;
+    static SlotState now[kMaxSlots];
+    int n = 0;
+    ReadSlots(world, now, &n);
+    char line[1500] = "";
+    int l = 0, k = 0;
+    for (int i = 1; i < n && i < g_step_n && l < 1400; i++)
+        if (now[i].used != g_step_before[i].used || now[i].next_free != g_step_before[i].next_free || now[i].seq != g_step_before[i].seq) {
+            k++;
+            l += sprintf_s(line + l, sizeof(line) - l, " %d:%d/%d/%d>%d/%d/%d", i, g_step_before[i].used, g_step_before[i].next_free,
+                           g_step_before[i].seq, now[i].used, now[i].next_free, now[i].seq);
+        }
+    Log("tablestep: %s: %d entries (used/next/seq):%s; head %u", what, k, line, *reinterpret_cast<uint16_t*>(world + kWorldFreeHead));
+    ReadSlots(world, g_step_before, &g_step_n);
+}
 extern bool g_shop_close_waits;
 void RunDeferredNew(uint8_t* world);
 bool g_shop_requested = false;  // this copy's Barter press went out as kShopOpen
@@ -247,7 +270,23 @@ void __fastcall QmDtorHook(uint8_t* self, void* /*edx*/) {
         // inventory, vt+0x508, into its owner's, vt+0x504; a stack that merges is destroyed). Done here first, so the
         // deal includes it (trade_host, shop_no_pause: a stack the screen destroyed only on the shopper's copy);
         // the destructor's own call then finds the tables empty.
+        uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+        int pending_before = world ? *reinterpret_cast<int*>(world + 0x75d) : -1;
         reinterpret_cast<void(__thiscall*)(void*)>(0x4569a0)(self);
+        // The stacks the screen split off for the offer tables exist on this copy only, and handing them back marks
+        // them for destruction (World::DestroyEntity 0x4e4a30: the pending list World+0x759, count +0x75d, seq + 1);
+        // the frame after, World 0x4e4bb0 frees them (slot onto the free list, seq + 1 again). Measured before that,
+        // the deal gave the others their slots as they were before being freed, and the shopper's free list then went
+        // its own way (shoptalk: Brotherhood Scrip, the whole stack spent, four slots one seq apart). So they are freed
+        // now, before the deal is measured, when nothing else was pending (then nothing else is freed early here).
+        if (world && pending_before == 0 && *reinterpret_cast<int*>(world + 0x75d) > 0) {
+            Log("co-op: shop: freeing the %d stacks handed back from the offer tables before measuring the deal",
+                *reinterpret_cast<int*>(world + 0x75d));
+            reinterpret_cast<void(__thiscall*)(void*)>(0x4e4bb0)(world);
+        } else if (world && pending_before != 0) {
+            Log("co-op: shop: %d destroys were pending before the hand-back: the handed-back stacks are freed next frame",
+                pending_before);
+        }
         extern int g_diff_mode;
         extern uint8_t g_done_kind;
         g_diff_mode = 2;
@@ -258,8 +297,11 @@ void __fastcall QmDtorHook(uint8_t* self, void* /*edx*/) {
         g_done_kind = kSyncDone;
     }
     if (closing) LogShopState(*reinterpret_cast<uint8_t**>(kWorldPtr), "before the close");
+    if (closing) TableStepMark(*reinterpret_cast<uint8_t**>(kWorldPtr));
     original(self);
     if (closing) {
+        TableStepLog(*reinterpret_cast<uint8_t**>(kWorldPtr), "the real close (the shopper's destructor)");
+        g_step_frames = 4;
         LogShopState(*reinterpret_cast<uint8_t**>(kWorldPtr), "after the close");
         LogCampaignStock("after the close");
         g_shop.mine = false;  // the others close at kShopClose's frame
@@ -305,7 +347,9 @@ void CoopCommandAtFrame(const uint8_t* r) {
     int frame = *reinterpret_cast<int*>(world + kWorldFrame);
     g_applying_at_frame = true;
     g_shop_new_n = 0;
+    TableStepMark(world);
     if (!f.mine && f.ok && f.len) ApplyDelta(f.data, f.len);
+    if (!f.mine && kind == kShopClose) TableStepLog(world, "the deal applied here");
     g_applying_at_frame = false;
     if (kind == kShopClose) {
         if (!f.mine && g_shop.open && g_frame_b) {
@@ -313,6 +357,7 @@ void CoopCommandAtFrame(const uint8_t* r) {
         } else if (!f.mine && g_shop.open) {
             LogShopState(world, "before the close");
             HeadlessShopClose(world);
+            TableStepLog(world, "the headless close");
             LogShopState(world, "after the close");
             LogCampaignStock("after the close");
         }
@@ -350,6 +395,13 @@ int RefuseShopperOrders(uint8_t* msg, int len) {
             Log("co-op: refused this player's talk to recruiter %u: a player is trading", npc);
             Notice("Co-op: a player is trading - recruit when they are done");
             drop = true;
+        } else if (r[0] == 0x17) {
+            // Any other conversation would hold every copy, the shopper's too, while its shop is open; the shop's close
+            // then ran its destroys and bookkeeping under that hold in another order than everywhere else, and five
+            // entity slots stayed one sequence number apart (shoptalk). So it waits until the shop is done.
+            Log("co-op: refused this player's talk to NPC %u: a player is trading", npc);
+            Notice("Co-op: a player is trading - talk to them when they are done");
+            drop = true;
         } else if (actor == buyer) {
             Log("co-op: refused this player's order %02x for squad member %u: it is trading", r[0], actor);
             Notice("Co-op: that character is trading - wait for them");
@@ -380,9 +432,16 @@ bool g_shop_close_waits = false;
 void RunDeferredCreates() {
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     if (!world) return;
+    if (g_step_frames > 0) {
+        g_step_frames--;
+        TableStepLog(world, "frame start");
+    }
     RunDeferredNew(world);
+    if (g_frame_b) TableStepLog(world, "the waiting create");
     if (g_frame_b) {
         ApplyBookkeeping(world, g_frame_b);
+        TableStepLog(world, "the deal's bookkeeping");
+        g_step_frames = 4;
         free(g_frame_b);
         g_frame_b = nullptr;
         Log("co-op: delta bookkeeping written after its destroys finished");
@@ -391,6 +450,7 @@ void RunDeferredCreates() {
         g_shop_close_waits = false;
         LogShopState(world, "before the close");
         HeadlessShopClose(world);
+        TableStepLog(world, "the headless close (a frame late)");
         LogShopState(world, "after the close");
         LogCampaignStock("after the close");
         g_shop.open = false;
@@ -404,6 +464,12 @@ void RunDeferredNew(uint8_t* world) {
         DeferredNew& d = g_deferred_new[i];
         int made = 0, kids = 0;
         int conflicts = ApplyNewEntities(world, &d.ne, 1, &made, &kids);
+        // Its slot's old entity is gone now and this is a new one: off the list of destroys to repeat (destroying
+        // "what is still there" destroyed this new stack: shoptalk, a garbage count on the joiner).
+        extern uint16_t g_destroyed[512];
+        extern int g_ndestroyed;
+        for (int k = 0; k < g_ndestroyed; k++)
+            if (g_destroyed[k] == d.ne.slot) g_destroyed[k] = 0xffff;
         uint8_t* e = Entries(world);
         if (d.have_b) {
             *reinterpret_cast<uint16_t*>(e + d.ne.slot * 8 + 4) = d.next_free;

@@ -213,6 +213,15 @@ void DotsFrame() {
     }
     ReleaseSRWLockShared(&g_dots_lock);
     static char shown[400] = "";
+    // Also a new view (after a load) and every 2 s while there are dots: a repaint asked while the view was not up
+    // yet was lost, and the view repaints only what changed (seen: dots on one copy, none on the other).
+    static uint8_t* last_view = nullptr;
+    static DWORD last_repaint = 0;
+    if (g_view && table[0] && (g_view != last_view || GetTickCount() - last_repaint > 2000)) {
+        last_view = g_view;
+        last_repaint = GetTickCount();
+        reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(g_view))[3])(g_view);
+    }
     if (strcmp(table, shown) != 0) {
         strcpy_s(shown, table);
         if (g_view) reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(g_view))[3])(g_view);
@@ -236,7 +245,9 @@ void DotsFrame() {
         }
         Log("bot: the joiner selects only its 2nd and 3rd characters");
     }
-    if (!shot && frame >= 220 && g_shot_event) {
+    static int first_frame = -1;
+    if (first_frame < 0) first_frame = frame;
+    if (!shot && frame >= first_frame + 200 && g_shot_event) {
         shot = true;
         SetEvent(g_shot_event);
     }
@@ -263,16 +274,24 @@ int* Rect(uint8_t* w) { return reinterpret_cast<int*>(w + 0xc3); }
 void __fastcall ViewDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
     g_view_draw(self, edx, renderer);
     g_view = self;
+    // The bottom panel is a child of the mission screen (children from +0x18, next sibling +0x24). Found there, not
+    // through the small portraits: with one character selected the bar shows a single large portrait instead, and
+    // the small ones never draw (QuestBarter.sav: no dots at all).
     uint8_t* panel = nullptr;
-    for (uint8_t* p : g_portraits)
-        if (p && !panel) panel = *reinterpret_cast<uint8_t**>(p + 0x10e);
-    if (!panel || *reinterpret_cast<uintptr_t*>(panel) != kPanelVtable) return;
+    uint8_t* game_main = *reinterpret_cast<uint8_t**>(kGameMainPtr);
+    for (uint8_t* c = game_main ? *reinterpret_cast<uint8_t**>(game_main + 0x18) : nullptr; c && !panel;
+         c = *reinterpret_cast<uint8_t**>(c + 0x24))
+        if (*reinterpret_cast<uintptr_t*>(c) == kPanelVtable) panel = c;
+    if (!panel) return;
+    // Tab k shows squad member k (the bar fills its tabs in squad order; a tab holds only the name and HP it shows).
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    uint16_t squad[16];
+    int nsquad = world ? GetSquad(world, squad, 16) : 0;
     AcquireSRWLockShared(&g_dots_lock);
-    for (int k = 0; k < 6; k++) {
+    for (int k = 0; k < 6 && k < nsquad; k++) {
         uint8_t* tab = *reinterpret_cast<uint8_t**>(panel + 0xfe + 4 * k);
-        uint8_t* portrait = *reinterpret_cast<uint8_t**>(panel + 0x147 + 4 * k);
-        if (!tab || !portrait || *reinterpret_cast<uintptr_t*>(tab) != kTabVtable) continue;
-        uint16_t slot = static_cast<uint16_t>(*reinterpret_cast<uint32_t*>(portrait + kPortraitEntity) >> 16);
+        if (!tab || *reinterpret_cast<uintptr_t*>(tab) != kTabVtable) continue;
+        uint16_t slot = squad[k];
         int colours[4], n = 0;
         for (int c = 0; c < 4; c++) {
             if (!g_dots[c].live) continue;

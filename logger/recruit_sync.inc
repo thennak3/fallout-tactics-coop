@@ -177,3 +177,194 @@ void CloseHeadlessRecruit() {
     g_recruit_mine_sent = false;
     g_recruit_synced = false;
 }
+
+// ---- Level-ups (QuestBarter.sav): the Level effect button opens mission-screen mode 3, the character screen
+// (WCharacter, vtable 0x7ffa84). With a perk to choose, its setup (0x45ab80) makes the perk dialog WPickPerk (ctor
+// 0x4b5d60, vtable 0x8063a8), keeps it at WCharacter+0x159a and runs its modal loop, vtable slot 11 (+0x2c, the base
+// window's 0x6c6190): window ticks, the message-pump hook and the dialog's own update and draw slots are not reached
+// from that loop. Its Done (0x4b64b0, __fastcall(dialog, edx, button), ret 4) gives the list's highlighted perk to the
+// dialog (vt+0x188) and ends the loop with 4 (EndModal, vt+0x34); Cancel (0x6c62c0) ends it with 0x10. The test bot
+// replaces the loop: Done pressed at once, 4 returned.
+const uintptr_t kPickPerkModalSlot = 0x8063a8 + 0x2c;
+const uintptr_t kBaseModal = 0x6c6190;
+typedef int(__fastcall* ModalFn)(void*, void*);
+ModalFn g_pickperk_modal = nullptr;
+
+int __fastcall PickPerkModalHook(uint8_t* self, void* edx) {
+    if (g_test.enabled && _stricmp(g_test.scenario, "levelup") == 0) {
+        Log("bot: LEVEL perk dialog: pressing Done (the highlighted perk)");
+        reinterpret_cast<void(__fastcall*)(void*, void*, void*)>(0x4b64b0)(self, nullptr, nullptr);
+        return 4;
+    }
+    return g_pickperk_modal(self, edx);
+}
+
+
+// ---- Level-up lock (owner, 2026-10-22: "block the level up screen on that character and block the recruitment
+// screen if a player is levelling up ... for other players"). The levelling player's copy sends record 8 (kLevelOpen,
+// the character's slot at +5) when its character screen opens and record 9 (kLevelClose) once its changes are out;
+// every other copy then closes a character screen of that character and refuses talks to a recruiter.
+// Two players opening the same character's screen at once (a race, as at a merchant): every record carries a claim, and
+// every copy sees the records in the host's relay order, so the first open for a character wins everywhere. A copy
+// whose own open comes back second closes its screen (its changes never reach the character: the screen keeps its own
+// copy until Done) and says so. A close carries its claim too, so a loser's close leaves the winner's lock alone.
+struct LevelLock { bool open; uint16_t who; uint32_t claim; };
+LevelLock g_level_locks[4] = {};  // other players' open character screens
+bool g_level_mine_sent = false;
+bool g_level_mine_won = false;  // our open came back first for its character
+uint32_t g_level_my_claim = 0;
+uint16_t g_level_my_who = 0;
+
+LevelLock* LevelLockOf(uint16_t who) {
+    for (LevelLock& l : g_level_locks)
+        if (l.open && l.who == who) return &l;
+    return nullptr;
+}
+bool AnyLevelLock() {
+    for (const LevelLock& l : g_level_locks)
+        if (l.open) return true;
+    return false;
+}
+
+// The squad member a character screen shows: the first squad EntityID inside the window (test mode logs every one).
+uint16_t CharacterOfScreen(uint8_t* w) {
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    uint16_t squad[16];
+    int n = world ? GetSquad(world, squad, 16) : 0;
+    uint16_t first = 0;
+    char hits[300] = "";
+    int hl = 0;
+    for (int off = 0; off + 4 <= 0x1600; off++)
+        for (int k = 0; k < n; k++)
+            if (*reinterpret_cast<uint32_t*>(w + off) == FullId(world, squad[k])) {
+                if (!first) first = squad[k];
+                if (hl < 260) hl += sprintf_s(hits + hl, sizeof(hits) - hl, " +%x=%u", off, squad[k]);
+            }
+    static bool logged = false;
+    if (g_test.enabled && !logged) {
+        logged = true;
+        Log("co-op: character screen: squad ids inside at%s", hits[0] ? hits : " none");
+    }
+    return first;
+}
+
+void SendLevelRecord(uint8_t kind, uint16_t who, uint32_t claim) {
+    uint8_t r[27];
+    CoopRecord(r, kind, 0);
+    memcpy(r + 5, &who, 2);
+    memcpy(r + 7, &claim, 4);
+    SendCoopRecords(reinterpret_cast<const uint8_t(*)[27]>(r), 1);
+}
+
+// This copy's character screen opened (netlog.cpp) and, once its changes are out, closed (PrivateCloseStep).
+void LevelScreenOpened(uint8_t* w) {
+    uint16_t who = CharacterOfScreen(w);
+    LARGE_INTEGER qpc;  // unique per player and per open, as a talk claim
+    QueryPerformanceCounter(&qpc);
+    uint32_t seed[3] = {qpc.LowPart, static_cast<uint32_t>(qpc.HighPart), GetCurrentProcessId()};
+    uint32_t h = Fnv(2166136261u, seed, sizeof(seed));
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    g_level_my_claim = h ? h : 1;
+    g_level_my_who = who;
+    g_level_mine_sent = true;
+    g_level_mine_won = false;
+    SendLevelRecord(kLevelOpen, who, g_level_my_claim);
+    Log("co-op: character screen of %u open here (claim %08x): the others wait for it", who, g_level_my_claim);
+}
+void LevelScreenClosed() {
+    if (!g_level_mine_sent) return;
+    g_level_mine_sent = false;
+    SendLevelRecord(kLevelClose, g_level_my_who, g_level_my_claim);
+}
+
+void HandleLevelRecord(const uint8_t* r) {
+    uint16_t who;
+    uint32_t claim;
+    memcpy(&who, r + 5, 2);
+    memcpy(&claim, r + 7, 4);
+    bool mine = g_level_mine_sent && claim == g_level_my_claim;
+    if (r[3] == kLevelOpen && mine) {
+        if (LevelLockOf(who)) {  // another player's open for this character came first: theirs
+            Log("co-op: character screen of %u: another player's came first (claim %08x lost)", who, claim);
+            Notice("Co-op: another player is levelling up that character - wait for them");
+            g_end_game_mode = true;  // our screen closes without its Done: nothing changed
+        } else {
+            g_level_mine_won = true;
+            Log("co-op: character screen of %u is ours (claim %08x)", who, claim);
+        }
+    } else if (r[3] == kLevelOpen && !LevelLockOf(who)) {
+        // First for this character (an open of ours that comes back later loses). Ours, if it went first, wins.
+        bool ours_first = g_level_mine_sent && g_level_my_who == who && g_level_mine_won;
+        if (!ours_first)
+            for (LevelLock& l : g_level_locks)
+                if (!l.open) {
+                    l = {true, who, claim};
+                    Log("co-op: another player's character screen of %u is open (claim %08x)", who, claim);
+                    break;
+                }
+    } else if (r[3] == kLevelClose && !mine) {
+        for (LevelLock& l : g_level_locks)
+            if (l.open && l.claim == claim) {
+                l = {};
+                Log("co-op: the other player's character screen of %u closed", who);
+            }
+    }
+}
+
+// Another player's character screen of this character is open: ours closes (netlog.cpp, as it opens).
+bool LevelLockedScreen(uint8_t* w) {
+    if (!AnyLevelLock()) return false;
+    uint16_t who = CharacterOfScreen(w);
+    if (!LevelLockOf(who)) return false;
+    Log("co-op: refused this player's character screen of %u: another player is levelling them up", who);
+    Notice("Co-op: another player is levelling up that character - wait for them");
+    return true;
+}
+
+// Client send: a talk to a recruiter while another player levels up is taken out (recruiting changes their squad).
+int RefuseDuringLevelUp(uint8_t* msg, int len) {
+    if (!AnyLevelLock() || len < 6 || *reinterpret_cast<uint32_t*>(msg) != 2) return len;
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    int count = *reinterpret_cast<uint16_t*>(msg + 4);
+    for (int i = 0; i < count && 6 + (i + 1) * 27 <= len;) {
+        uint8_t* r = msg + 6 + i * 27;
+        uint16_t npc;
+        memcpy(&npc, r + 5, 2);
+        if (r[0] == 0x17 && world && npc < EntityCount(world) && IsActor(world, npc) &&
+            reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(EntityById(world, npc)))[0x3f0 / 4])(EntityById(world, npc))) {
+            Log("co-op: refused this player's talk to recruiter %u: a player is levelling up", npc);
+            Notice("Co-op: a player is levelling up - recruit when they are done");
+            memmove(r, r + 27, len - (r + 27 - msg));
+            len -= 27;
+            count--;
+            *reinterpret_cast<uint16_t*>(msg + 4) = static_cast<uint16_t>(count);
+            continue;
+        }
+        i++;
+    }
+    return count ? len : 0;
+}
+
+// The character screen's Done (0x4678b0, __fastcall(WCharacter*, edx, button), ret 4) keeps the changes. It waits until
+// this copy knows its open won: the records flow through the host's ticks, and with the host levelling up (its world
+// held) a joiner heard it had lost only after it had pressed Done and kept a perk the host also chose (levelrace).
+const uint8_t kCharDonePrologue[] = {0x56, 0x8b, 0xf1, 0x8a, 0x86, 0x22, 0x01, 0x00, 0x00};
+uint8_t* g_chardone_trampoline = nullptr;
+
+void __fastcall CharDoneHook(uint8_t* self, void* edx, void* button) {
+    if (g_level_mine_sent && !g_level_mine_won) {
+        Log("co-op: the character screen's Done waits: not yet known whether another player has this character");
+        Notice("Co-op: checking whether another player has this character - press Done again in a moment");
+        return;
+    }
+    reinterpret_cast<void(__fastcall*)(void*, void*, void*)>(g_chardone_trampoline)(self, edx, button);
+}
+
+void InstallLevelUpHooks() {
+    g_chardone_trampoline = HookWithTrampoline(0x4678b0, kCharDonePrologue, sizeof(kCharDonePrologue), (void*)&CharDoneHook);
+    Log("co-op: perk dialog hook %s, character screen Done hook %s",
+        PatchSlot(kPickPerkModalSlot, kBaseModal, (void*)&PickPerkModalHook, &g_pickperk_modal) ? "ok" : "FAILED",
+        g_chardone_trampoline ? "ok" : "FAILED");
+}
