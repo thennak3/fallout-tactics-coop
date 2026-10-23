@@ -130,7 +130,7 @@ DWORD WINAPI SelectionPoller(LPVOID) {
     for (;;) {
         Sleep(200);
         if (!g_coop_join || g_join_state != 'P') continue;
-        char req[400];
+        char req[1024];
         int rl = sprintf_s(req, "SEL %08x ", g_joiner_id);
         AcquireSRWLockShared(&g_dots_lock);
         rl += FormatSlots(req + rl, sizeof(req) - rl, g_my_sel);
@@ -287,6 +287,7 @@ void __fastcall ViewDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     uint16_t squad[16];
     int nsquad = world ? GetSquad(world, squad, 16) : 0;
+    bool drew = false;
     AcquireSRWLockShared(&g_dots_lock);
     for (int k = 0; k < 6 && k < nsquad; k++) {
         uint8_t* tab = *reinterpret_cast<uint8_t**>(panel + 0xfe + 4 * k);
@@ -308,8 +309,13 @@ void __fastcall ViewDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
         int width = n * kDotSize + (n - 1) * 3;
         int x = (tx0 + tx1 - width) / 2, y = ty - kDotSize - 3;
         for (int i = 0; i < n; i++, x += kDotSize + 3) DrawDot(renderer, x, y, kDotColour[colours[i]]);
+        drew = true;
     }
     ReleaseSRWLockShared(&g_dots_lock);
+    // The view scrolls by moving what it drew and redrawing only the strip that came into sight: the dots moved with
+    // the world and left copies behind (owner: "during screen drag the control dots don't update and move with the
+    // world"). While there are dots, the whole view is drawn again next frame.
+    if (drew) reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(self))[3])(self);
 }
 
 void* __fastcall ViewDtorHook(uint8_t* self, void* edx, unsigned flags) {
