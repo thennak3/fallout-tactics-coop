@@ -609,6 +609,19 @@ bool LevelLockedScreen(uint8_t* w);              // recruit_sync.inc
 void LevelScreenOpened(uint8_t* w);
 
 char __fastcall ClientSendHook(void* self, void* /*edx*/, const uint8_t* msg, int len, int reliable) {
+    if (g_test.enabled && len >= 6 && *reinterpret_cast<const uint32_t*>(msg) == 2) {  // every command this player sends
+        int count = *reinterpret_cast<const uint16_t*>(msg + 4);
+        for (int i = 0; i < count && 6 + (i + 1) * 27 <= len; i++) {
+            const uint8_t* r = msg + 6 + i * 27;
+            if (r[0] == 0x30) continue;  // the mod's own records
+            uint16_t actor, a2, a3;
+            memcpy(&actor, r + 1, 2);
+            memcpy(&a2, r + 3, 2);
+            memcpy(&a3, r + 5, 2);
+            Log("cmd: sent type 0x%02x actor %u args %u %u | %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", r[0], actor, a2,
+                a3, r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], r[16], r[17], r[18]);
+        }
+    }
     if (g_coop_host || g_coop_join) {
         len = RefuseShopperOrders(const_cast<uint8_t*>(msg), len);
         if (!len) return 1;  // nothing left: not sent
@@ -1533,6 +1546,9 @@ void Init() {
     InstallDots();
     InstallRecruitHooks();
     InstallLevelUpHooks();
+    Log("co-op: joiner load guard %s, %s",
+        PatchSlot(kGameMainVtable + 0x38, 0x6c6260, (void*)&GameMainCloseHook, &g_gamemain_close) ? "ok" : "FAILED",
+        PatchSlot(kCampaignWindowVtable + 0x34, 0x6c61f0, (void*)&CampaignCloseHook, &g_campaign_close) ? "ok" : "FAILED");
     bool menu = PatchSlot(kMainMenuUpdateSlot, kWindowUpdateStub, (void*)&MainMenuUpdateHook, &g_mainmenu_update);
     bool pump = PatchCall(kPumpHandlerCall, kPumpHandler, (void*)&PumpHandlerHook);
     Log("co-op: main-menu hook %s, pump hook %s", menu ? "ok" : "FAILED", pump ? "ok" : "FAILED");

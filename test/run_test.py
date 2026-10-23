@@ -50,7 +50,9 @@ TESTS = {
     "fetch_save": ("move", "host", 7),  # joiner loads a different save; only the transfer can sync it
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
     "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
-    "drift_host": ("drift", "host", 4),  # the joiner moves an NPC on its copy only; the host notices and re-syncs
+    "drift_host": ("drift", "host", 4),
+    "joinload": ("joinload", "join", 5),
+    "play": ("play", "host", 4),  # a person plays both copies (--save, --hold-frames); the bots only log and compare  # the joiner presses quick-load mid-mission: refused (only the host loads)  # the joiner moves an NPC on its copy only; the host notices and re-syncs
     "survey": ("survey", "host", 0),  # exploration: the NPCs next to the first two squad members (use with --save)
     "quest_host": ("quest", "host", 4),  # QuestBarter.sav: the host talks to the quest giver; the joiner gets the changes
     "quest_join": ("quest", "join", 4),  # the same from the joiner
@@ -762,6 +764,14 @@ def main():
         check("no reload: no re-sync, no upload, no new generation",
               "host: re-sync (" not in host and "join: quick-save for the host" not in join
               and "join: following the host to generation 2" not in join)
+    elif scenario == "joinload":
+        check("the joiner pressed quick-load and it was refused, with a notice",
+              "bot: the joiner presses quick-load" in join
+              and re.search(r'join: refused this player.s load of "[^"]+": only the host loads', join) is not None
+              and "notice: Co-op: only the host can load a game" in join)
+        check("no reload anywhere: no re-sync, no new generation, the joiner stayed in the session",
+              "host: re-sync (" not in host and "join: following the host to generation 2" not in join
+              and "game session returned to the main menu" not in join)
     elif scenario == "drift":
         check("the joiner's bot moved an NPC on its copy only", talk_frame is not None)
         dd = re.findall(r"co-op: drift: .*'s game differs from ours at frame (\d+)", host)

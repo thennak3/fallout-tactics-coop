@@ -1254,6 +1254,15 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         // quick-loads, the joiner follows from its mission screen; both keep going in session 2.
         if (session == 1 && rel_s >= 60 && Once(0) && g_coop_host) RequestResync("bot: mid-mission re-sync");
         if (session >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "joinload") == 0) {
+        // A joiner's own load is refused (only the host loads): the joiner presses quick-load mid-mission, as its F9 key
+        // would; both copies must play on in the same session, in step.
+        if (session == 1 && rel_s >= 60 && Once(0) && g_coop_join) {
+            uint8_t* gm = *reinterpret_cast<uint8_t**>(kGameMainPtr);
+            Log("bot: the joiner presses quick-load");
+            if (gm) reinterpret_cast<void(__fastcall*)(void*)>(kQuickLoad)(gm);
+        }
+        if (rel_s >= 300) BotFinish();
     } else if (_stricmp(s, "drift") == 0) {
         // The safety net: the joiner moves an NPC on its copy only (a desync on purpose); the host must notice from
         // the joiner's position hashes, re-sync, and both play on in step in session 2.
@@ -1453,6 +1462,8 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
     } else if (_stricmp(s, "watch") == 0 || _stricmp(s, "play") == 0) {
         // A person plays; the bot only logs (snapshots, RNG, HP changes) so copies can be compared afterwards.
         // play: unlike watch, the copies load [test] save themselves and the host waits for [test] joiners.
+        // [test] hold: frames to play before both copies finish (0: until the runner's timeout).
+        if (g_test.hold > 0 && rel_s >= g_test.hold) BotFinish();
     } else {
         Log("bot: FAIL unknown scenario \"%s\"", s);
         BotFinish();
