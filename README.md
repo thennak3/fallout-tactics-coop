@@ -115,7 +115,9 @@ python -I test/run_suite.py               # every test (slow)
 ```
 
 The tests load saves from the host copy's `core/user/save`: `New Save Game.sav` and `QuickSave.sav` (two different
-mission saves), and `bunker.sav` (made in the bunker, with the merchant and the recruiter nearby) for the bunker tests.
+mission saves), `bunker.sav` (made in the bunker, with the merchant and the recruiter nearby) for the bunker tests,
+and `QuestBarter.sav` (in the bunker, squad member 1 next to General Barnaky, member 2 next to the quartermaster, a
+level-up pending) for the quest, level-up and shop-and-talk tests.
 The list of tests is in `test/run_test.py`.
 
 ## How it works
