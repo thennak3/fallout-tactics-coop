@@ -46,6 +46,8 @@ DWORD g_bot_level_tick = 0;
 void DumpWindowTree(uint8_t* w, int depth);  // below
 
 bool g_bot_level_request = false;
+bool g_bot_inv_request = false;  // invscreen: press INV from the mission screen's tick
+DWORD g_bot_inv_tick = 0;
 
 // levelup: one skill point spent on squad member 0, as the character screen's spinner does: its first skill
 // (attribute table 0, Skills at +0x363, values from +0x367) one higher.
@@ -1083,6 +1085,23 @@ void __fastcall WindowTickHook(uint8_t* w) {
             BotTalk(g_client_ptr, world, 0, *reinterpret_cast<int*>(world + kWorldFrame));
         }
     }
+    if (g_test.enabled && (g_bot_inv_request || g_bot_inv_tick) && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
+        if (g_bot_inv_request) {  // the game bar's INV button: handler 0x47fab0 (owner +0x10e, the WGameBar)
+            g_bot_inv_request = false;
+            for (uint8_t* c = *reinterpret_cast<uint8_t**>(w + 0x18); c; c = *reinterpret_cast<uint8_t**>(c + 0x24))
+                if (*reinterpret_cast<uintptr_t*>(c) == 0x80299c)
+                    for (uint8_t* b = *reinterpret_cast<uint8_t**>(c + 0x18); b; b = *reinterpret_cast<uint8_t**>(b + 0x24))
+                        if (*reinterpret_cast<uintptr_t*>(b + 0x112) == 0x47fab0) {
+                            reinterpret_cast<void(__fastcall*)(void*, void*, void*)>(0x47fab0)(*reinterpret_cast<void**>(b + 0x10e), nullptr, b);
+                            g_bot_inv_tick = GetTickCount();
+                            Log("bot: INV opened: mode %d", *reinterpret_cast<int*>(w + 0x156));
+                        }
+        } else if (GetTickCount() - g_bot_inv_tick > static_cast<DWORD>(g_test.hold) * 1000) {
+            g_bot_inv_tick = 0;
+            Log("bot: INV closing (mode %d)", *reinterpret_cast<int*>(w + 0x156));
+            g_end_game_mode = true;
+        }
+    }
     if (g_test.enabled && g_bot_level_request && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
         g_bot_level_request = false;
         g_bot_level_tick = GetTickCount();  // before: the perk dialog's own loop runs inside this call
@@ -1254,6 +1273,12 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         // quick-loads, the joiner follows from its mission screen; both keep going in session 2.
         if (session == 1 && rel_s >= 60 && Once(0) && g_coop_host) RequestResync("bot: mid-mission re-sync");
         if (session >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "invscreen") == 0) {
+        // Does a full-screen window on one copy (the inventory: the world runs on under it) change what NPCs do there?
+        // The host opens its inventory (the game bar's INV button, 0x47fab0) at 30 frames for [test] hold wall-clock
+        // seconds (0: never opened, the control run); both play on to 900 frames and compare.
+        if (rel_s >= 30 && Once(0) && g_coop_host && g_test.hold > 0) g_bot_inv_request = true;
+        if (rel_s >= 900) BotFinish();
     } else if (_stricmp(s, "joinload") == 0) {
         // A joiner's own load is refused (only the host loads): the joiner presses quick-load mid-mission, as its F9 key
         // would; both copies must play on in the same session, in step.
@@ -1279,7 +1304,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
                 break;
             }
         }
-        if (session >= 2 && rel_s >= 200) BotFinish();
+        if ((session >= 2 && rel_s >= 200) || (session == 1 && rel_s >= 500)) BotFinish();  // corrected: no reload
     } else if (_stricmp(s, "transition") == 0) {
         if (g_snap_tag == 1 && rel_s >= 60 && Once(0)) BotEndMission("World Map");
         if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
