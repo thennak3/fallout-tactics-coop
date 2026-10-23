@@ -53,6 +53,7 @@ TESTS = {
     "drift_host": ("drift", "host", 4),
     "joinload": ("joinload", "join", 5),
     "play": ("play", "host", 4),
+    "chaos": ("chaos", "all", 6),  # every copy's bot moves, gives, opens screens and containers at random (--save, --hold-frames)
     "invscreen": ("invscreen", "host", 10),  # exploration: the host sits in its inventory (--hold-frames: seconds; 0 = control)  # a person plays both copies (--save, --hold-frames); the bots only log and compare  # the joiner presses quick-load mid-mission: refused (only the host loads)  # the joiner moves an NPC on its copy only; the host notices and re-syncs
     "survey": ("survey", "host", 0),  # exploration: the NPCs next to the first two squad members (use with --save)
     "quest_host": ("quest", "host", 4),  # QuestBarter.sav: the host talks to the quest giver; the joiner gets the changes
@@ -81,6 +82,8 @@ TESTS = {
 MENU_TESTS = {"menu_join", "dropin"}
 HOST_IP = "127.0.0.1"  # --host-ip: the address joiners connect to (this PC's LAN address tests the real network path)
 FORCE_FILE_SERVER = False  # set in main: trades with more than one joiner use the file-server path
+ENTITY_LOG = False  # --entity-log: every entity made or destroyed, with the code that did it
+CHAOS_NO_SELECT = False  # --chaos-no-select: the chaos bots never change their selection
 SHOP_NO_PAUSE = True  # a shop pauses nobody (the default); --shop-pause: the old held conversation
 DROPIN_DELAY_S = 10  # dropin: start the joiner this long after the host, so the host is already playing
 
@@ -104,6 +107,10 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
         if menu:
             f.write(f"menu={mode}\n")
         f.write(f"index={index}\nhold={hold}\n")
+        if ENTITY_LOG:
+            f.write("entity_log=1\n")
+        if CHAOS_NO_SELECT:
+            f.write("chaos_select=0\n")
 
 
 def read(path):
@@ -160,14 +167,18 @@ def main():
     ap.add_argument("--mutate-follow", action="store_true", help="joiner never follows a new save; resync must FAIL")
     ap.add_argument("--joiners", type=int, default=1, choices=(1, 2, 3), help="joiner copies (players - 1)")
     ap.add_argument("--host-ip", default="127.0.0.1", help="address the joiners connect to (default loopback)")
+    ap.add_argument("--entity-log", action="store_true", help="log every entity made or destroyed (exploration)")
+    ap.add_argument("--chaos-no-select", action="store_true", help="chaos: the bots never change their selection")
     ap.add_argument("--inline-delta", action="store_true", help="3-4 player trades: send the deal through lockstep, not the file server")
     ap.add_argument("--shop-pause", action="store_true", help="the old way: a shop holds every copy while it is open")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
     ap.add_argument("--save", default=None, help="save both copies start from (default New Save Game.sav)")
     args = ap.parse_args()
-    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE
+    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE, ENTITY_LOG, CHAOS_NO_SELECT
     HOST_IP = args.host_ip
     SHOP_NO_PAUSE = not args.shop_pause
+    ENTITY_LOG = args.entity_log
+    CHAOS_NO_SELECT = args.chaos_no_select
     extras = EXTRA_JOIN_DIRS[:args.joiners - 1]
     scenario, actor, min_frames = TESTS[args.test]
     FORCE_FILE_SERVER = scenario == "trade" and args.joiners > 1 and not args.inline_delta
@@ -653,7 +664,7 @@ def main():
             check("the delta went through the host's file server (over the lockstep limit set for the test)",
                   "on the host's file server for the others to fetch" in trader
                   and re.search(r"co-op: fetched the delta from the host's file server: [1-9]\d* bytes", other) is not None)
-        ap = re.search(r"co-op: delta applied: (\d+) created, (\d+) destroyed, (\d+) stack counts, (\d+) inventories, (\d+) HP, (\d+) conflicts(.*)", other)
+        ap = re.search(r"co-op: delta applied: (\d+) created, (\d+) destroyed, (\d+) stack counts, (\d+) inventories, (\d+) HP, (?:\d+ moved, )?(\d+) conflicts(.*)", other)
         check("the other copy applied the delta without conflicts", bool(ap) and ap.group(6) == "0" and "MALFORMED" not in ap.group(7),
               ap.group(0) if ap else "no delta applied line")
         check("the other copy created the new entity", bool(ap) and int(ap.group(1)) >= 1, ap.group(0) if ap else "")

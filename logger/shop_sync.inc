@@ -330,9 +330,15 @@ void QueueFrameDelta(uint8_t kind, bool ok, bool mine, const uint8_t* data, int 
 bool TakeWorldFix(const uint8_t** data, int* len);  // drift.inc
 
 // ActorActHook: a co-op command at its frame, on every copy.
+void FixHoldAtFrame(const uint8_t* r);  // drift.inc
+
 void CoopCommandAtFrame(const uint8_t* r) {
     uint8_t kind = r[3];
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    if (kind == kFixHold) {
+        FixHoldAtFrame(r);
+        return;
+    }
     if (kind == kShopOpen) {
         ExecuteShopOpen(r);
         return;

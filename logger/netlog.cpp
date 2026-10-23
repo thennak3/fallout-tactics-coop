@@ -5,6 +5,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <intrin.h>
 #include <share.h>
 #include <stdint.h>
 #include <math.h>
@@ -608,18 +609,47 @@ int RefuseDuringLevelUp(uint8_t* msg, int len);  // recruit_sync.inc
 bool LevelLockedScreen(uint8_t* w);              // recruit_sync.inc
 void LevelScreenOpened(uint8_t* w);
 
+// The loot screen (WLoot, in WSquadEquip) opens when a character reaches the container its use command (0x04) named, on
+// every copy, since every copy runs every command (owner, 2026-10-23: "when two players have the same player selected
+// and one of them opens a inventory both screens open the inventory screen"). It belongs to the player who sent that
+// command: this copy notes its own (here); a loot screen opening with none of ours pending is closed (PrivateScreenTick).
+// A later move, attack or talk order for that character is a change of mind: the use is no longer pending.
+const DWORD kUseWindowMs = 120000;  // a walk to a container across the map
+DWORD g_my_use_tick = 0;
+uint16_t g_my_use_actor = 0;
+
+void NoteMyUses(const uint8_t* msg, int len) {
+    if (len < 6 || *reinterpret_cast<const uint32_t*>(msg) != 2) return;
+    int count = *reinterpret_cast<const uint16_t*>(msg + 4);
+    for (int i = 0; i < count && 6 + (i + 1) * 27 <= len; i++) {
+        const uint8_t* r = msg + 6 + i * 27;
+        uint16_t actor;
+        memcpy(&actor, r + 1, 2);
+        if (r[0] == 0x04) {
+            g_my_use_tick = GetTickCount();
+            g_my_use_actor = actor;
+        } else if ((r[0] == 0x00 || r[0] == 0x02 || r[0] == 0x11 || r[0] == 0x17) && actor == g_my_use_actor) {
+            g_my_use_tick = 0;
+        }
+    }
+}
+
 char __fastcall ClientSendHook(void* self, void* /*edx*/, const uint8_t* msg, int len, int reliable) {
     if (g_test.enabled && len >= 6 && *reinterpret_cast<const uint32_t*>(msg) == 2) {  // every command this player sends
         int count = *reinterpret_cast<const uint16_t*>(msg + 4);
         for (int i = 0; i < count && 6 + (i + 1) * 27 <= len; i++) {
             const uint8_t* r = msg + 6 + i * 27;
             if (r[0] == 0x30) continue;  // the mod's own records
-            uint16_t actor, a2, a3;
+            uint16_t actor, a2, a3, b2, b3;
+            uint32_t param;
             memcpy(&actor, r + 1, 2);
             memcpy(&a2, r + 3, 2);
             memcpy(&a3, r + 5, 2);
-            Log("cmd: sent type 0x%02x actor %u args %u %u | %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", r[0], actor, a2,
-                a3, r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], r[16], r[17], r[18]);
+            memcpy(&b2, r + 19, 2);
+            memcpy(&b3, r + 21, 2);
+            memcpy(&param, r + 23, 4);
+            Log("cmd: sent type 0x%02x actor %u args %u %u, %u %u, param %08x | %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                r[0], actor, a2, a3, b2, b3, param, r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], r[16], r[17], r[18]);
         }
     }
     if (g_coop_host || g_coop_join) {
@@ -627,6 +657,7 @@ char __fastcall ClientSendHook(void* self, void* /*edx*/, const uint8_t* msg, in
         if (!len) return 1;  // nothing left: not sent
         len = RefuseDuringLevelUp(const_cast<uint8_t*>(msg), len);
         if (!len) return 1;
+        NoteMyUses(msg, len);
     }
     if ((g_coop_host || g_coop_join) && HasTalkCommand(msg, len) && RefuseLockedTalk(const_cast<uint8_t*>(msg), len))
         return 1;  // a talk to an NPC another player is talking to: not sent
@@ -671,6 +702,39 @@ extern uint16_t g_private_npc, g_local_talk_npc;
 extern bool g_claim_mine;  // private_sync.inc: the last relayed talk claim, and when it came
 extern DWORD g_claim_tick;
 
+// A loot screen ticking: kept if this player sent the use that opened it, else closed (the mission screen's mode
+// ended, as for another player's conversation). Decided once per screen.
+void LootScreenTick(uint8_t* w, DWORD now) {
+    static uintptr_t loot_vt = 0;
+    static uint8_t* decided = nullptr;
+    static bool mine = false;
+    static DWORD seen = 0, opened = 0;
+    if (!loot_vt) {
+        if (!strstr(RttiName(w), "WLoot")) return;
+        loot_vt = *reinterpret_cast<uintptr_t*>(w);
+    }
+    if (*reinterpret_cast<uintptr_t*>(w) != loot_vt) return;
+    if (w != decided || now - seen > 1000) {  // a new loot screen (a window can come back at the same address)
+        decided = w;
+        opened = now;
+        mine = g_my_use_tick && now - g_my_use_tick < kUseWindowMs;
+        if (mine) {
+            g_my_use_tick = 0;
+            Log("co-op: loot screen opened for this player (actor %u)", g_my_use_actor);
+        } else {
+            Log("co-op: loot screen opened for another player's search: closing it here");
+            Notice("Co-op: another player is searching that");
+        }
+    }
+    seen = now;
+    if (!mine) g_end_game_mode = true;
+    if (mine && g_test.enabled && _stricmp(g_test.scenario, "chaos") == 0 && now - opened > 1500) {
+        if (opened) Log("bot: CHAOS closing the loot screen");
+        opened = 0;
+        g_end_game_mode = true;  // the bot's own search: looked, closed
+    }
+}
+
 void PrivateScreenTick(uint8_t* w) {  // window-tick hook
     if (!g_coop_host && !g_coop_join) return;
     HostHoldTimeout();
@@ -699,7 +763,10 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
         talk_pipboy = w;
         kind = kSpeechScreen;
     }
-    if (kind == kNotPrivate) return;
+    if (kind == kNotPrivate) {
+        LootScreenTick(w, now);
+        return;
+    }
     if (!g_private_open && strstr(RttiName(w), "WCharacter") && LevelLockedScreen(w)) {
         g_end_game_mode = true;  // another player is levelling up this character: our screen of them closes
         return;
@@ -1506,6 +1573,9 @@ void Init() {
             ? "lost-session hook installed (a joiner follows the host instead of showing the error)"
             : "lost-session slot unexpected, hook not installed");
     bool frame = PatchCall(kFrameTickCall, kClientTickProcessor, (void*)&FrameTickHook);
+    bool gate = PatchCall(kStepGateCalls[0], kStepGate, (void*)&StepGateHook) &&
+                PatchCall(kStepGateCalls[1], kStepGate, (void*)&StepGateHook);
+    Log("co-op: step gate hooks %s (the hold for a drift correction)", gate ? "ok" : "FAILED");
     bool tick = PatchJmp(kWindowTick, kWindowTickPrologue, sizeof(kWindowTickPrologue), (void*)&WindowTickHook);
     Log("co-op: frame hook %s, window-tick hook %s", frame ? "ok" : "FAILED", tick ? "ok" : "FAILED");
     Log(PatchCall(kSpawnCallSite, kWorldSpawnPlayer, (void*)&SpawnPlayerHook)
@@ -1587,6 +1657,7 @@ void Init() {
     }
     g_test.enabled = GetPrivateProfileIntA("test", "enabled", 0, ".\\ftcoop.ini") != 0;
     if (g_test.enabled) StartShotThread();
+    if (g_test.enabled && GetPrivateProfileIntA("test", "entity_log", 0, ".\\ftcoop.ini")) InstallEntityLogHooks();
     if (GetPrivateProfileIntA("ui", "skip_intro", g_test.enabled ? 1 : 0, ".\\ftcoop.ini") != 0) {
         *reinterpret_cast<uint8_t*>(kIntroShownFlag) = 1;
         Log("ui: skipping the startup movies ([ui] skip_intro)");

@@ -48,6 +48,7 @@ void DumpWindowTree(uint8_t* w, int depth);  // below
 bool g_bot_level_request = false;
 bool g_bot_inv_request = false;  // invscreen: press INV from the mission screen's tick
 DWORD g_bot_inv_tick = 0;
+DWORD g_bot_inv_hold_ms = 0;  // chaos: how long the INV screen stays up (0: [test] hold seconds)
 
 // levelup: one skill point spent on squad member 0, as the character screen's spinner does: its first skill
 // (attribute table 0, Skills at +0x363, values from +0x367) one higher.
@@ -1017,6 +1018,7 @@ void BotDriveMultiSetup(uint8_t* w);  // netlog.cpp
 void WaitPopupTick(uint8_t* w);  // netlog.cpp
 void PrivateScreenTick(uint8_t* w);  // netlog.cpp
 void PrivateCloseStep();  // below
+void FixHoldTick();       // drift.inc
 void LevelScreenClosed();  // recruit_sync.inc
 bool AnyLevelLock();
 bool PrivateScreensClosed();  // netlog.cpp
@@ -1039,6 +1041,7 @@ void __fastcall WindowTickHook(uint8_t* w) {
     if ((g_coop_host || g_coop_join) && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
         __try {
             PrivateCloseStep();  // also while the world is held (no frames run)
+            FixHoldTick();       // drift.inc: the host's correction while every copy holds
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("co-op: exception 0x%08x closing the private screens", GetExceptionCode());
         }
@@ -1085,6 +1088,21 @@ void __fastcall WindowTickHook(uint8_t* w) {
             BotTalk(g_client_ptr, world, 0, *reinterpret_cast<int*>(world + kWorldFrame));
         }
     }
+    // chaos: a conversation a script opened (a mission message: kept on the host's copy, everyone waits), read, then
+    // closed. From the mission screen's tick: no game frames run while it is up.
+    if (g_test.enabled && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable && _stricmp(g_test.scenario, "chaos") == 0) {
+        static DWORD speech_seen = 0;
+        if (g_private_open && g_private_speech) {
+            if (!speech_seen) speech_seen = GetTickCount();
+            if (GetTickCount() - speech_seen > 2000 && !g_end_game_mode) {
+                Log("bot: CHAOS closing a conversation (%s)", RttiName(g_private_speech));
+                g_end_game_mode = true;
+                speech_seen = GetTickCount();
+            }
+        } else {
+            speech_seen = 0;
+        }
+    }
     if (g_test.enabled && (g_bot_inv_request || g_bot_inv_tick) && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
         if (g_bot_inv_request) {  // the game bar's INV button: handler 0x47fab0 (owner +0x10e, the WGameBar)
             g_bot_inv_request = false;
@@ -1096,7 +1114,7 @@ void __fastcall WindowTickHook(uint8_t* w) {
                             g_bot_inv_tick = GetTickCount();
                             Log("bot: INV opened: mode %d", *reinterpret_cast<int*>(w + 0x156));
                         }
-        } else if (GetTickCount() - g_bot_inv_tick > static_cast<DWORD>(g_test.hold) * 1000) {
+        } else if (GetTickCount() - g_bot_inv_tick > (g_bot_inv_hold_ms ? g_bot_inv_hold_ms : static_cast<DWORD>(g_test.hold) * 1000)) {
             g_bot_inv_tick = 0;
             Log("bot: INV closing (mode %d)", *reinterpret_cast<int*>(w + 0x156));
             g_end_game_mode = true;
@@ -1150,6 +1168,124 @@ void __fastcall WindowTickHook(uint8_t* w) {
     }
 }
 
+// ---- chaos: every copy plays at once, as fast as people would and faster (owner, 2026-10-23: "just call stuff
+// constantly, swap characters, issue move commands, etc etc"). Each copy draws from its own random stream (seeded per
+// copy and logged, never the game's), so the copies act differently and on the same characters at overlapping times:
+// moves of one character or the whole squad, gives of a random stack between two characters (0x13), its own inventory
+// screen opened and closed, the nearest container used (0x04: its loot screen, then closed), its selection swapped.
+// The snapshots every 50 frames compare the copies afterwards; the drift check corrects or re-syncs on the way.
+uint32_t g_chaos_rng = 0;
+uint32_t ChaosRand() {
+    g_chaos_rng = g_chaos_rng * 1664525u + 1013904223u;
+    return g_chaos_rng >> 8;
+}
+
+// msg 2 with one command and both entity fields: give (0x13) takes the recipient in e1, the item in e2, count << 3 in param.
+void SendCommand2(uint8_t* client, uint8_t cmd, uint16_t actor, uint32_t e1, uint32_t e2, int32_t param) {
+    MoveMsg m = {};
+    m.type = 2;
+    m.count = 1;
+    m.cmd = cmd;
+    m.actor = actor;
+    m.e1 = e1;
+    m.e2 = e2;
+    m.param = param;
+    reinterpret_cast<void(__thiscall*)(void*, void*, int, int)>(kClientSend)(client, &m, sizeof(m), 1);
+}
+
+void BotChaos(uint8_t* client, uint8_t* world, int rel_s) {
+    static int next = 0;
+    if (!g_chaos_rng) {
+        g_chaos_rng = GetTickCount() ^ (g_coop_host ? 0x9e3779b9u : 0x85ebca6bu * static_cast<uint32_t>(g_test.index));
+        Log("bot: CHAOS seed %08x", g_chaos_rng);
+        next = 20 + static_cast<int>(ChaosRand() % 20);
+    }
+    if (rel_s < next || g_private_open) return;
+    next = rel_s + 6 + static_cast<int>(ChaosRand() % 25);
+    uint16_t squad[16];
+    int n = GetSquad(world, squad, 16);
+    if (n < 1) return;
+    int ia = static_cast<int>(ChaosRand() % n);
+    uint16_t a = squad[ia];
+    unsigned roll = ChaosRand() % 100;
+    if (roll < 35) {  // one character somewhere
+        int t = PickWalkTarget(world, a, ChaosRand());
+        if (t >= 0) {
+            Log("bot: CHAOS move %u to waypoint %d", a, t);
+            SendCommand(client, 0, a, 0, g_waypoints[t], 4);
+        }
+    } else if (roll < 50) {  // the whole squad
+        int t = PickWalkTarget(world, squad[0], ChaosRand());
+        if (t >= 0) {
+            Log("bot: CHAOS squad move to waypoint %d", t);
+            BotMoveSquad(client, world, g_waypoints[t]);
+        }
+    } else if (roll < 75 && n > 1) {  // a stack from one character to another, all of it or part
+        int ib = static_cast<int>(ChaosRand() % (n - 1));
+        uint16_t b = squad[ib >= ia ? ib + 1 : ib];
+        uint16_t items[64];
+        int counts[64];
+        int k = InvItems(world, a, items, counts, 64);
+        if (k <= 0) return;
+        int i = static_cast<int>(ChaosRand() % k);
+        int c = counts[i] > 1 ? 1 + static_cast<int>(ChaosRand() % counts[i]) : 1;
+        Log("bot: CHAOS give %d of item %u (stack of %d) from %u to %u", c, items[i], counts[i], a, b);
+        SendCommand2(client, 0x13, a, FullId(world, b), FullId(world, items[i]), c << 3);
+    } else if (roll < 85) {  // this player's inventory screen, for a moment
+        if (!g_bot_inv_tick) {
+            g_bot_inv_hold_ms = 500 + ChaosRand() % 2500;
+            Log("bot: CHAOS inventory screen for %u ms", g_bot_inv_hold_ms);
+            g_bot_inv_request = true;
+        }
+    } else if (roll < 93) {  // the nearest container (its loot screen opens for this player when the character gets there)
+        float* p = EntityPos(world, a);
+        int best = -1;
+        float best_d = 30.0f;
+        for (int i = 1; i < EntityCount(world); i++) {
+            uint8_t* e = EntityById(world, static_cast<uint16_t>(i));
+            if (*reinterpret_cast<uintptr_t*>(e) != kContainerVtable) continue;
+            float* q = EntityPos(world, static_cast<uint16_t>(i));
+            float d = sqrtf((p[0] - q[0]) * (p[0] - q[0]) + (p[2] - q[2]) * (p[2] - q[2]));
+            if (d < best_d) { best_d = d; best = i; }
+        }
+        if (best > 0) {
+            Log("bot: CHAOS %u uses container %d (distance %.1f)", a, best, best_d);
+            SendCommand2(client, 0x04, a, FullId(world, static_cast<uint16_t>(best)), 0, 0);
+        }
+    } else if (GetPrivateProfileIntA("test", "chaos_select", 1, ".\\ftcoop.ini")) {
+        // a new selection: what the dots show elsewhere (the selection is this copy's own, +0xb2 bit 0x40)
+        for (int i = 0; i < n; i++) {
+            uint8_t* e = EntityById(world, squad[i]);
+            if (ChaosRand() % 2) e[0xb2] |= 0x40; else e[0xb2] &= ~0x40;
+        }
+        Log("bot: CHAOS selection swapped");
+    }
+}
+
+// Exploration ([test] entity_log): every actor's raw memory every 10 frames, to ftcoop_actors.bin as {u32 frame, u16 id,
+// kActorDump bytes}, for an offline diff of two copies: the first field that differs before a one-copy attack.
+const size_t kActorDump = 0xfa0;  // past the attributes (+0x2a7 + 4 * 0x339)
+int g_dump_actors = -1;           // [test] entity_log, read on the first frame
+void DumpActors(uint8_t* world, int frame) {
+    static FILE* f = nullptr;
+    if (!f && fopen_s(&f, "ftcoop_actors.bin", "wb") != 0) f = nullptr;
+    if (!f) return;
+    static uint8_t buf[kActorDump];
+    for (int i = 1; i < EntityCount(world); i++) {
+        if (!IsActor(world, i)) continue;
+        __try {
+            memcpy(buf, EntityById(world, static_cast<uint16_t>(i)), kActorDump);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            memset(buf, 0xee, sizeof(buf));
+        }
+        uint16_t id = static_cast<uint16_t>(i);
+        fwrite(&frame, 4, 1, f);
+        fwrite(&id, 2, 1, f);
+        fwrite(buf, 1, kActorDump, f);
+    }
+    fflush(f);
+}
+
 bool Once(int step) {
     if (g_bot_done_step[step]) return false;
     g_bot_done_step[step] = true;
@@ -1182,6 +1318,8 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
     int rel_s = frame - session_t0;
     if (g_snap_tag > 0) WatchHp(world, frame, rel_s == 0);
     if (g_snap_tag > 0) Log("RNG s=%ld f=%d v=%08x", g_snap_tag, frame, *reinterpret_cast<uint32_t*>(world + 0x729));
+    if (g_dump_actors < 0) g_dump_actors = GetPrivateProfileIntA("test", "entity_log", 0, ".\\ftcoop.ini");
+    if (g_dump_actors && g_snap_tag == 1 && rel_s % 10 == 0) DumpActors(world, frame);
     if (g_snap_tag > 0 && rel_s > 0 && rel_s % 50 == 0 && rel_s != g_bot_last_snap) {  // co-op sessions only
         g_bot_last_snap = rel_s;
         SnapshotAll(world, frame);
@@ -1484,6 +1622,9 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         }
         int end_at = _stricmp(s, "trade2") == 0 ? talk_at + 750 : talk_at + 450;
         if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= end_at)) BotFinish();  // no reload: session 1 goes on
+    } else if (_stricmp(s, "chaos") == 0) {
+        BotChaos(client, world, rel_s);
+        if (g_test.hold > 0 && rel_s >= g_test.hold) BotFinish();
     } else if (_stricmp(s, "watch") == 0 || _stricmp(s, "play") == 0) {
         // A person plays; the bot only logs (snapshots, RNG, HP changes) so copies can be compared afterwards.
         // play: unlike watch, the copies load [test] save themselves and the host waits for [test] joiners.
@@ -1531,9 +1672,36 @@ void DotsFrame();  // dots.inc
 void DriftFrame(uint8_t* world);  // drift.inc
 void DriftCheckHost();
 
+// World+0x2ef counts the world's update calls (0x4fbf50 adds 1 after its fixed-step loop, once per redraw), not its
+// frames: a slower copy runs several frames per call, so the copies' counters part (3-4 apart within a minute,
+// 2026-10-23 actor dumps: every actor's +0x13c, stamped from it by the entity "moved" update 0x5e00f0). About 40
+// places in the simulation read it (cached results "fresh this update"), and NPCs then fired at someone on one copy
+// only (chaos runs: same random draws up to that shot, three times). So at the start of every frame it is set from
+// the frame number, the same everywhere; x 256 keeps it rising across the update calls between two frames.
+void StampUpdateCounter() {
+    uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    if (w) *reinterpret_cast<int*>(w + 0x2ef) = *reinterpret_cast<int*>(w + kWorldFrame) * 256;
+}
+
+// Exploration: the world tick 0x4fc230 (__thiscall(World*)), called from the fixed-step loop at 0x4fc0e2; while it
+// runs, the code is the lockstep frame's. Random draws outside it (drift.inc) are another path's.
+const uintptr_t kWorldTickCall = 0x4fc0e2;
+const uintptr_t kWorldTick = 0x4fc230;
+bool g_in_world_tick = false;
+void __fastcall WorldTickHook(uint8_t* world) {
+    g_in_world_tick = true;
+    reinterpret_cast<void(__thiscall*)(void*)>(kWorldTick)(world);
+    g_in_world_tick = false;
+}
+
 uint32_t __fastcall FrameTickHook(uint8_t* client) {
     g_client_ptr = client;
     __try {
+        if (g_coop_host || g_coop_join) StampUpdateCounter();  // first, before the frame's world step
+        if (g_test.enabled && g_dump_actors > 0)
+            if (uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr))  // exploration: the world clock and its step
+                Log("TIME f=%d t=%08x step=%08x", *reinterpret_cast<int*>(w + kWorldFrame), *reinterpret_cast<uint32_t*>(w + 0x2f7),
+                    *reinterpret_cast<uint32_t*>(w + 0x2c1));
         ReapplyBookkeeping();
         RunDeferredCreates();  // shop_sync.inc
         DotsFrame();           // dots.inc

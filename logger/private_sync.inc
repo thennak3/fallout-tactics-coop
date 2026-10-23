@@ -17,6 +17,8 @@
 //   'I' owner n {slot, seq}: an Actor's inventory list, in order (Inventory entity +0x1a9 list, +0x1ad count);
 //   'Q' n {slot, seq}: the squad (players[1] +0x4b list);
 //   'H' slot hp: an Actor's HP;
+//   'F' n serial term n {slot, seq}: the entity table's free list in the host's order (drift.inc): every copy chains
+//       the slots it has free in that order (then any others), so all copies hand out the same slots afterwards;
 //   'B' count head serial n {slot, next_free, seq}: the entity table's bookkeeping, so all copies hand out the same
 //       slots afterwards (opening barter alone creates and destroys the shop's stock), and the entity serial counter
 //       0x8be148.
@@ -36,7 +38,7 @@
 // a talk to a locked NPC from anyone else (two players clicking at the same moment).
 const uint8_t kCoopCmd = 0x30;
 enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6, kRecruitOpen = 7, kLevelOpen = 8,
-       kLevelClose = 9 };  // 8, 9: recruit_sync.inc (the level-up lock)
+       kLevelClose = 9, kFixHold = 10 };  // 10: drift.inc (every copy holds for the host's correction)  // 8, 9: recruit_sync.inc (the level-up lock)
 void HandleLevelRecord(const uint8_t* r);  // recruit_sync.inc  // 5, 6: shop_sync.inc; 7: recruit_sync.inc
 bool g_recruit_synced = false;  // a recruit screen is up and every copy made its candidates (recruit_sync.inc)
 void HandleRecruitOpen(const uint8_t* r);  // recruit_sync.inc
@@ -1189,6 +1191,8 @@ int ApplyNewEntities(uint8_t* world, NewEntity* ne, int nn, int* made, int* kids
     return conflicts;
 }
 
+void ApplyFreeOrder(uint8_t* world, const uint8_t* p, int n, uint32_t serial, uint16_t term);  // drift.inc
+
 void ApplyDelta(const uint8_t* data, int len) {
     LogAiFlags("before the delta");
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
@@ -1196,7 +1200,7 @@ void ApplyDelta(const uint8_t* data, int len) {
     DeltaReader r = {data, data + len, false};
     uint8_t* e = Entries(world);
     void* dummy = *reinterpret_cast<void**>(e);
-    int created = 0, destroyed = 0, counts = 0, invs = 0, hps = 0, vars = 0, conflicts = 0, attrs = 0;
+    int created = 0, destroyed = 0, counts = 0, invs = 0, hps = 0, moved = 0, vars = 0, conflicts = 0, attrs = 0, frees = 0;
     static uint16_t slots[256], seqs[256];
     int n = 0;
     for (uint8_t op = r.U8(); !r.bad && op != 'E'; op = r.U8()) {
@@ -1306,7 +1310,7 @@ void ApplyDelta(const uint8_t* data, int len) {
         } else if (op == 'H') {
             uint16_t id = r.U16();
             int hp = static_cast<int>(r.U32());
-            if (IsActor(world, id)) {
+            if (IsActor(world, id) && *reinterpret_cast<int*>(EntityById(world, id) + kActorHp) != hp) {
                 *reinterpret_cast<int*>(EntityById(world, id) + kActorHp) = hp;
                 hps++;
             }
@@ -1316,25 +1320,27 @@ void ApplyDelta(const uint8_t* data, int len) {
             if (!r.Has(12)) break;
             memcpy(pos, r.p, 12);
             r.p += 12;
-            if (IsActor(world, id)) {
-                uint8_t* ent = EntityById(world, id);
+            uint8_t* ent = IsActor(world, id) ? EntityById(world, id) : nullptr;
+            if (ent && memcmp(ent + kEntityPos, pos, sizeof(pos)) != 0) {  // where it already is: left alone
                 memcpy(ent + kEntityPos, pos, sizeof(pos));
-                __try {  // the map (World+4), as the recruit screen places a recruit (0x4d6980): 0x6e5ab0 when
-                         // World+0x1a5 is set, then 0x6e9bc0. Without the first the entity kept its old bounds
-                         // (+0x08..+0x1c, +0x50..+0x6c) and NPCs walked round it where it had been.
-                    if (*reinterpret_cast<uint32_t*>(world + 0x1a5))
-                        reinterpret_cast<void(__thiscall*)(void*, void*)>(0x6e5ab0)(world + 4, ent);
-                    reinterpret_cast<void(__thiscall*)(void*, void*)>(0x6e9bc0)(world + 4, ent);
+                __try {  // the entity's own "moved" update 0x5e00f0 (__thiscall(Entity*)): its box (+0x08..+0x1c) from
+                         // the new position, and the map's cells moved to it (0x6e99c0). 0x6e9bc0 and 0x6e5ab0, used
+                         // here first (from the recruit screen's 0x4d6980), only take an entity off the map: a drift
+                         // correction moving every actor that way left them all invisible, on the minimap too (owner,
+                         // 2026-10-23: "they're in the right spot when i double click but they're invisible now").
+                    reinterpret_cast<void(__thiscall*)(void*)>(0x5e00f0)(ent);
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
                     Log("co-op: exception 0x%08x moving actor %u on the map grid", GetExceptionCode(), id);
                 }
-                hps++;
+                moved++;
             }
         } else if (op == 'I') {
             uint16_t owner = r.U16();
             if (!ReadIdList(r, slots, seqs, &n, 256)) break;
-            uint8_t* actor = IsActor(world, owner) ? EntityById(world, owner) : nullptr;
-            uint16_t inv_id = actor ? *reinterpret_cast<uint16_t*>(actor + kActorInventory + 2) : 0;
+            uint8_t* actor = owner < EntityCount(world) ? EntityById(world, owner) : nullptr;  // an Actor or a Container
+            uintptr_t ovt = actor ? *reinterpret_cast<uintptr_t*>(actor) : 0;
+            size_t field = ovt == kActorVtable ? kActorInventory : ovt == kContainerVtable ? kContainerInventory : 0;
+            uint16_t inv_id = field ? *reinterpret_cast<uint16_t*>(actor + field + 2) : 0;
             uint8_t* invent = inv_id && inv_id < EntityCount(world) ? EntityById(world, inv_id) : nullptr;
             if (!invent || *reinterpret_cast<uintptr_t*>(invent) != kInventoryVtable) {
                 Log("co-op: actor %u has no inventory here", owner);
@@ -1344,6 +1350,14 @@ void ApplyDelta(const uint8_t* data, int len) {
             RewriteIdList(*reinterpret_cast<uint8_t**>(invent + kInventoryList), slots, seqs, n);
             *reinterpret_cast<int*>(invent + 0x1ad) = n;
             invs++;
+        } else if (op == 'F') {
+            uint16_t nf = r.U16();
+            uint32_t serial = r.U32();
+            uint16_t term = r.U16();
+            if (!r.Has(nf * 4)) break;
+            ApplyFreeOrder(world, r.p, nf, serial, term);
+            r.p += nf * 4;
+            frees++;
         } else if (op == 'Q') {
             if (!ReadIdList(r, slots, seqs, &n, 16)) break;
             uint8_t* begin = *reinterpret_cast<uint8_t**>(world + kWorldPlayers);
@@ -1397,8 +1411,9 @@ void ApplyDelta(const uint8_t* data, int len) {
             r.bad = true;
         }
     }
-    Log("co-op: delta applied: %d created, %d destroyed, %d stack counts, %d inventories, %d HP, %d conflicts, "
-        "%d variables, %d attribute runs%s", created, destroyed, counts, invs, hps, conflicts, vars, attrs, r.bad ? ", MALFORMED" : "");
+    Log("co-op: delta applied: %d created, %d destroyed, %d stack counts, %d inventories, %d HP, %d moved, %d conflicts, "
+        "%d variables, %d attribute runs%s%s", created, destroyed, counts, invs, hps, moved, conflicts, vars, attrs,
+        frees ? ", the free list" : "", r.bad ? ", MALFORMED" : "");
 }
 
 // ---- receiving: every copy, on the same frame (Actor vtable slot 510, ActOnControllerCommand) ----
@@ -1532,6 +1547,8 @@ void SendTalkClaim(void* client, const uint8_t* msg, int len) {
 void QueueFrameDelta(uint8_t kind, bool ok, bool mine, const uint8_t* data, int len);  // shop_sync.inc
 void CoopCommandAtFrame(const uint8_t* r);                                              // shop_sync.inc
 
+void ReleaseFixHold(const char* why);  // drift.inc
+
 void HandleCoopCommand(const uint8_t* r) {
     uint8_t kind = r[3], n = r[4];
     uint16_t npc;
@@ -1601,8 +1618,13 @@ void HandleCoopCommand(const uint8_t* r) {
             }
         }
         if ((r[8] & 4) && !queued) QueueFrameDelta(kind, false, g_delta_mine, nullptr, 0);  // ours, or nothing to apply
+        bool mine = g_delta_mine;
         g_delta_mine = false;
         g_rx_len = 0;
+        if (npc == 0xfffe) {  // the host's correction while every copy holds (drift.inc)
+            ReleaseFixHold(mine ? "our correction went round" : "the host's correction applied");
+            return;
+        }
         if (kind == kShopClose) return;  // the conversation goes on: its NPC stays busy
         if (r[8] & 4) return;  // freed at its frame on every copy (CoopCommandAtFrame): arrival differs per copy
         if (g_test.enabled) {  // test mode: dump some actors' memory for 100 frames, to diff the copies
