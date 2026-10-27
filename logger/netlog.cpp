@@ -4,6 +4,10 @@
 // The key left of "1" writes a numbered marker to the log so actions can be matched to messages.
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)  // mstcpip.h defines it only for newer Windows targets
+#endif
 #include <iphlpapi.h>
 #include <windows.h>
 #include <intrin.h>
@@ -1162,8 +1166,15 @@ bool DiscoverCoopHost(const char* address, const char* want, char* out_ip, size_
     if (s == INVALID_SOCKET) return false;
     BOOL on = TRUE;
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&on), sizeof(on));
-    DWORD timeout = 300;
+    DWORD timeout = 100;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    // A query to an address where nothing listens (127.0.0.1 on any PC but the host's) comes back as ICMP "port
+    // unreachable", and Windows then fails the socket's next recvfrom at once with WSAECONNRESET. The old loop took
+    // that as "no more answers": every round ended in no time, before the host's answer came (owner, two PCs: "no
+    // co-op host answered" in the same millisecond as the search). Off, and each round listens for its full time.
+    BOOL connreset = FALSE;
+    DWORD got = 0;
+    WSAIoctl(s, SIO_UDP_CONNRESET, &connreset, sizeof(connreset), nullptr, 0, &got, nullptr, nullptr);
     char bcast[16][16], named[4][16];
     int nb = LanBroadcasts(bcast, 16), nn = 0;
     if (const char* at = strstr(want, " @")) {  // "[Co-op] <name> @a,b,c"
@@ -1189,7 +1200,7 @@ bool DiscoverCoopHost(const char* address, const char* want, char* out_ip, size_
             strcat_s(sent_to, targets[i]);
         }
     Log("join: looking for co-op hosts at%s (port %d)", sent_to, g_file_port);
-    bool found = false;
+    bool found = false, recv_error_logged = false;
     char other_ip[64] = "", other_name[96] = "";
     int others = 0;
     for (int round = 0; round < 5 && !found; round++) {
@@ -1202,11 +1213,28 @@ bool DiscoverCoopHost(const char* address, const char* want, char* out_ip, size_
             inet_pton(AF_INET, t, &to.sin_addr);
             sendto(s, "FTCOOP?\n", 8, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
         }
+        if (g_test.enabled) {  // as on a PC without the host: one query where nothing listens (an ICMP "unreachable")
+            sockaddr_in dead = {};
+            dead.sin_family = AF_INET;
+            dead.sin_port = htons(static_cast<u_short>(g_file_port + 98));
+            inet_pton(AF_INET, "127.0.0.1", &dead.sin_addr);
+            sendto(s, "FTCOOP?\n", 8, 0, reinterpret_cast<sockaddr*>(&dead), sizeof(dead));
+        }
         char buf[160];
-        sockaddr_in from = {};
-        int fl = sizeof(from);
-        int n;
-        while ((n = recvfrom(s, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr*>(&from), &fl)) > 0) {
+        DWORD round_end = GetTickCount() + 300;
+        while (!found && static_cast<LONG>(round_end - GetTickCount()) > 0) {
+            sockaddr_in from = {};
+            int fl = sizeof(from);
+            int n = recvfrom(s, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr*>(&from), &fl);
+            if (n <= 0) {
+                int err = WSAGetLastError();
+                if (err != WSAETIMEDOUT && !recv_error_logged) {
+                    recv_error_logged = true;
+                    Log("join: discovery receive error %d (going on listening)", err);
+                }
+                if (err != WSAETIMEDOUT) Sleep(10);
+                continue;
+            }
             buf[n] = 0;
             char* nl = strchr(buf, '\n');
             if (nl) *nl = 0;
@@ -1255,6 +1283,14 @@ DWORD WINAPI DiscoveryResponder(LPVOID) {
         int fl = sizeof(from);
         int n = recvfrom(s, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr*>(&from), &fl);
         if (n <= 0 || strncmp(buf, "FTCOOP?", 7) != 0) continue;
+        char ip[64];
+        inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+        static char last_ip[64] = "";
+        static DWORD last_at = 0;
+        if (strcmp(ip, last_ip) != 0 || GetTickCount() - last_at > 5000)  // one line per joiner's search, not per probe
+            Log("host: a joiner at %s is looking for the host; answering", ip);
+        strcpy_s(last_ip, ip);
+        last_at = GetTickCount();
         char reply[160];
         int rl = sprintf_s(reply, "FTCOOP! %s\n", g_session_name);
         sendto(s, reply, rl, 0, reinterpret_cast<sockaddr*>(&from), fl);
