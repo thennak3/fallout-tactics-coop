@@ -11,6 +11,7 @@ Tests:
   soak        both sides take turns ordering random walks for --soak-frames frames
   fetch_save  the joiner starts from a different save; the host's save is transferred
   transition  both end the mission to the world map; the joiner must rejoin the next session
+  tbauto      as turnbased, but the host's attack starts the combat (turn-based on in the host's options)
   turnbased   turn-based combat: every player acts on the squad's turn and takes a turn pressing End Turn
   encounter   as transition, but the host meets a random encounter (mode 2) on the world map
 Every test compares every Actor's position and HP at every shared snapshot frame (every 50 frames).
@@ -56,6 +57,7 @@ TESTS = {
     "drift_host": ("drift", "host", 4),
     "joinload": ("joinload", "join", 5),
     "play": ("play", "host", 4),
+    "tbauto": ("tbauto", "all", 4),  # as turnbased, but the combat starts by itself: the host's squad fires (--host-turnbased)
     "turnbased": ("turnbased", "all", 4),  # the host turns turn-based on; every copy orders its member each squad turn, the players take turns ending it
     "chaos": ("chaos", "all", 6),  # every copy's bot moves, gives, opens screens and containers at random (--save, --hold-frames)
     "invscreen": ("invscreen", "host", 10),  # exploration: the host sits in its inventory (--hold-frames: seconds; 0 = control)  # a person plays both copies (--save, --hold-frames); the bots only log and compare  # the joiner presses quick-load mid-mission: refused (only the host loads)  # the joiner moves an NPC on its copy only; the host notices and re-syncs
@@ -915,10 +917,16 @@ def main():
     for name, log in (("host", host), ("joiner", join)):
         check(f"{name}: no out-of-sync report (msg 0xcf)", "type=207(" not in log)
         check(f"{name}: no crash or bot failure", not re.search(r"EXCEPTION 0xc0000005|bot: FAIL|bot: TIMEOUT", log))
-    if scenario == "turnbased":
+    if scenario in ("turnbased", "tbauto"):
         others = [("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]
-        check("host turned turn-based on", "bot: TB toggling turn-based" in host,
-              (re.search(r"bot: TB toggling.*", host) or [""])[0])
+        if scenario == "turnbased":
+            check("host turned turn-based on", "bot: TB toggling turn-based" in host,
+                  (re.search(r"bot: TB toggling.*", host) or [""])[0])
+        else:
+            first_tb = re.search(r"TURN s=\d+ f=(\d+) mode=[12] ", host)
+            check("the combat started by itself after the host's attack (nobody pressed the toggle)",
+                  "bot: TB toggling" not in host + "".join(l for _, l in others) and "bot: TB attacking" in host and bool(first_tb),
+                  (re.search(r"bot: TB attacking.*", host) or ["no attack"])[0] + (f"; turn-based from frame {first_tb.group(1)}" if first_tb else ""))
         turns = lambda log: re.findall(r"TURN s=(\d+ f=\d+ mode=\d+ group=\S+ player=\S+ squad=\d)", log)
         t_host = turns(host)
         check("a turn-based combat ran on the host", any(" mode=0 " not in t for t in t_host), f"{len(t_host)} turn changes")

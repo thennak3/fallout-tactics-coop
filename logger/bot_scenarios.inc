@@ -1143,7 +1143,8 @@ void __fastcall WindowTickHook(uint8_t* w) {
             speech_seen = 0;
         }
     }
-    if (g_test.enabled && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable && _stricmp(g_test.scenario, "turnbased") == 0)
+    if (g_test.enabled && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable &&
+        (_stricmp(g_test.scenario, "turnbased") == 0 || _stricmp(g_test.scenario, "tbauto") == 0))
         BotTurnBasedTick(w);
     if (g_test.enabled && (g_bot_inv_request || g_bot_inv_tick) && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
         if (g_bot_inv_request) {  // the game bar's INV button: handler 0x47fab0 (owner +0x10e, the WGameBar)
@@ -1410,7 +1411,18 @@ void BotTurnBasedTick(uint8_t* gm) {
     DWORD now = GetTickCount();
     if (!t0) t0 = now;
     int mode = *reinterpret_cast<int*>(world + kWorldCombat);
-    if (!toggled && g_coop_host && now - t0 > 3000) {
+    // tbauto: nobody touches the toggle; the host's squad fires at the nearest enemy and the game starts the combat
+    // itself (fire 0x611730 -> 0x506b30), turn-based from the host's option (on every copy: settings_sync.inc).
+    bool auto_start = _stricmp(g_test.scenario, "tbauto") == 0;
+    static DWORD last_attack = 0;
+    static int attacks = 0;
+    if (auto_start && g_coop_host && mode == 0 && attacks < 6 && now - t0 > 3000 && now - last_attack > 5000) {
+        last_attack = now;
+        ++attacks;
+        Log("bot: TB attacking to start a combat (try %d, turn-based option %d)", attacks, *reinterpret_cast<int*>(world + 0x78d));
+        BotAttack(g_client_ptr, world);
+    }
+    if (!auto_start && !toggled && g_coop_host && now - t0 > 3000) {
         toggled = true;
         Log("bot: TB toggling turn-based (preference single %d, multi %d, world+0x7c9 %d)", *reinterpret_cast<int*>(world + 0x78d),
             *reinterpret_cast<int*>(world + 0x791), world[0x7c9]);
@@ -1812,7 +1824,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         }
         int end_at = _stricmp(s, "trade2") == 0 ? talk_at + 750 : talk_at + 450;
         if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= end_at)) BotFinish();  // no reload: session 1 goes on
-    } else if (_stricmp(s, "turnbased") == 0) {
+    } else if (_stricmp(s, "turnbased") == 0 || _stricmp(s, "tbauto") == 0) {
         static int done_at = -1;
         if (g_tb_done && done_at < 0) done_at = rel_s;
         if ((done_at >= 0 && rel_s >= done_at + 100) || (g_test.hold > 0 && rel_s >= g_test.hold)) BotFinish();
