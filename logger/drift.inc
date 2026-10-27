@@ -647,7 +647,25 @@ void __fastcall RayVisitHook(uint8_t* query, void* edx, uint8_t* obj) {
     }
 }
 
+// And who really calls the hit routine 0x613230 (stack scans showed stale frames): its return address, at entry.
+const uint8_t kHitPrologue[] = {0x55, 0x8b, 0xec, 0x6a, 0xff};  // push ebp; mov ebp, esp; push -1
+void* g_hit_trampoline = nullptr;
+void __stdcall HitEntryLog(uintptr_t caller) {
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    Log("HIT f=%d 0x613230 called from %06x", world ? *reinterpret_cast<int*>(world + kWorldFrame) : -1,
+        static_cast<unsigned>(caller));
+}
+__declspec(naked) void HitEntryThunk() {
+    __asm pushad
+    __asm push dword ptr [esp + 32]
+    __asm call HitEntryLog
+    __asm popad
+    __asm jmp dword ptr [g_hit_trampoline]
+}
+
 void InstallEntityLogHooks() {  // test mode only (after the test config is read)
+    g_hit_trampoline = HookWithTrampoline(0x613230, kHitPrologue, sizeof(kHitPrologue), (void*)&HitEntryThunk);
+    Log("co-op: hit entry log hook %s", g_hit_trampoline ? "ok" : "FAILED");
     g_ray_visit_trampoline = HookWithTrampoline(0x5110a0, kRayVisitPrologue, sizeof(kRayVisitPrologue), (void*)&RayVisitHook);
     Log("co-op: ray visit log hook %s", g_ray_visit_trampoline ? "ok" : "FAILED");
     g_anim_trampoline = HookWithTrampoline(0x5e2b00, kAnimPrologue, sizeof(kAnimPrologue), (void*)&AnimStepHook);

@@ -46,8 +46,9 @@ The mod is loaded by [FTSE](https://github.com/melindil/FTSE) (Fallout Tactics S
    [Releases page](https://github.com/thennak3/fallout-tactics-coop/releases).
 2. Extract it into your game folder, next to `BOS.exe`. It adds two files:
    - `netlog.dll` (the mod)
-   - `core\FTSE\ftse.lua` (two lines that tell FTSE to load the mod). If you already have an `ftse.lua` from another
-     FTSE mod, add its two lines to yours instead of replacing it.
+   - `core\FTSE\ftse.lua` (loads the mod, and makes FTSE's burst rolls the same on every copy). If you already have
+     an `ftse.lua` from another FTSE mod, copy the whole of ours into yours instead of replacing it: without the
+     `OnBurstAttack` part, NPC bursts land differently on each copy and the game drifts apart.
 
 To uninstall, delete those two files. To remove FTSE as well, delete `realBinkw32.dll` and `core\FTSE`, and put back
 your original `binkw32.dll`.

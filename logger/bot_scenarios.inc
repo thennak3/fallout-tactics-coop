@@ -1698,10 +1698,24 @@ uint32_t __fastcall FrameTickHook(uint8_t* client) {
     g_client_ptr = client;
     __try {
         if (g_coop_host || g_coop_join) StampUpdateCounter();  // first, before the frame's world step
+        {  // the x87 control word the frame runs under (precision, rounding): logged when it changes
+            static unsigned last_cw = 0xffffffff;
+            unsigned short cw;
+            __asm fnstcw cw
+            if (cw != last_cw) {
+                uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr);
+                Log("co-op: FPU control word %04x (was %04x) at frame %d", cw, last_cw & 0xffff,
+                    w ? *reinterpret_cast<int*>(w + kWorldFrame) : -1);
+                last_cw = cw;
+            }
+        }
         if (g_test.enabled && g_dump_actors > 0)
             if (uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr))  // exploration: the world clock and its step
-                Log("TIME f=%d t=%08x step=%08x", *reinterpret_cast<int*>(w + kWorldFrame), *reinterpret_cast<uint32_t*>(w + 0x2f7),
-                    *reinterpret_cast<uint32_t*>(w + 0x2c1));
+                Log("TIME f=%d t=%08x step=%08x flags 7d=%02x 81=%02x 83=%02x 85=%02x 8b=%02x", *reinterpret_cast<int*>(w + kWorldFrame),
+                    *reinterpret_cast<uint32_t*>(w + 0x2f7), *reinterpret_cast<uint32_t*>(w + 0x2c1),
+                    *reinterpret_cast<uint8_t*>(0x8bdd7d), *reinterpret_cast<uint8_t*>(0x8bdd81),
+                    *reinterpret_cast<uint8_t*>(0x8bdd83), *reinterpret_cast<uint8_t*>(0x8bdd85),
+                    *reinterpret_cast<uint8_t*>(0x8bdd8b));
         ReapplyBookkeeping();
         RunDeferredCreates();  // shop_sync.inc
         DotsFrame();           // dots.inc

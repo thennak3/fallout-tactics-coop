@@ -1311,6 +1311,7 @@ void ApplyDelta(const uint8_t* data, int len) {
             uint16_t id = r.U16();
             int hp = static_cast<int>(r.U32());
             if (IsActor(world, id) && *reinterpret_cast<int*>(EntityById(world, id) + kActorHp) != hp) {
+                Log("co-op: actor %u HP %d -> %d", id, *reinterpret_cast<int*>(EntityById(world, id) + kActorHp), hp);
                 *reinterpret_cast<int*>(EntityById(world, id) + kActorHp) = hp;
                 hps++;
             }
@@ -1322,6 +1323,10 @@ void ApplyDelta(const uint8_t* data, int len) {
             r.p += 12;
             uint8_t* ent = IsActor(world, id) ? EntityById(world, id) : nullptr;
             if (ent && memcmp(ent + kEntityPos, pos, sizeof(pos)) != 0) {  // where it already is: left alone
+                const float* was = reinterpret_cast<const float*>(ent + kEntityPos);
+                Log("co-op: actor %u moved from (%.6f, %.6f, %.6f) to (%.6f, %.6f, %.6f), %.6f apart", id, was[0], was[1],
+                    was[2], pos[0], pos[1], pos[2],
+                    sqrtf((was[0] - pos[0]) * (was[0] - pos[0]) + (was[2] - pos[2]) * (was[2] - pos[2])));
                 memcpy(ent + kEntityPos, pos, sizeof(pos));
                 __try {  // the entity's own "moved" update 0x5e00f0 (__thiscall(Entity*)): its box (+0x08..+0x1c) from
                          // the new position, and the map's cells moved to it (0x6e99c0). 0x6e9bc0 and 0x6e5ab0, used
