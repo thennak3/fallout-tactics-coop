@@ -34,6 +34,7 @@ const DWORD kDriftFixWindowMs = 10000;  // a drift back within this of a correct
 DWORD g_drift_fix_tick = 0;  // the last correction
 int g_drift_fix_frame = 0;   // comparisons start again after this frame
 DWORD g_drift_last_resync = 0;
+const DWORD kLockBlocksResyncMs = 120000;  // an NPC lock this old holds up no re-sync (a held host still does)
 void StartWorldFix(uint8_t* world, uint8_t kinds);
 
 // HP too (owner, 2026-10-23: "sounds like we need a regular use this ID or seed sync as well"): a hit that landed on
@@ -188,8 +189,8 @@ void DriftFromJoiner(unsigned id, const char* name, const char* p) {
 void DriftCheckHost() {
     extern bool g_private_open;
     if (!g_drift_reason[0] || g_private_open || g_resync_state != 0) return;
-    for (const NpcLock& l : g_npc_locks)
-        if (l.npc) return;  // someone's conversation or shop is open
+    for (const NpcLock& l : g_npc_locks)  // someone's conversation or shop is (about to be) open; a lock left over
+        if (l.npc && GetTickCount() - l.since < kLockBlocksResyncMs) return;  // from a lost talk no longer blocks it
     DWORD now = GetTickCount();
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     uint8_t kinds = g_drift_kinds;

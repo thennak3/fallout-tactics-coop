@@ -70,6 +70,8 @@ TESTS = {
     "levelrace": ("levelup", "all", 4),  # QuestBarter.sav: both press Level on the same frame; one screen wins
     "menu_join": ("move", "join", 7),  # both pick their role in the Multiplayer menu (Host / Join), not ftcoop.ini
     "dropin": ("dropin", "host", 4),  # host plays alone; a joiner arrives later through the menu; host re-syncs
+    "talk2": ("talk2", "all", 4),
+    "talk2same": ("talk2same", "all", 4),  # the same, with the same character: the joiner's talk is lost, its NPC must be freed  # bunker save: host and joiner talk to two different NPCs at the same moment
     "talk_host": ("talk", "host", 4),  # bunker save: the host talks to an NPC, changes its game, ends: joiner gets it
     "talk_join": ("talk", "join", 4),  # the same from the joiner: its save goes to the host, everyone reloads it
     "trade_host": ("trade", "host", 4),  # bunker: both move; the host walks to the merchant, barters, trades; joiner gets it
@@ -195,7 +197,7 @@ def main():
     global SAVE
     if args.save:
         SAVE = args.save
-    elif scenario in ("talk", "trade", "trade2", "recruit", "recruitnew", "browse", "exit"):
+    elif scenario in ("talk", "talk2", "talk2same", "trade", "trade2", "recruit", "recruitnew", "browse", "exit"):
         SAVE = "user/save/bunker.sav"
     elif scenario in ("quest", "shoptalk", "levelup"):
         SAVE = "user/save/QuestBarter.sav"
@@ -952,7 +954,21 @@ def main():
                 return sum(math.dist(a, b) for a, b in zip(path, path[1:]))
             dist = max((walked(u) for u in moved), default=0.0)
             check(f"{who}: its character moved during turn-based", dist > MIN_MOVE, f"ids {sorted(moved)}, walked {dist:.2f}")
-    if scenario in ("chaos", "turnbased"):  # a split that a correction or reload repaired still counts: the copies must never differ
+    if scenario in ("talk2", "talk2same"):
+        talkers = [("host", host), ("joiner", join)] if scenario == "talk2" else [("host", host)]
+        for who, log in [("host", host), ("joiner", join)]:
+            busy = set(re.findall(r"co-op: NPC (\d+) is busy with", log))
+            free = set(re.findall(r"co-op: NPC (\d+) is free again", log))
+            check(f"{who}: every NPC that was busy is free again", bool(busy) and busy <= free,
+                  f"busy {sorted(busy)}, free again {sorted(free)}")
+            if (who, log) not in talkers:
+                check(f"{who}: its lost talk opened no conversation for it", "opened for this player" not in log)
+                continue
+            check(f"{who}: its own conversation opened for it", "co-op: this player started a conversation" in log
+                  and "opened for this player" in log)
+            check(f"{who}: ended it and brought the others up to date", "bot: ending the conversation" in log
+                  and "co-op: private screens closed, bringing the other players up to date" in log)
+    if scenario in ("chaos", "turnbased", "talk2", "talk2same"):  # a split that a correction or reload repaired still counts: the copies must never differ
         for who, log in [("host", host), ("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
             hits = re.findall(r"co-op: drift: .*|host: re-sync \(.*|join: following the host to generation \d+.*", log)
             check(f"{who}: never drifted (no drift report, correction or re-sync)", not hits, hits[0][:120] if hits else "")

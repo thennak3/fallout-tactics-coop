@@ -933,8 +933,11 @@ void BotSpeechTick(uint8_t* w) {
     static int ticks = 0;
     if (ticks == 0) {
         g_bot_done_step[1] = true;
-        BotLocalChange(*reinterpret_cast<uint8_t**>(kWorldPtr));
-        BotChangeQuestVar(*reinterpret_cast<uint8_t**>(kWorldPtr));  // what a story conversation changes
+        extern bool g_my_conv_light;
+        if (!g_my_conv_light) {  // a shop's light conversation (the world runs on) changes inventories: trade tests
+            BotLocalChange(*reinterpret_cast<uint8_t**>(kWorldPtr));
+            BotChangeQuestVar(*reinterpret_cast<uint8_t**>(kWorldPtr));  // what a story conversation changes
+        }
     }
     if (++ticks == 60) {
         Log("bot: ending the conversation");
@@ -1087,7 +1090,9 @@ void __fastcall WindowTickHook(uint8_t* w) {
         }
     }
     if (g_test.enabled && w == g_private_speech &&
-        (_stricmp(g_test.scenario, "talk") == 0 || _stricmp(g_test.scenario, "quest") == 0 || (IsShopTalk() && g_coop_join)))
+        (_stricmp(g_test.scenario, "talk") == 0 || _stricmp(g_test.scenario, "talk2") == 0 || _stricmp(g_test.scenario, "talk2same") == 0 ||
+         _stricmp(g_test.scenario, "quest") == 0 ||
+         (IsShopTalk() && g_coop_join)))
         BotSpeechTick(w);
     if (g_test.enabled && IsRecruitScenario()) {
         if (w == g_private_speech) BotRecruitSpeechTick(w);
@@ -1696,6 +1701,33 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             if (g_snap_tag == 1 && rel_s >= 30 + 120 * leg && Once(5 + leg) && i_act) BotMoveSquad(client, world, legs[leg]);
         if (g_snap_tag == 1 && rel_s >= 900 && Once(0)) Log("bot: FAIL the squad is not off the map 900 frames in");
         if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "talk2") == 0 || _stricmp(s, "talk2same") == 0) {
+        // Bunker save: two conversations at once with two NPCs (owner, two PCs, 2026-10-27: the host talked to one NPC
+        // while the other player talked to another, and no NPC was ever freed again; the host's re-sync waits for
+        // free NPCs, so the games stayed apart). The host's member 0 walks the owner's route to the recruiter, the
+        // joiner's member 1 walks to the merchant; both talk on the same frame, each changes its game while its
+        // conversation is up (BotSpeechTick), then closes it.
+        const int talk_at = 30 + 80 * kOwnerRouteLegs + 40;
+        // talk2same: both players send the same character (the host's talk reaches it first; the joiner's is lost).
+        bool same = _stricmp(s, "talk2same") == 0;
+        if (g_coop_host) {
+            for (int leg = 0; leg < kOwnerRouteLegs; leg++)
+                if (g_snap_tag == 1 && rel_s >= 30 + 80 * leg && Once(5 + leg)) BotRouteLeg(client, world, leg);
+            if (g_snap_tag == 1 && rel_s >= talk_at && Once(0)) BotTalk(client, world, 0, frame);
+        } else if (g_test.index == 1) {
+            for (int leg = 0; leg < 2; leg++)
+                if (g_snap_tag == 1 && rel_s >= 30 + 80 * leg && Once(5 + leg)) {
+                    BotRouteLeg(client, world, leg);  // leg 0 picks member 0
+                    uint16_t squad[16];
+                    if (!same && leg == 0 && GetSquad(world, squad, 16) > 1) {
+                        g_bot_talker = squad[1];
+                        SendCommand(client, 0, g_bot_talker, 0, kOwnerRoute[0], 4);
+                    }
+                }
+            if (!same && g_snap_tag == 1 && rel_s >= 190 && Once(7)) SendCommand(client, 0, g_bot_talker, 0, kMerchantApproach, 4);
+            if (g_snap_tag == 1 && rel_s >= talk_at && Once(0)) BotTalk(client, world, kMerchant, frame);
+        }
+        if (rel_s >= talk_at + 700) BotFinish();
     } else if (_stricmp(s, "browse") == 0) {
         // Bunker save: [test] actor walks to the merchant, talks, opens barter, buys nothing, leaves. No reload: only
         // the entity bookkeeping (the shop's stock came and went) goes to the other copy as co-op commands. Meanwhile

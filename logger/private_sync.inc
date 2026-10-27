@@ -1294,6 +1294,16 @@ void ApplyDelta(const uint8_t* data, int len) {
             int count = static_cast<int>(r.U32());
             uint8_t* ent = EntityById(world, slot);
             if (ent && ent != dummy) {
+                int was = *reinterpret_cast<int*>(ent + kItemCount);
+                if (was != count) {  // what drifted, for the drift hunt (owner, two PCs: inventories never agreed)
+                    char name[64] = "";
+                    __try {
+                        const wchar_t* nm = *reinterpret_cast<wchar_t**>(ent + 0x199);
+                        for (int c = 0; nm && nm[c] && c < 63; c++) name[c] = nm[c] < 0x80 ? static_cast<char>(nm[c]) : '?';
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    }
+                    Log("co-op: item %u (%s \"%s\") count %d -> %d", slot, RttiName(ent), name, was, count);
+                }
                 *reinterpret_cast<int*>(ent + kItemCount) = count;
                 counts++;
             }
@@ -1351,6 +1361,25 @@ void ApplyDelta(const uint8_t* data, int len) {
                 Log("co-op: actor %u has no inventory here", owner);
                 conflicts++;
                 continue;
+            }
+            {  // what drifted: the list as it was here against the host's
+                char before[1024], after[1024];
+                InvString(world, owner, before, sizeof(before));
+                size_t len = 0;
+                after[0] = 0;
+                for (int k = 0; k < n && len + 16 < sizeof(after); k++)
+                    len += sprintf_s(after + len, sizeof(after) - len, "%s%u", k ? "," : "", slots[k]);
+                char ids_before[1024];
+                size_t lb = 0;
+                ids_before[0] = 0;
+                for (const char* p = before; *p && lb + 8 < sizeof(ids_before);) {  // "id:count,id:count" -> "id,id"
+                    while (*p && *p != ':' && *p != ',') ids_before[lb++] = *p++;
+                    while (*p && *p != ',') p++;
+                    if (*p == ',') ids_before[lb++] = *p++;
+                }
+                ids_before[lb] = 0;
+                if (strcmp(ids_before, after) != 0 && !(n == 0 && strcmp(before, "-") == 0))
+                    Log("co-op: inventory of %u here: %s; the host's: %s", owner, before, n ? after : "-");
             }
             RewriteIdList(*reinterpret_cast<uint8_t**>(invent + kInventoryList), slots, seqs, n);
             *reinterpret_cast<int*>(invent + 0x1ad) = n;
@@ -1427,7 +1456,7 @@ const uintptr_t kActorAct = 0x5747e0;
 typedef void(__fastcall* ActFn)(void*, void*, uint8_t*);
 ActFn g_actor_act = nullptr;
 
-struct NpcLock { uint16_t npc; bool mine; DWORD since; };
+struct NpcLock { uint16_t npc; bool mine; DWORD since; uint16_t talker; };  // talker: the squad member sent to talk
 const DWORD kLockMaxMs = 10 * 60 * 1000;
 uint16_t g_host_hold_npc = 0;  // host: the game is held for a joiner's conversation with this NPC
 uint16_t g_last_other_npc = 0;  // the NPC of the last talk command from another player
@@ -1645,11 +1674,62 @@ void HandleCoopCommand(const uint8_t* r) {
     }
 }
 
+// A talk's lock is freed by kSyncDone once its conversation has closed. A talk that never opens one sent no
+// kSyncDone, and its NPC stayed busy for good (owner, two PCs: two players talking at once with the same character;
+// the later order took it elsewhere, and every later re-sync waited for that NPC). Every command acts on every copy
+// at the same frame, so the next order for the same character (another talk included) frees its pending talk there
+// on every copy, unless that conversation is up: then the character is in it (the talker's copy, or a held host).
+void ReleaseSupersededTalk(const uint8_t* cmd, uint16_t new_npc = 0) {
+    uint16_t actor;
+    memcpy(&actor, cmd + 1, 2);
+    for (auto& l : g_npc_locks) {
+        if (!l.npc || l.talker != actor || l.npc == new_npc) continue;
+        if ((l.mine && g_private_open && g_private_npc == l.npc) || l.npc == g_host_hold_npc) continue;  // talking now
+        uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+        Log("co-op: NPC %u is free again (its talker %u got another order, command 0x%02x, before the conversation opened) at frame %d",
+            l.npc, actor, cmd[0], world ? *reinterpret_cast<int*>(world + kWorldFrame) : -1);
+        if (l.mine && g_local_talk_npc == l.npc) g_local_talk_npc = 0;
+        l.npc = 0;
+    }
+}
+
+// A conversation window (WSpeech: +0x100 the talker's EntityID, +0x104 the NPC's; the index in the high half) opened
+// on this copy. Returns whose it is by its NPC's lock (1 this player's, 0 another's, -1 no lock: the caller decides),
+// and frees the other talks still pending for the same character: it is in this conversation, not theirs.
+int ConversationOpened(uint8_t* w) {
+    uint16_t talker = static_cast<uint16_t>(*reinterpret_cast<uint32_t*>(w + 0x100) >> 16);
+    uint16_t npc = static_cast<uint16_t>(*reinterpret_cast<uint32_t*>(w + 0x104) >> 16);
+    int owner = -1;
+    for (auto& l : g_npc_locks)
+        if (l.npc == npc) owner = l.mine ? 1 : 0;
+    for (auto& l : g_npc_locks) {
+        if (!l.npc || l.npc == npc || l.talker != talker) continue;
+        Log("co-op: NPC %u is free again (its talker %u is talking to NPC %u instead)", l.npc, talker, npc);
+        if (l.mine && g_local_talk_npc == l.npc) g_local_talk_npc = 0;
+        l.npc = 0;
+    }
+    if (owner == 1) g_local_talk_npc = npc;
+    Log("co-op: conversation of %u with NPC %u: %s", talker, npc, owner == 1 ? "this player's" : owner == 0 ? "another player's" : "no lock");
+    return owner;
+}
+
+// A new session (a load, a re-sync) starts every conversation over: no NPC is busy.
+void ClearNpcLocks() {
+    int n = 0;
+    for (auto& l : g_npc_locks)
+        if (l.npc) {
+            n++;
+            l.npc = 0;
+        }
+    if (n) Log("co-op: new session: %d NPC lock(s) cleared", n);
+}
+
 void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
     if (cmd && cmd[0] == kCoopCmd) {  // mostly handled when it arrived (CoopFromNetwork); some act at their frame
         CoopCommandAtFrame(cmd);
         return;
     }
+    if (cmd && cmd[0] != 0x17 && (g_coop_host || g_coop_join)) ReleaseSupersededTalk(cmd);
     if (cmd && cmd[0] == 0x17 && (g_coop_host || g_coop_join)) {  // a talk: that NPC is busy until kSyncDone
         uint16_t npc;
         memcpy(&npc, cmd + 5, 2);
@@ -1667,6 +1747,7 @@ void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
             l->npc = npc;
             l->mine = mine;
             l->since = GetTickCount();
+            memcpy(&l->talker, cmd + 1, 2);
         }
         Log("co-op: NPC %u is busy with %s", npc, mine ? "this player" : "another player");
         // A recruiter (FTSE slot 252, IsRecruitMaster) changes the squad everyone plays: everyone waits, as before.

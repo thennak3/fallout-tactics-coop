@@ -754,6 +754,8 @@ void LootScreenTick(uint8_t* w, DWORD now) {
     }
 }
 
+int ConversationOpened(uint8_t* w);  // private_sync.inc
+
 void PrivateScreenTick(uint8_t* w) {  // window-tick hook
     if (!g_coop_host && !g_coop_join) return;
     HostHoldTimeout();
@@ -795,6 +797,13 @@ void PrivateScreenTick(uint8_t* w) {  // window-tick hook
                     (g_coop_host && now - g_remote_talk_tick >= kTalkWindowMs);  // nobody's: a script's, the host's
         // A conversation a talk claim decided (private_sync.inc): the claim's winner, whoever else talked too.
         if (kind == kSpeechScreen && g_claim_tick && now - g_claim_tick < kTalkWindowMs) mine = g_claim_mine;
+        // The conversation's own NPC decides when it has a lock: two players' talks at once (two claims, one lock
+        // each) left only the last claim to go by (owner, two PCs). Other talks still pending for the same character
+        // lost: their locks are freed (ConversationOpened, private_sync.inc).
+        if (kind == kSpeechScreen && strstr(RttiName(w), "WSpeech")) {
+            int owner = ConversationOpened(w);
+            if (owner >= 0) mine = owner == 1;
+        }
         if (!mine) {
             static uint8_t* closed = nullptr;
             if (closed != w) {
@@ -1575,6 +1584,7 @@ void __fastcall ClientRecvHook(void* self, void* /*edx*/, const uint8_t* msg, in
             g_join_state = 'P';
             Notice("Co-op: in the host's game");
         }
+        ClearNpcLocks();
         if (g_coop_host) {
             Log("session %ld started (%s)", n, g_session_coop ? "co-op lobby" : "alone");
             // World map -> mission starts without a load, so no joiner could come along: re-sync by save.
