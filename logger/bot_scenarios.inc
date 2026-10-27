@@ -1065,6 +1065,7 @@ void ReleaseTalkerHold();     // netlog.cpp
 extern uint8_t* g_private_speech;
 extern bool g_end_game_mode;
 extern uint8_t* g_client_ptr;
+void BotTurnBasedTick(uint8_t* gm);  // turnbased, below
 
 void __fastcall WindowTickHook(uint8_t* w) {
     NoteWindowClass(w);
@@ -1142,6 +1143,8 @@ void __fastcall WindowTickHook(uint8_t* w) {
             speech_seen = 0;
         }
     }
+    if (g_test.enabled && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable && _stricmp(g_test.scenario, "turnbased") == 0)
+        BotTurnBasedTick(w);
     if (g_test.enabled && (g_bot_inv_request || g_bot_inv_tick) && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
         if (g_bot_inv_request) {  // the game bar's INV button: handler 0x47fab0 (owner +0x10e, the WGameBar)
             g_bot_inv_request = false;
@@ -1335,6 +1338,149 @@ bool Once(int step) {
     return true;
 }
 
+bool g_tb_done = false;  // turnbased: enough squad turns seen
+// ---- turnbased: Individual / Squad turn-based combat with shared control of one squad (owner, 2026-10-27).
+// World+0x427: 0 = real time, 1 or 2 = a turn-based combat runs (started by record 0x1f: the game bar's toggle
+// 0x477bd0 or a hit, from the preference World+0x78d, single player, or +0x791 when World+0x7c9). Turn groups: vector
+// World+0x430/+0x434 (0x18 bytes each), the current one's index at World+0x43c; 0x507bc0 gives the player slot that
+// owns the current group. End turn: 0x477a80(WGameMain*, squad) checks 0x6368a0(client, that player) (the client's id
+// +0x130 against the player's +0x31) and sends record 0x22 (squad) or 0x0d per character. Every copy's bot orders its
+// own squad member on each squad turn; the players take turns pressing the real end-turn button.
+const uintptr_t kToggleTurnBased = 0x477bd0;   // void __thiscall(WGameMain*)
+const uintptr_t kEndTurn = 0x477a80;           // void __thiscall(WGameMain*, char squad), ret 4
+const uintptr_t kCurrentTurnPlayer = 0x507bc0; // uint8_t* __thiscall(World*): the player slot whose group is current
+const size_t kWorldCombat = 0x427;
+const size_t kWorldTurnGroups = 0x430;
+const size_t kWorldTurnGroup = 0x43c;
+
+uint8_t* TurnPlayer(uint8_t* world) {
+    if (!world || *reinterpret_cast<int*>(world + kWorldCombat) == 0) return nullptr;
+    __try {
+        return reinterpret_cast<uint8_t*(__thiscall*)(void*)>(kCurrentTurnPlayer)(world);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+uint8_t* SquadOwner(uint8_t* world) {  // the player slot that owns the shared squad (the host's)
+    uint16_t squad[16];
+    if (GetSquad(world, squad, 16) < 1) return nullptr;
+    int slot = *reinterpret_cast<uint8_t*>(EntityById(world, squad[0]) + 0x163);
+    return *reinterpret_cast<uint8_t**>(world + kWorldPlayers) + slot * kPlayerSize;
+}
+
+// Frame hook, every co-op session: one line whenever the combat mode, the current group or its player changes, so
+// the copies' turn sequences can be compared.
+void LogTurns(uint8_t* world, int frame) {
+    static int last_mode = -1, last_group = -1, last_player = -2;
+    static long pref_logged = 0;
+    if (pref_logged != g_snap_tag) {
+        pref_logged = g_snap_tag;
+        Log("TBPREF s=%ld single=%d multi=%d", g_snap_tag, *reinterpret_cast<int*>(world + 0x78d), *reinterpret_cast<int*>(world + 0x791));
+    }
+    int mode = *reinterpret_cast<int*>(world + kWorldCombat);
+    int group = mode ? *reinterpret_cast<uint16_t*>(world + kWorldTurnGroup) : -1;
+    uint8_t* p = TurnPlayer(world);
+    int player = p ? *reinterpret_cast<int*>(p + kPlayerId) : -1;
+    if (mode == last_mode && group == last_group && player == last_player) return;
+    last_mode = mode, last_group = group, last_player = player;
+    uint8_t* b = *reinterpret_cast<uint8_t**>(world + kWorldTurnGroups);
+    uint8_t* e = *reinterpret_cast<uint8_t**>(world + kWorldTurnGroups + 4);
+    Log("TURN s=%ld f=%d mode=%d group=%d/%d player=%d squad=%d", g_snap_tag, frame, mode, group,
+        b ? static_cast<int>((e - b) / 0x18) : 0, player, p && p == SquadOwner(world) ? 1 : 0);
+}
+
+uint16_t CurrentTurnActor(uint8_t* world) {  // the current group's first member (an entity handle: index in the high half)
+    uint8_t* b = *reinterpret_cast<uint8_t**>(world + kWorldTurnGroups);
+    uint8_t* e = *reinterpret_cast<uint8_t**>(world + kWorldTurnGroups + 4);
+    int idx = *reinterpret_cast<uint16_t*>(world + kWorldTurnGroup);
+    if (!b || idx >= (e - b) / 0x18) return 0;
+    uint8_t* g = b + idx * 0x18;
+    uint8_t* mb = *reinterpret_cast<uint8_t**>(g + 4);
+    return mb && mb != *reinterpret_cast<uint8_t**>(g + 8) ? *reinterpret_cast<uint16_t*>(mb + 2) : 0;
+}
+
+// The mission screen's tick (UI context: the buttons' own calls). Wall-clock pacing, as people press buttons.
+void BotTurnBasedTick(uint8_t* gm) {
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    if (!world || !g_client_ptr || g_snap_tag < 1) return;
+    static DWORD t0 = 0, turn_start = 0, pressed_at = 0;
+    static bool toggled = false, was_squad = false, acted = false, pressed = false, fallback = false;
+    static int turn = 0;
+    DWORD now = GetTickCount();
+    if (!t0) t0 = now;
+    int mode = *reinterpret_cast<int*>(world + kWorldCombat);
+    if (!toggled && g_coop_host && now - t0 > 3000) {
+        toggled = true;
+        Log("bot: TB toggling turn-based (preference single %d, multi %d, world+0x7c9 %d)", *reinterpret_cast<int*>(world + 0x78d),
+            *reinterpret_cast<int*>(world + 0x791), world[0x7c9]);
+        reinterpret_cast<void(__thiscall*)(void*)>(kToggleTurnBased)(gm);
+    }
+    static bool was_tb = false;
+    if (!mode) {
+        if (was_tb && !g_tb_done) {
+            g_tb_done = true;
+            Log("bot: TB back in real time after %d squad turns", turn);
+        }
+        return;
+    }
+    was_tb = true;
+    uint8_t* cur = TurnPlayer(world);
+    bool squad = cur && cur == SquadOwner(world);
+    if (squad && !was_squad) {
+        ++turn;
+        turn_start = now, acted = false, pressed = false, fallback = false;
+        Log("bot: TB squad turn %d", turn);
+    } else if (!squad && was_squad) {
+        Log("bot: TB squad turn %d over", turn);
+    }
+    was_squad = squad;
+    if (!squad) return;
+    int players = 1 + g_test.joiners;
+    int me = g_coop_host ? 0 : g_test.index;
+    // Squad turn-based (mode 2): the whole squad's turn, every player orders its own member. Individual (mode 1): one
+    // character's turn, which only that character can use: the players take it in turns (the presser orders it).
+    if (!acted && now - turn_start > 1500) {
+        acted = true;
+        int member = me;
+        if (mode == 1) {
+            uint16_t squad_ids[16];
+            int n = GetSquad(world, squad_ids, 16);
+            uint16_t cur_id = CurrentTurnActor(world);
+            member = -1;
+            for (int i = 0; i < n; i++)
+                if (squad_ids[i] == cur_id) member = i;
+            if (turn % players != me) member = -1;
+        }
+        if (member >= 0) {
+            if (mode == 2 && me == 0 && turn % 2 == 0) BotAttack(g_client_ptr, world);
+            else BotMoveMember(g_client_ptr, world, member, static_cast<unsigned>(turn));
+        }
+    }
+    if (!pressed && now - turn_start > 5000 && turn % players == me) {
+        pressed = true, pressed_at = now;
+        Log("bot: TB END TURN pressed (squad turn %d, player %d)", turn, me);
+        reinterpret_cast<void(__thiscall*)(void*, char)>(kEndTurn)(gm, 1);
+    }
+    if (pressed && !fallback && now - pressed_at > 8000) {
+        fallback = true;
+        Log("bot: TB end turn had no effect after 8 s (squad turn %d, player %d)", turn, me);
+    }
+    if (!fallback && me == 0 && turn % players != 0 && now - turn_start > 15000) {
+        fallback = true;
+        Log("bot: TB the host ends squad turn %d instead", turn);
+        reinterpret_cast<void(__thiscall*)(void*, char)>(kEndTurn)(gm, 1);
+    }
+    // Every player pressed End Turn twice: the last player leaves turn-based through the toggle (record 0x1e, after
+    // the same "my turn" check), and the run ends once the combat is over on this copy.
+    static bool leaving = false;
+    if (turn > 2 * players + 1 && !leaving && me == players - 1) {
+        leaving = true;
+        Log("bot: TB leaving turn-based (player %d)", me);
+        reinterpret_cast<void(__thiscall*)(void*)>(kToggleTurnBased)(gm);
+    }
+}
+
 void BotFinish() {
     Log("bot: DONE");
     if (g_log) fflush(g_log);
@@ -1361,6 +1507,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
     int rel_s = frame - session_t0;
     if (g_snap_tag > 0) WatchHp(world, frame, rel_s == 0);
     if (g_snap_tag > 0) Log("RNG s=%ld f=%d v=%08x", g_snap_tag, frame, *reinterpret_cast<uint32_t*>(world + 0x729));
+    if (g_snap_tag > 0) LogTurns(world, frame);
     if (g_dump_actors < 0) g_dump_actors = GetPrivateProfileIntA("test", "entity_log", 0, ".\\ftcoop.ini");
     if (g_dump_actors && g_snap_tag == 1 && rel_s % 10 == 0) DumpActors(world, frame);
     if (g_snap_tag > 0 && rel_s > 0 && rel_s % 50 == 0 && rel_s != g_bot_last_snap) {  // co-op sessions only
@@ -1665,6 +1812,10 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         }
         int end_at = _stricmp(s, "trade2") == 0 ? talk_at + 750 : talk_at + 450;
         if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= end_at)) BotFinish();  // no reload: session 1 goes on
+    } else if (_stricmp(s, "turnbased") == 0) {
+        static int done_at = -1;
+        if (g_tb_done && done_at < 0) done_at = rel_s;
+        if ((done_at >= 0 && rel_s >= done_at + 100) || (g_test.hold > 0 && rel_s >= g_test.hold)) BotFinish();
     } else if (_stricmp(s, "chaos") == 0) {
         BotChaos(client, world, rel_s);
         if (g_test.hold > 0 && rel_s >= g_test.hold) BotFinish();
@@ -1762,6 +1913,8 @@ uint32_t __fastcall FrameTickHook(uint8_t* client) {
         ReapplyBookkeeping();
         RunDeferredCreates();  // shop_sync.inc
         DotsFrame();           // dots.inc
+        if (uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr))
+            if (g_coop_host || g_coop_join) SettingsFrame(w);
         if (uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr)) {
             DriftFrame(w);
             if (g_coop_host) DriftCheckHost();

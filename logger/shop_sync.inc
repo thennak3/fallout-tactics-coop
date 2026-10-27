@@ -339,6 +339,10 @@ void CoopCommandAtFrame(const uint8_t* r) {
         FixHoldAtFrame(r);
         return;
     }
+    if (kind == kGameSettings) {
+        SettingsAtFrame(r);
+        return;
+    }
     if (kind == kShopOpen) {
         ExecuteShopOpen(r);
         return;

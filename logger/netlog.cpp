@@ -347,6 +347,20 @@ char __fastcall SpawnPlayerHook(void* world, void* /*edx*/, uint8_t* record, voi
 // The original trusts its cache at ui+0xfe. The World's player array is rebuilt during level load, so a
 // lookup made before the load finished left a dangling pointer: both copies crashed in 0x49f600 reading the
 // member list of freed memory when the bot started fast. Always rescan (8 slots) and refresh the cache.
+// "Is this player me" 0x6368a0 (thiscall, ECX = Client, the player slot on the stack, ret 4): the Client's id (+0x130)
+// against the slot's (+0x31). Only the game bar's turn buttons ask it (end turn 0x477a80, toggle 0x477bd0, 0x4778f0),
+// with the slot whose group has the turn: a co-op joiner plays the shared squad in slot 1 (as UiLocalPlayerHook), so
+// its End Turn was dropped before it was sent. Replaced: slot 1 is also the joiner's.
+const uintptr_t kIsLocalPlayer = 0x6368a0;
+const uint8_t kIsLocalPlayerPrologue[] = {0x8b, 0x44, 0x24, 0x04, 0x85, 0xc0};  // mov eax,[esp+4]; test eax,eax
+
+bool __fastcall IsLocalPlayerHook(uint8_t* client, void*, uint8_t* player) {
+    if (!player) return false;
+    if (*reinterpret_cast<int*>(player + kPlayerId) == *reinterpret_cast<int*>(client + 0x130)) return true;
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    return g_coop_join && g_share_squad && world && player == *reinterpret_cast<uint8_t**>(world + kWorldPlayers) + kPlayerSize;
+}
+
 uint8_t* __fastcall UiLocalPlayerHook(uint8_t* ui) {
     *reinterpret_cast<uint8_t**>(ui + 0xfe) = nullptr;
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
@@ -1685,6 +1699,9 @@ void Init() {
     Log(PatchJmp(kUiLocalPlayer, kUiLocalPlayerPrologue, sizeof(kUiLocalPlayerPrologue), (void*)&UiLocalPlayerHook)
             ? "ui local-player hook installed"
             : "ui local-player prologue unexpected, hook not installed");
+    Log(PatchJmp(kIsLocalPlayer, kIsLocalPlayerPrologue, sizeof(kIsLocalPlayerPrologue), (void*)&IsLocalPlayerHook)
+            ? "turn-owner hook installed (a joiner's End Turn on the squad's turn)"
+            : "turn-owner prologue unexpected, hook not installed");
     Log(PatchCall(kTickGateGetPlayerCall, kGetPlayerById, (void*)&TickGateGetPlayerHook)
             ? "tick-gate player hook installed"
             : "tick-gate call site unexpected, hook not installed");

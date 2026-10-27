@@ -38,7 +38,7 @@
 // a talk to a locked NPC from anyone else (two players clicking at the same moment).
 const uint8_t kCoopCmd = 0x30;
 enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6, kRecruitOpen = 7, kLevelOpen = 8,
-       kLevelClose = 9, kFixHold = 10 };  // 10: drift.inc (every copy holds for the host's correction)  // 8, 9: recruit_sync.inc (the level-up lock)
+       kLevelClose = 9, kFixHold = 10, kGameSettings = 11 };  // 11: settings_sync.inc  // 10: drift.inc (every copy holds for the host's correction)  // 8, 9: recruit_sync.inc (the level-up lock)
 void HandleLevelRecord(const uint8_t* r);  // recruit_sync.inc  // 5, 6: shop_sync.inc; 7: recruit_sync.inc
 bool g_recruit_synced = false;  // a recruit screen is up and every copy made its candidates (recruit_sync.inc)
 void HandleRecruitOpen(const uint8_t* r);  // recruit_sync.inc
@@ -1840,6 +1840,7 @@ void BotChangeQuestVar(uint8_t* world) {
     Log("bot: QUEST VAR none to change");
 }
 
+#include "settings_sync.inc"
 #include "shop_sync.inc"
 
 // The deal (diff mode 2): only the buyer's and the merchant's inventories (the merchant's is the shop's stock now),

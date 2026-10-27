@@ -88,6 +88,11 @@ Checked by the automated tests in `test/`:
 - One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
   others are told someone got there first.
 - The world map: only the host picks where to go; the others follow.
+- Turn-based combat, Individual and Squad, with 2 and 3 players. On the squad's turn every player can order the squad
+  (in Individual mode, the character whose turn it is), and any player can press End Turn or switch turn-based off.
+- The host's game settings count for everyone: difficulty, turn-based mode, CTB speed, friendly fire, violence and
+  fast turn-based come from the host's options. Changing them on another player's PC has no effect while you play
+  together.
 - Random encounters on the world map: the host's game rolls and enters them, and the others follow into the
   encounter.
 - Long fights with every player acting at once (moving, swapping characters, giving items, opening containers): the
@@ -100,7 +105,6 @@ Checked by the automated tests in `test/`:
   the conversation closes. Shops don't pause anyone (for the old behaviour, put the lines `[coop]` and
   `shop_no_pause=0` in a file `ftcoop.ini` next to `BOS.exe`, on every player's PC).
 - Not tested yet: two separate PCs, play over the internet.
-- Turn-based modes are untested; the tests use Continuous Turn-Based.
 
 ## Build from source
 

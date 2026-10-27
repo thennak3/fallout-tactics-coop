@@ -11,6 +11,7 @@ Tests:
   soak        both sides take turns ordering random walks for --soak-frames frames
   fetch_save  the joiner starts from a different save; the host's save is transferred
   transition  both end the mission to the world map; the joiner must rejoin the next session
+  turnbased   turn-based combat: every player acts on the squad's turn and takes a turn pressing End Turn
   encounter   as transition, but the host meets a random encounter (mode 2) on the world map
 Every test compares every Actor's position and HP at every shared snapshot frame (every 50 frames).
 
@@ -55,6 +56,7 @@ TESTS = {
     "drift_host": ("drift", "host", 4),
     "joinload": ("joinload", "join", 5),
     "play": ("play", "host", 4),
+    "turnbased": ("turnbased", "all", 4),  # the host turns turn-based on; every copy orders its member each squad turn, the players take turns ending it
     "chaos": ("chaos", "all", 6),  # every copy's bot moves, gives, opens screens and containers at random (--save, --hold-frames)
     "invscreen": ("invscreen", "host", 10),  # exploration: the host sits in its inventory (--hold-frames: seconds; 0 = control)  # a person plays both copies (--save, --hold-frames); the bots only log and compare  # the joiner presses quick-load mid-mission: refused (only the host loads)  # the joiner moves an NPC on its copy only; the host notices and re-syncs
     "survey": ("survey", "host", 0),  # exploration: the NPCs next to the first two squad members (use with --save)
@@ -170,6 +172,10 @@ def main():
     ap.add_argument("--joiners", type=int, default=1, choices=(1, 2, 3), help="joiner copies (players - 1)")
     ap.add_argument("--host-ip", default="127.0.0.1", help="address the joiners connect to (default loopback)")
     ap.add_argument("--entity-log", action="store_true", help="log every entity made or destroyed (exploration)")
+    ap.add_argument("--host-turnbased", type=int, default=None,
+                    help="the host's bos.cfg game.turnBasedSingle for this run (restored afterwards): 1 Individual, else Squad")
+    ap.add_argument("--joiner-turnbased", type=int, default=None,
+                    help="mutation: the joiner's bos.cfg game.turnBasedSingle (restored afterwards); the host's stays")
     ap.add_argument("--chaos-no-select", action="store_true", help="chaos: the bots never change their selection")
     ap.add_argument("--inline-delta", action="store_true", help="3-4 player trades: send the deal through lockstep, not the file server")
     ap.add_argument("--shop-pause", action="store_true", help="the old way: a shop holds every copy while it is open")
@@ -245,8 +251,17 @@ def main():
               args.soak_frames, SAVE, fetch, menu=menu, joiners=0 if dropin else args.joiners, hold=args.hold_frames)
     for i, d in enumerate([JOIN_DIR] + extras, start=1):
         write_ini(d, "join", scenario, actor, args.timeout, share, args.soak_frames, join_save, fetch,
-                  not args.mutate_follow, menu=menu, index=i, hold=args.hold_frames)
+                  not args.mutate_follow, menu=menu, joiners=args.joiners, index=i, hold=args.hold_frames)
 
+    # Mutation: a joiner whose own turn-based option differs from the host's (each player's bos.cfg).
+    cfg_before = {}  # bos.cfg -> its text before this run
+    for d, value in ((HOST_DIR, args.host_turnbased), (JOIN_DIR, args.joiner_turnbased)):
+        if value is None:
+            continue
+        cfg = os.path.join(d, "core", "bos.cfg")
+        cfg_before[cfg] = read(cfg)
+        with open(cfg, "w", encoding="latin1", newline="") as f:
+            f.write(re.sub(r"\{game\.turnBasedSingle\} = \{\d+\}", "{game.turnBasedSingle} = {%d}" % value, cfg_before[cfg]))
     # The host's own quick-save must survive re-syncs (they go through the quick-save slot).
     host_quick = os.path.join(HOST_DIR, "core", "user", "save", "QuickSave.sav")
     quick_before = sha(host_quick) if os.path.exists(host_quick) else None
@@ -272,6 +287,9 @@ def main():
             else:
                 codes.append(p.returncode)
     finally:
+        for cfg, text in cfg_before.items():
+            with open(cfg, "w", encoding="latin1", newline="") as f:
+                f.write(text)
         for d, text in backups.items():
             ini = os.path.join(d, "ftcoop.ini")
             if text is None:
@@ -897,7 +915,36 @@ def main():
     for name, log in (("host", host), ("joiner", join)):
         check(f"{name}: no out-of-sync report (msg 0xcf)", "type=207(" not in log)
         check(f"{name}: no crash or bot failure", not re.search(r"EXCEPTION 0xc0000005|bot: FAIL|bot: TIMEOUT", log))
-    if scenario == "chaos":  # a split that a correction or reload repaired still counts: the copies must never differ
+    if scenario == "turnbased":
+        others = [("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]
+        check("host turned turn-based on", "bot: TB toggling turn-based" in host,
+              (re.search(r"bot: TB toggling.*", host) or [""])[0])
+        turns = lambda log: re.findall(r"TURN s=(\d+ f=\d+ mode=\d+ group=\S+ player=\S+ squad=\d)", log)
+        t_host = turns(host)
+        check("a turn-based combat ran on the host", any(" mode=0 " not in t for t in t_host), f"{len(t_host)} turn changes")
+        for who, log in others:
+            t_x = turns(log)
+            n = min(len(t_host), len(t_x))
+            first = next((i for i in range(n) if t_host[i] != t_x[i]), None)
+            check(f"{who}: same turn sequence as the host (mode, group, player, frame)", n >= 4 and first is None,
+                  f"{n} changes compared" + (f"; first difference: host {t_host[first]!r}, {who} {t_x[first]!r}" if first is not None else ""))
+        for who, log in [("host", host)] + others:
+            check(f"{who}: back in real time after a player left turn-based", "bot: TB leaving turn-based" in host + "".join(l for _, l in others)
+                  and "bot: TB back in real time" in log, (re.search(r"bot: TB back in real time.*", log) or ["not back"])[0])
+            n = len(re.findall(r"bot: TB squad turn \d+$", log, re.M))
+            check(f"{who}: at least 4 squad turns", n >= 4, f"{n} squad turns")
+        for who, log in others:
+            presses = re.findall(r"bot: TB END TURN pressed \(squad turn (\d+)", log)
+            dead = re.findall(r"bot: TB end turn had no effect.*", log)
+            check(f"{who}: pressed End Turn and it ended the squad's turn", bool(presses) and not dead,
+                  dead[0] if dead else f"squad turns {', '.join(presses)}")
+            moved = {int(x) for x in re.findall(r"bot: MOVE id=(\d+)", log)}
+            def walked(uid):  # path length over the host's snapshots (several legs can end near the start)
+                path = [s_host[f][uid][:3] for f in sorted(s_host) if uid in s_host[f]]
+                return sum(math.dist(a, b) for a, b in zip(path, path[1:]))
+            dist = max((walked(u) for u in moved), default=0.0)
+            check(f"{who}: its character moved during turn-based", dist > MIN_MOVE, f"ids {sorted(moved)}, walked {dist:.2f}")
+    if scenario in ("chaos", "turnbased"):  # a split that a correction or reload repaired still counts: the copies must never differ
         for who, log in [("host", host), ("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
             hits = re.findall(r"co-op: drift: .*|host: re-sync \(.*|join: following the host to generation \d+.*", log)
             check(f"{who}: never drifted (no drift report, correction or re-sync)", not hits, hits[0][:120] if hits else "")
