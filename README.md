@@ -88,6 +88,10 @@ Checked by the automated tests in `test/`:
 - One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
   others are told someone got there first.
 - The world map: only the host picks where to go; the others follow.
+- Random encounters on the world map: the host's game rolls and enters them, and the others follow into the
+  encounter.
+- Long fights with every player acting at once (moving, swapping characters, giving items, opening containers): the
+  games stay identical, with no corrections or reloads, for 2 and 3 players.
 - Joining by the host's network address (tested on one PC through its LAN address).
 
 ## Known issues

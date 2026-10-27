@@ -1014,6 +1014,45 @@ void BotWorldMapStartMission(uint8_t* campaign_window) {
     Log("bot: FAIL no available location on the world map");
 }
 
+// World map -> random encounter through the game's own path. Travel (WWorldWindow 0x6bad60, a private LCG at +0x112,
+// only on the copy that travels: the host) queues a hit from its encounter table (campaign + 0x1ed, 0x45 bytes each,
+// +0 FOTString name, +0x10 enabled) as a copy of the entry's name in the vector at campaign + 4 (begin) / + 8 (end) /
+// + 0xc (capacity), then calls the dispatcher 0x6bcaa0. That one waits for +0x11a > 7, asks "encounter_confirm" while
+// its roll is below campaign + 0x1c, then builds the map (0x6bab20) and enters it (0x6b6580, mode 2). The bot queues
+// the first enabled entry and calls the dispatcher with the confirm threshold at 0 (as if the player accepted).
+const uintptr_t kEncounterDispatch = 0x6bcaa0;  // void __thiscall(WWorldWindow*, int), ret 4
+const uintptr_t kGameFree = 0x6c4e50;           // void __cdecl(void*)
+
+void BotWorldMapEncounter(uint8_t* world_window) {
+    uint8_t* campaign = *reinterpret_cast<uint8_t**>(kCampaignPtr);
+    uint8_t* table = *reinterpret_cast<uint8_t**>(campaign + 0x1ed);
+    uint8_t* table_end = *reinterpret_cast<uint8_t**>(campaign + 0x1f1);
+    uint8_t* entry = nullptr;
+    for (uint8_t* e = table; e && e < table_end; e += 0x45)
+        if (e[0x10]) { entry = e; break; }
+    if (!entry) { Log("bot: FAIL no enabled random encounter in the campaign's table"); return; }
+    void*** q = reinterpret_cast<void***>(campaign + 4);  // begin, end, capacity
+    size_t n = q[0] ? q[1] - q[0] : 0;
+    if (!q[0] || q[1] == q[2]) {
+        void** grown = static_cast<void**>(reinterpret_cast<void*(__cdecl*)(size_t)>(kGameNew)((n + 1) * 4));
+        for (size_t i = 0; i < n; ++i) grown[i] = q[0][i];
+        if (q[0]) reinterpret_cast<void(__cdecl*)(void*)>(kGameFree)(q[0]);
+        q[0] = grown; q[1] = grown + n; q[2] = grown + n + 1;
+    }
+    void* name = *reinterpret_cast<void**>(entry);  // a copy of the FOTString: one more reference (count at -0xc)
+    if (name) ++*reinterpret_cast<int*>(static_cast<uint8_t*>(name) - 0xc);
+    *q[1]++ = name;
+    Log("bot: ENCOUNTER queued table entry %d of %d (%zu already queued, flag 0x8aeb20 = %d); dispatching",
+        static_cast<int>((entry - table) / 0x45), static_cast<int>((table_end - table) / 0x45), n, *reinterpret_cast<uint8_t*>(0x8aeb20));
+    int confirm = *reinterpret_cast<int*>(campaign + 0x1c);
+    *reinterpret_cast<int*>(campaign + 0x1c) = 0;
+    *reinterpret_cast<void**>(world_window + 0x116) = nullptr;
+    *reinterpret_cast<int*>(world_window + 0x11a) = 8;
+    reinterpret_cast<void(__thiscall*)(void*, int)>(kEncounterDispatch)(world_window, 0);
+    *reinterpret_cast<int*>(campaign + 0x1c) = confirm;
+    Log("bot: ENCOUNTER dispatched (mission mode now %d)", *reinterpret_cast<int*>(campaign + 0x14));
+}
+
 void BotDriveMultiSetup(uint8_t* w);  // netlog.cpp
 void WaitPopupTick(uint8_t* w);  // netlog.cpp
 void PrivateScreenTick(uint8_t* w);  // netlog.cpp
@@ -1156,6 +1195,10 @@ void __fastcall WindowTickHook(uint8_t* w) {
         *reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) {
         static int ticks = 0;  // let the world map settle (about 2 s) before choosing
         if (++ticks == 60) BotWorldMapStartMission(w);
+    }
+    if (g_test.enabled && g_coop_host && _stricmp(g_test.scenario, "encounter") == 0 && strstr(RttiName(w), "WWorldWindow")) {
+        static int ticks = 0;  // let the world map settle (about 2 s), then meet a random encounter
+        if (++ticks == 60) BotWorldMapEncounter(w);
     }
     if (g_test.enabled && _stricmp(g_test.scenario, "exit") == 0 && *reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) {
         static int ticks = 0;  // the joiner tries first (refused), the host chooses a little later
@@ -1443,7 +1486,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             }
         }
         if ((session >= 2 && rel_s >= 200) || (session == 1 && rel_s >= 500)) BotFinish();  // corrected: no reload
-    } else if (_stricmp(s, "transition") == 0) {
+    } else if (_stricmp(s, "transition") == 0 || _stricmp(s, "encounter") == 0) {
         if (g_snap_tag == 1 && rel_s >= 60 && Once(0)) BotEndMission("World Map");
         if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
     } else if (_stricmp(s, "dropin") == 0) {

@@ -593,6 +593,21 @@ void QuickSaveRetry(uint8_t* game_main, int waited, const char* who) {
     Log("%s: quick-save not written after %d frames (saving %d, mode %d, countdown %d, world+0x7c9 %d): asking again", who,
         waited, game_main[0x15a], *reinterpret_cast<int*>(game_main + 0x156), *reinterpret_cast<int*>(game_main + 0x15c),
         world ? world[0x7c9] : -1);
+    // What 0x4782a0 checks per squad member (Actor vtable+0x480, 0x56df50): the World+0x513 actor passes; else HP
+    // (+0x281) > 0, +0xf96 clear and the FOTString at +0xf8a not the empty one (0x8bc71c).
+    uint8_t* begin = world ? *reinterpret_cast<uint8_t**>(world + kWorldPlayers) : nullptr;
+    uint8_t* end = world ? *reinterpret_cast<uint8_t**>(world + kWorldPlayers + 4) : nullptr;
+    for (uint8_t* pl = begin; pl && pl < end; pl += kPlayerSize) {
+        uint8_t* head = *reinterpret_cast<uint8_t**>(pl + 0x4b);
+        for (uint8_t* n = head ? *reinterpret_cast<uint8_t**>(head) : nullptr; n && n != head; n = *reinterpret_cast<uint8_t**>(n)) {
+            uint16_t id = *reinterpret_cast<uint16_t*>(n + 10);
+            uint8_t* e = *reinterpret_cast<uint8_t**>(*reinterpret_cast<uint8_t**>(world + 0x743) + id * 8);
+            void* str = *reinterpret_cast<void**>(e + 0xf8a);
+            Log("%s:   player %d squad %u: hp %d, +0xf96 %d, +0xf8a %s, World+0x513 %u", who, *reinterpret_cast<int*>(pl + kPlayerId),
+                id, *reinterpret_cast<int*>(e + 0x281), e[0xf96],
+                str == *reinterpret_cast<void**>(0x8bc71c) ? "empty" : "set", *reinterpret_cast<uint16_t*>(world + 0x513));
+        }
+    }
     reinterpret_cast<void(__fastcall*)(void*)>(kQuickSave)(game_main);
 }
 

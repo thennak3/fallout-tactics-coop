@@ -11,6 +11,7 @@ Tests:
   soak        both sides take turns ordering random walks for --soak-frames frames
   fetch_save  the joiner starts from a different save; the host's save is transferred
   transition  both end the mission to the world map; the joiner must rejoin the next session
+  encounter   as transition, but the host meets a random encounter (mode 2) on the world map
 Every test compares every Actor's position and HP at every shared snapshot frame (every 50 frames).
 
 Usage: python -I run_test.py <test> [--mutate-share-squad] [--timeout 180] [--soak-frames 4000]
@@ -48,6 +49,7 @@ TESTS = {
     "attack": ("attack", "host", 9),
     "soak": ("soak", "host", 0),  # minimum computed from --soak-frames
     "fetch_save": ("move", "host", 7),  # joiner loads a different save; only the transfer can sync it
+    "encounter": ("encounter", "host", 5),  # mission -> world map -> random encounter (mode 2); host re-syncs, joiner follows
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
     "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
     "drift_host": ("drift", "host", 4),
@@ -696,10 +698,15 @@ def main():
               "join: following the host to generation 2 from the world map" in join)
         g2 = [k for k in shared if k[0] == 2]
         check("at least 4 shared snapshot frames in generation 2, all identical", len(g2) >= 4, f"{len(g2)} frames")
-    elif scenario == "transition":
+    elif scenario in ("transition", "encounter"):
         check("both bots ended the mission (ActionEndMission -> World Map)",
               'bot: END MISSION -> "World Map"' in host and 'bot: END MISSION -> "World Map"' in join)
-        check("host bot started a mission from the world map", "bot: WORLD MAP -> " in host)
+        if scenario == "encounter":
+            m = re.search(r"bot: ENCOUNTER dispatched \(mission mode now (\d+)\)", host)
+            check("host met a random encounter on the world map (mission mode 2)", bool(m) and m.group(1) == "2",
+                  m.group(0) if m else "no encounter line")
+        else:
+            check("host bot started a mission from the world map", "bot: WORLD MAP -> " in host)
         check("host's mission started alone and re-synced",
               "host: session without a load" in host and "host: re-sync (session started without a co-op lobby)" in host)
         check("host served the re-sync save as generation 2", "serving it to joiners as generation 2" in host)
@@ -890,6 +897,10 @@ def main():
     for name, log in (("host", host), ("joiner", join)):
         check(f"{name}: no out-of-sync report (msg 0xcf)", "type=207(" not in log)
         check(f"{name}: no crash or bot failure", not re.search(r"EXCEPTION 0xc0000005|bot: FAIL|bot: TIMEOUT", log))
+    if scenario == "chaos":  # a split that a correction or reload repaired still counts: the copies must never differ
+        for who, log in [("host", host), ("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
+            hits = re.findall(r"co-op: drift: .*|host: re-sync \(.*|join: following the host to generation \d+.*", log)
+            check(f"{who}: never drifted (no drift report, correction or re-sync)", not hits, hits[0][:120] if hits else "")
     if extra_logs:  # selection dots with 3-4 players: a colour each, and every copy shows every player
         colours = ["red", "blue", "yellow", "green"][:2 + len(extra_logs)]
         given = re.findall(r"host: .*'s colour is (\w+)", host)
