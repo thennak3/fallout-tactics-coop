@@ -306,15 +306,21 @@ def main():
     # Mode asserts: guard against a hollow pass where a copy silently ran single-player.
     hooks = "main-menu hook ok, pump hook ok"
     check("host became the co-op host", "co-op: hosting" in host and hooks in host)
-    check("joiner became a co-op joiner", f"co-op: joining {HOST_IP}" in join and hooks in join)
+    # Through the menu the joiner joins the address the host put in its session's name (its LAN address), not HOST_IP.
+    joined = f"co-op: joining {HOST_IP}" in join or (menu and re.search(r"co-op: joining \d+\.\d+\.\d+\.\d+", join))
+    check("joiner became a co-op joiner", bool(joined) and hooks in join)
     if menu:
         check("Start Co-op button added to the Multiplayer screen", "menu: Start Co-op button added" in host)
         check("host pressed Start Co-op", "menu: Multiplayer > Start Co-op" in host and "co-op mode at start: off" in host)
         check("host's DirectPlay session is named [Co-op] <name>", re.search(r'session "\[Co-op\] [^"]+", DPTCPNetwork', host) is not None)
         check("joiner's session list showed the host's co-op session", 'bot: the session list shows "[Co-op]' in join)
-        check("joiner found the host over UDP and joined that session",
-              re.search(r'menu: Multiplayer > Join: co-op session "\[Co-op\][^"]*" at 127\.0\.0\.1', join) is not None
-              and "co-op mode at start: off" in join)
+        m = re.search(r'session "(\[Co-op\][^"]*)", DPTCPNetwork', host)
+        advertised = m.group(1).split(" @")[1].split(",") if m and " @" in m.group(1) else []
+        check("host's session name carries its addresses", bool(advertised), m.group(1) if m else "no session line")
+        jm = re.search(r'menu: Multiplayer > Join: co-op session "\[Co-op\][^"]*" at ([\d.]+)', join)
+        check("joiner found the host at an address from the session name and joined that session",
+              bool(jm) and jm.group(1) in advertised + ["127.0.0.1"] and "co-op mode at start: off" in join,
+              jm.group(1) if jm else "no join line")
         check("Join button enabled with no session in the list", "Join button enabled" in join)
         check("joiner showed the waiting message, which closed by itself when the host was ready",
               "co-op: showing the waiting message" in join and "closing the waiting message" in join

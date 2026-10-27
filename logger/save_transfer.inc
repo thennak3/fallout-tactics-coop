@@ -797,11 +797,18 @@ void NoticeLeftJoiners() {
 // Runtime roles, chosen in the Multiplayer menu (or by ftcoop.ini [coop] mode= for the tests).
 bool g_poller_started = false;
 DWORD WINAPI DiscoveryResponder(LPVOID);  // netlog.cpp
+int LocalAddresses(char (*out)[16], int max);  // netlog.cpp
 
 void BecomeHost() {
     g_coop_host = true;
     g_coop_join = false;
-    sprintf_s(g_session_name, "[Co-op] %s", g_player_name);
+    // "[Co-op] <name> @<this PC's addresses>": the session list (DirectPlay's, which reaches the joiners) carries where
+    // to find the host; the session record itself holds no address (DirectPlay keeps it). A joiner asks those
+    // addresses first (two PCs: "when they hit join there was nothing that happened", owner, 2026-10-27).
+    char ips[3][16];
+    int n = LocalAddresses(ips, 3);
+    int len = sprintf_s(g_session_name, "[Co-op] %s", g_player_name);
+    for (int i = 0; i < n; i++) len += sprintf_s(g_session_name + len, sizeof(g_session_name) - len, "%s%s", i ? "," : " @", ips[i]);
     StartFileServer();
     static bool responder = false;
     if (!responder) {

@@ -4,6 +4,7 @@
 // The key left of "1" writes a numbered marker to the log so actions can be matched to messages.
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <intrin.h>
 #include <share.h>
@@ -116,7 +117,7 @@ TestConfig g_test = {};
 bool g_test_load_started = false;
 bool g_menu_role_chosen = false;  // the Multiplayer menu's Host or Join (co-op) was pressed
 bool g_open_load_after = false;       // main menu: open the Load Game screen (after Start Co-op)
-char g_session_name[64] = "[Co-op]";  // host: the DirectPlay session's name, also the discovery reply
+char g_session_name[112] = "[Co-op]";  // host: the DirectPlay session's name, also the discovery reply
 void* MakeFOTString(const char* s);
 
 #pragma pack(push, 1)
@@ -504,7 +505,7 @@ const UINT kWaitPopupMessage = WM_APP + 0x54;
 const uintptr_t kMessageBox = 0x6602b0;
 bool g_wait_popup_pending = false;
 volatile bool g_wait_popup_up = false;
-char g_wait_session[64] = "";
+char g_wait_session[128] = "";
 
 void LoadReceivedSave() {  // pump context, main menu: load the host's save as the joiner
     strcpy_s(g_load_name, kReceivedName);
@@ -859,7 +860,7 @@ uint32_t __fastcall PumpHandlerHook(void* app, void* /*edx*/, HWND hwnd, UINT ms
         return 0;
     }
     if (msg == kWaitPopupMessage && g_main_menu) {
-        char text[160];
+        char text[256];
         sprintf_s(text, "Joining %s. Waiting for the host's game... (OK stops waiting)", g_wait_session);
         void* str = MakeFOTString(text);
         Log("co-op: showing the waiting message");
@@ -1087,7 +1088,61 @@ void ResolveAddress(const char* in, char* out, size_t cap) {  // IPv4 text or a 
     }
 }
 
-// Joiner: ask co-op hosts for themselves over UDP. want: a session name to match, or "" for the first host.
+// Every IPv4 network this PC is on, as its directed broadcast address (192.168.1.255 for 192.168.1.x/24). The limited
+// broadcast 255.255.255.255 leaves through one adapter only, which Windows picks: with a virtual one (Hyper-V/WSL,
+// VirtualBox, a VPN) it often never reaches the LAN, and two PCs with no firewall still did not find each other
+// (owner, 2026-10-27: "when they hit join there was nothing that happened"; one PC worked through 127.0.0.1).
+int LanBroadcasts(char (*out)[16], int max) {
+    ULONG size = 16 * 1024;
+    static uint8_t buf[64 * 1024];
+    IP_ADAPTER_ADDRESSES* list = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf);
+    size = sizeof(buf);
+    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr,
+                             list, &size) != NO_ERROR)
+        return 0;
+    int n = 0;
+    for (IP_ADAPTER_ADDRESSES* a = list; a && n < max; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u && n < max; u = u->Next) {
+            if (u->Address.lpSockaddr->sa_family != AF_INET || u->OnLinkPrefixLength > 30) continue;
+            uint32_t ip = ntohl(reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr)->sin_addr.s_addr);
+            uint32_t mask = u->OnLinkPrefixLength ? 0xffffffffu << (32 - u->OnLinkPrefixLength) : 0;
+            in_addr b;
+            b.s_addr = htonl(ip | ~mask);
+            inet_ntop(AF_INET, &b, out[n++], 16);
+        }
+    }
+    return n;
+}
+
+// This PC's IPv4 addresses for others to reach it: adapters that are up, with a default gateway first; no loopback, no
+// link-local (169.254).
+int LocalAddresses(char (*out)[16], int max) {
+    static uint8_t buf[64 * 1024];
+    IP_ADAPTER_ADDRESSES* list = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf);
+    ULONG size = sizeof(buf);
+    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                          GAA_FLAG_SKIP_DNS_SERVER, nullptr, list, &size) != NO_ERROR)
+        return 0;
+    int n = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (IP_ADAPTER_ADDRESSES* a = list; a && n < max; a = a->Next) {
+            if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            if ((a->FirstGatewayAddress != nullptr) != (pass == 0)) continue;
+            for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u && n < max; u = u->Next) {
+                if (u->Address.lpSockaddr->sa_family != AF_INET) continue;
+                in_addr ip = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr)->sin_addr;
+                if ((ntohl(ip.s_addr) >> 16) == 0xa9fe) continue;  // 169.254: no address from the network
+                inet_ntop(AF_INET, &ip, out[n++], 16);
+            }
+        }
+    return n;
+}
+
+// Joiner: ask co-op hosts for themselves over UDP: the address typed in, the addresses in the session's name (the
+// host's, see BecomeHost), this PC, every network's broadcast. want:
+// the session name picked; a host that answers with another name is taken if it is the only one that answered (the
+// session list and the host's own name can differ).
 bool DiscoverCoopHost(const char* address, const char* want, char* out_ip, size_t cap) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return false;
@@ -1095,10 +1150,37 @@ bool DiscoverCoopHost(const char* address, const char* want, char* out_ip, size_
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&on), sizeof(on));
     DWORD timeout = 300;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-    const char* targets[] = {address, "127.0.0.1", "255.255.255.255"};
+    char bcast[16][16], named[4][16];
+    int nb = LanBroadcasts(bcast, 16), nn = 0;
+    if (const char* at = strstr(want, " @")) {  // "[Co-op] <name> @a,b,c"
+        for (const char* p = at + 2; *p && nn < 4;) {
+            int k = 0;
+            while (*p && *p != ',' && k < 15) named[nn][k++] = *p++;
+            named[nn][k] = 0;
+            in_addr test;
+            if (k && inet_pton(AF_INET, named[nn], &test) == 1) nn++;
+            if (*p == ',') p++;
+        }
+    }
+    const char* targets[28] = {address};
+    int nt = 1;
+    for (int i = 0; i < nn; i++) targets[nt++] = named[i];
+    targets[nt++] = "127.0.0.1";
+    targets[nt++] = "255.255.255.255";
+    for (int i = 0; i < nb && nt < 28; i++) targets[nt++] = bcast[i];
+    char sent_to[400] = "";
+    for (int i = 0; i < nt; i++)
+        if (targets[i] && targets[i][0]) {
+            strcat_s(sent_to, " ");
+            strcat_s(sent_to, targets[i]);
+        }
+    Log("join: looking for co-op hosts at%s (port %d)", sent_to, g_file_port);
     bool found = false;
+    char other_ip[64] = "", other_name[96] = "";
+    int others = 0;
     for (int round = 0; round < 5 && !found; round++) {
-        for (const char* t : targets) {
+        for (int ti = 0; ti < nt; ti++) {
+            const char* t = targets[ti];
             if (!t || !t[0]) continue;
             sockaddr_in to = {};
             to.sin_family = AF_INET;
@@ -1106,7 +1188,7 @@ bool DiscoverCoopHost(const char* address, const char* want, char* out_ip, size_
             inet_pton(AF_INET, t, &to.sin_addr);
             sendto(s, "FTCOOP?\n", 8, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
         }
-        char buf[128];
+        char buf[160];
         sockaddr_in from = {};
         int fl = sizeof(from);
         int n;
@@ -1115,7 +1197,17 @@ bool DiscoverCoopHost(const char* address, const char* want, char* out_ip, size_
             char* nl = strchr(buf, '\n');
             if (nl) *nl = 0;
             if (strncmp(buf, "FTCOOP! ", 8) != 0) continue;
-            if (want[0] && strcmp(buf + 8, want) != 0) continue;
+            if (want[0] && strcmp(buf + 8, want) != 0) {  // another name: kept in case it is the only host
+                char ip[64];
+                inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+                if (strcmp(ip, other_ip) != 0) {
+                    others += other_ip[0] ? 1 : 0;
+                    if (!other_ip[0]) others = 1;
+                    strcpy_s(other_ip, ip);
+                    strcpy_s(other_name, buf + 8);
+                }
+                continue;
+            }
             inet_ntop(AF_INET, &from.sin_addr, out_ip, cap);
             Log("join: co-op host \"%s\" answered from %s", buf + 8, out_ip);
             found = true;
@@ -1123,6 +1215,11 @@ bool DiscoverCoopHost(const char* address, const char* want, char* out_ip, size_
         }
     }
     closesocket(s);
+    if (!found && others == 1) {
+        strcpy_s(out_ip, cap, other_ip);
+        Log("join: no host named \"%s\", but one co-op host answered: \"%s\" at %s", want, other_name, other_ip);
+        found = true;
+    }
     return found;
 }
 
@@ -1144,7 +1241,7 @@ DWORD WINAPI DiscoveryResponder(LPVOID) {
         int fl = sizeof(from);
         int n = recvfrom(s, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr*>(&from), &fl);
         if (n <= 0 || strncmp(buf, "FTCOOP?", 7) != 0) continue;
-        char reply[96];
+        char reply[160];
         int rl = sprintf_s(reply, "FTCOOP! %s\n", g_session_name);
         sendto(s, reply, rl, 0, reinterpret_cast<sockaddr*>(&from), fl);
     }
@@ -1169,11 +1266,13 @@ bool JoinCoop(uint8_t* w, const char* session) {
     ResolveAddress(field, address, sizeof(address));
     if (!DiscoverCoopHost(address, session, ip, sizeof(ip))) {
         Log("menu: Join: no co-op host answered (session \"%s\", address field \"%s\")", session, field);
+        Notice("Co-op: the host did not answer - type the host's address in the IP box and press Join again");
         return false;
     }
     Log("menu: Multiplayer > Join: co-op session \"%s\" at %s, name \"%s\"", session, ip, name);
     BecomeJoiner(ip, name);
     strcpy_s(g_wait_session, session[0] ? session : ip);
+    if (char* at = strstr(g_wait_session, " @")) *at = 0;  // the name, without the host's addresses
     g_wait_popup_pending = true;  // the main menu shows "waiting for the host" until the save arrives
     g_menu_role_chosen = true;
     CloseMultiSetup(w);
@@ -1184,7 +1283,7 @@ bool JoinCoop(uint8_t* w, const char* session) {
 // adjust, push [callback+0x14], call handler). As __fastcall the arg is the third parameter, popped on return.
 void __fastcall MultiJoinButtonHook(uint8_t* w, void* /*edx*/, int arg) {
     uint8_t* rec = SelectedSession(w);
-    char session[64] = "";
+    char session[128] = "";
     if (rec) FOTStringToAnsi(rec + kSessionRecordName, session, sizeof(session));
     if (rec && strncmp(session, kCoopPrefix, sizeof(kCoopPrefix) - 1) == 0) {
         JoinCoop(w, session);
@@ -1253,14 +1352,16 @@ bool FindListedCoopSession(uint8_t* w, char* out, size_t cap) {
         if (!net) return false;
         uint8_t* b = *reinterpret_cast<uint8_t**>(net + 0x90);
         uint8_t* e = *reinterpret_cast<uint8_t**>(net + 0x94);
-        static char seen[256] = "";
-        char all[256] = "";
+        static char seen[1024] = "";
+        char all[1024] = "";
         size_t o = 0;
-        for (uint8_t* r = b; b && r + 0x85 <= e && o < sizeof(all) - 70; r += 0x85) {
-            char name[64];
+        for (uint8_t* r = b; b && r + 0x85 <= e && o < sizeof(all) - 140; r += 0x85) {
+            char name[128];
             FOTStringToAnsi(r + kSessionRecordName, name, sizeof(name));
             o += sprintf_s(all + o, sizeof(all) - o, "\"%s\" ", name);
-            if (!out[0] && strncmp(name, kCoopPrefix, sizeof(kCoopPrefix) - 1) == 0) strcpy_s(out, cap, name);
+            if (!out[0] && strncmp(name, kCoopPrefix, sizeof(kCoopPrefix) - 1) == 0) {
+                strcpy_s(out, cap, name);
+            }
         }
         if (strcmp(all, seen) != 0) {
             strcpy_s(seen, all);
@@ -1297,7 +1398,7 @@ void BotDriveMultiSetup(uint8_t* w) {  // called for every window tick
         reinterpret_cast<void(__thiscall*)(void*, int)>(reinterpret_cast<void*>(&StartCoopButton))(w, 0);
         return;
     }
-    char session[64];
+    char session[128];
     static DWORD next_try = 0;
     if (FindListedCoopSession(w, session, sizeof(session)) && GetTickCount() >= next_try) {
         next_try = GetTickCount() + 2000;
