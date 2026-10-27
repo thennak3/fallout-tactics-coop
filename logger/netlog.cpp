@@ -723,6 +723,10 @@ extern DWORD g_claim_tick;
 
 // A loot screen ticking: kept if this player sent the use that opened it, else closed (the mission screen's mode
 // ended, as for another player's conversation). Decided once per screen.
+void BotLootTake(uint8_t* w);  // bot_scenarios.inc
+DWORD g_chaos_search_until = 0;  // chaos: a forced search waits for its loot screen
+int g_loot_mode = 0;              // loot test: what BotLootTake takes (bot_scenarios.inc)
+
 void LootScreenTick(uint8_t* w, DWORD now) {
     static uintptr_t loot_vt = 0;
     static uint8_t* decided = nullptr;
@@ -747,7 +751,14 @@ void LootScreenTick(uint8_t* w, DWORD now) {
     }
     seen = now;
     if (!mine) g_end_game_mode = true;
-    if (mine && g_test.enabled && _stricmp(g_test.scenario, "chaos") == 0 && now - opened > 1500) {
+    static uint8_t* took = nullptr;  // chaos: the bot takes something as the screen's buttons do, then closes
+    bool bot_loots = g_test.enabled && (_stricmp(g_test.scenario, "chaos") == 0 || _stricmp(g_test.scenario, "loot") == 0);
+    if (mine && bot_loots && opened && now - opened > 700 && took != w) {
+        took = w;
+        g_chaos_search_until = 0;
+        BotLootTake(w);
+    }
+    if (mine && bot_loots && now - opened > 1500) {
         if (opened) Log("bot: CHAOS closing the loot screen");
         opened = 0;
         g_end_game_mode = true;  // the bot's own search: looked, closed

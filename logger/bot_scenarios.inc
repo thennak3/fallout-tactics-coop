@@ -1135,6 +1135,16 @@ void __fastcall WindowTickHook(uint8_t* w) {
     }
     // chaos: a conversation a script opened (a mission message: kept on the host's copy, everyone waits), read, then
     // closed. From the mission screen's tick: no game frames run while it is up.
+    if (g_test.enabled && _stricmp(g_test.scenario, "chaos") == 0 && strstr(RttiName(w), "WTutor")) {
+        static uint8_t* tutor = nullptr;  // a tutorial popup a trigger opened (on every copy): read, then closed
+        static DWORD tutor_seen = 0;
+        if (tutor != w) { tutor = w; tutor_seen = GetTickCount(); }
+        if (GetTickCount() - tutor_seen > 2000 && !g_end_game_mode) {
+            Log("bot: CHAOS closing a tutorial popup");
+            g_end_game_mode = true;
+            tutor_seen = GetTickCount();
+        }
+    }
     if (g_test.enabled && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable && _stricmp(g_test.scenario, "chaos") == 0) {
         static DWORD speech_seen = 0;
         if (g_private_open && g_private_speech) {
@@ -1245,6 +1255,39 @@ void SendCommand2(uint8_t* client, uint8_t cmd, uint16_t actor, uint32_t e1, uin
     reinterpret_cast<void(__thiscall*)(void*, void*, int, int)>(kClientSend)(client, &m, sizeof(m), 1);
 }
 
+// The loot screen's own moves (WLoot 0x803f00): Take All (button callback 0x495fa0) sends command 0x15 through
+// 0x631700(Client, actor handle*, container handle*); a stack dropped on the character sends 0x14 through
+// 0x631690(Client, actor*, container*, item*, count). The Client is WLoot+0x110, the container's handle +0x100, the
+// character the one that searched it (the button takes the screen's selection). Owner, two PCs: the copies split after
+// the other player took everything from a body.
+void BotLootTake(uint8_t* w) {
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    void* client = *reinterpret_cast<void**>(w + 0x110);
+    if (!world || !client) return;
+    extern uint16_t g_my_use_actor;  // the character that searched it (netlog.cpp), the one taking here
+    uint32_t actor = g_my_use_actor ? FullId(world, g_my_use_actor) : 0;
+    uint16_t container = *reinterpret_cast<uint16_t*>(w + 0x102);
+    uint16_t items[200];
+    int counts[200];
+    int k = InvItems(world, container, items, counts, 200);
+    if (!actor || k == 0) {
+        Log("bot: CHAOS loot screen of %u: %s", container, actor ? "empty" : "no character selected");
+        return;
+    }
+    extern int g_loot_mode;  // loot test: 1 take all, 2 one stack; 0 chaos: either
+    bool take_all = g_loot_mode ? g_loot_mode == 1 : (ChaosRand() % 2) != 0;
+    if (take_all) {
+        Log("bot: CHAOS TAKE ALL from %u (%d stacks) by %u", container, k, actor >> 16);
+        reinterpret_cast<void(__thiscall*)(void*, uint32_t*, void*)>(0x631700)(client, &actor, w + 0x100);
+    } else {
+        int i = static_cast<int>(ChaosRand() % static_cast<uint32_t>(k));
+        uint32_t item = FullId(world, items[i]);
+        Log("bot: CHAOS TAKE item %u x%d from %u by %u", items[i], counts[i], container, actor >> 16);
+        reinterpret_cast<void(__thiscall*)(void*, uint32_t*, void*, uint32_t*, int)>(0x631690)(client, &actor, w + 0x100, &item,
+                                                                                              counts[i] > 0 ? counts[i] : 1);
+    }
+}
+
 void BotChaos(uint8_t* client, uint8_t* world, int rel_s) {
     static int next = 0;
     if (!g_chaos_rng) {
@@ -1252,7 +1295,8 @@ void BotChaos(uint8_t* client, uint8_t* world, int rel_s) {
         Log("bot: CHAOS seed %08x", g_chaos_rng);
         next = 20 + static_cast<int>(ChaosRand() % 20);
     }
-    if (rel_s < next || g_private_open) return;
+    extern DWORD g_chaos_search_until;  // a forced search: no other orders until its loot screen opens (netlog.cpp)
+    if (rel_s < next || g_private_open || GetTickCount() < g_chaos_search_until) return;
     next = rel_s + 6 + static_cast<int>(ChaosRand() % 25);
     uint16_t squad[16];
     int n = GetSquad(world, squad, 16);
@@ -1260,6 +1304,8 @@ void BotChaos(uint8_t* client, uint8_t* world, int rel_s) {
     int ia = static_cast<int>(ChaosRand() % n);
     uint16_t a = squad[ia];
     unsigned roll = ChaosRand() % 100;
+    static int searches = 0;
+    if (searches < 2 && rel_s >= 60 * (searches + 1)) roll = 90;  // two searches early in every run: the loot path
     if (roll < 35) {  // one character somewhere
         int t = PickWalkTarget(world, a, ChaosRand());
         if (t >= 0) {
@@ -1302,7 +1348,12 @@ void BotChaos(uint8_t* client, uint8_t* world, int rel_s) {
         }
         if (best > 0) {
             Log("bot: CHAOS %u uses container %d (distance %.1f)", a, best, best_d);
-            SendCommand2(client, 0x04, a, FullId(world, static_cast<uint16_t>(best)), 0, 0);
+            SendCommand2(client, 0x04, a, FullId(world, static_cast<uint16_t>(best)), 0, 6);  // param 6, as the UI sends a use
+            if (roll == 90 && searches < 2) {
+                extern DWORD g_chaos_search_until;
+                g_chaos_search_until = GetTickCount() + 20000;
+            }
+            searches++;
         }
     } else if (GetPrivateProfileIntA("test", "chaos_select", 1, ".\\ftcoop.ini")) {
         // a new selection: what the dots show elsewhere (the selection is this copy's own, +0xb2 bit 0x40)
@@ -1525,6 +1576,16 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
     if (g_snap_tag > 0) WatchHp(world, frame, rel_s == 0);
     if (g_snap_tag > 0) Log("RNG s=%ld f=%d v=%08x", g_snap_tag, frame, *reinterpret_cast<uint32_t*>(world + 0x729));
     if (g_snap_tag > 0) LogTurns(world, frame);
+    // Test god mode (lootbody): the squad's HP back to its maximum (Actor +0xca6) every frame, on every copy alike.
+    if (g_snap_tag > 0 && (_stricmp(g_test.scenario, "lootbody") == 0 || _stricmp(g_test.scenario, "loot") == 0)) {
+        uint16_t squad[16];
+        int n = GetSquad(world, squad, 16);
+        for (int i = 0; i < n; i++) {
+            uint8_t* e = EntityById(world, squad[i]);
+            int hp = *reinterpret_cast<int*>(e + kActorHp), max_hp = *reinterpret_cast<int*>(e + 0xca6);
+            if (hp > 0 && hp < max_hp) *reinterpret_cast<int*>(e + kActorHp) = max_hp;
+        }
+    }
     if (g_dump_actors < 0) g_dump_actors = GetPrivateProfileIntA("test", "entity_log", 0, ".\\ftcoop.ini");
     if (g_dump_actors && g_snap_tag == 1 && rel_s % 10 == 0) DumpActors(world, frame);
     if (g_snap_tag > 0 && rel_s > 0 && rel_s % 50 == 0 && rel_s != g_bot_last_snap) {  // co-op sessions only
@@ -1701,6 +1762,64 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             if (g_snap_tag == 1 && rel_s >= 30 + 120 * leg && Once(5 + leg) && i_act) BotMoveSquad(client, world, legs[leg]);
         if (g_snap_tag == 1 && rel_s >= 900 && Once(0)) Log("bot: FAIL the squad is not off the map 900 frames in");
         if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
+    } else if (_stricmp(s, "loot") == 0) {
+        // Containers.sav, god mode: (1) the joiner's member 1 searches the nearest container and takes everything,
+        // (2) the host's member 0 searches another and takes one stack. Each
+        // search as the UI sends it (0x04, param 6); the loot screen's buttons do the taking (BotLootTake), then the
+        // screen closes as a player closes it. Owner, two PCs: the games split after the other player looted.
+        extern int g_loot_mode;
+        uint16_t squad[16];
+        int n = GetSquad(world, squad, 16);
+        // Containers 291 and 411 open a loot screen in this save (570 does not: locked, or not a loot container).
+        static const struct { int at; bool host; int member; int mode; uint16_t box; } steps[] = {
+            {40, false, 1, 1, 291}, {350, true, 0, 2, 411}};
+        for (int i = 0; i < 2; i++) {
+            const auto& st = steps[i];
+            if (rel_s < st.at || !Once(10 + i) || st.host != g_coop_host || (!g_coop_host && g_test.index != 1) || n <= st.member) continue;
+            uint16_t a = squad[st.member];
+            float* p = EntityPos(world, a);
+            int best = st.box;
+            float* q = EntityPos(world, st.box);
+            float best_d = sqrtf((q[0] - p[0]) * (q[0] - p[0]) + (q[2] - p[2]) * (q[2] - p[2]));
+            g_loot_mode = st.mode;
+            for (int k = 0; k < n; k++) {  // only the searcher selected on this copy, as a player clicking with it
+                uint8_t* e = EntityById(world, squad[k]);
+                if (k == st.member) e[0xb2] |= 0x40; else e[0xb2] &= ~0x40;
+            }
+            Log("bot: LOOT step %d: member %u searches container %d (distance %.1f), then %s", i + 1, a, best, best_d,
+                st.mode == 1 ? "takes all" : "takes one stack");
+            SendCommand2(client, 0x04, a, FullId(world, static_cast<uint16_t>(best)), 0, 6);
+        }
+        if (rel_s >= 750) BotFinish();
+    } else if (_stricmp(s, "lootbody") == 0) {
+        // Exploration (owner, two PCs: inventories split after the other player looted a corpse and pressed Done):
+        // the host's squad kills the nearest enemy if no body lies near; the joiner's member 1 uses the nearest body
+        // (command 0x04, as for a container). Which screens open where is logged (ui: window ... first ticks).
+        uint16_t squad[16];
+        int n = GetSquad(world, squad, 16);
+        auto nearest_body = [&](uint16_t from) {
+            float* a = EntityPos(world, from);
+            int best = -1;
+            float best_d = 1e9f;
+            for (int i = 1; i < EntityCount(world); i++) {
+                if (!IsActor(world, i) || InList(squad, n, i) || ActorHp(world, static_cast<uint16_t>(i)) > 0) continue;
+                float* p = EntityPos(world, static_cast<uint16_t>(i));
+                float d = sqrtf((p[0] - a[0]) * (p[0] - a[0]) + (p[2] - a[2]) * (p[2] - a[2]));
+                if (d < best_d) { best_d = d; best = i; }
+            }
+            return best;
+        };
+        static int body = -1;
+        if (g_coop_host && n > 0 && rel_s >= 30 && rel_s % 120 == 30 && nearest_body(squad[0]) < 0 && rel_s < 1500)
+            BotAttack(client, world);
+        if (g_coop_join && g_test.index == 1 && n > 1 && body < 0 && rel_s >= 60 && rel_s % 60 == 0) {
+            body = nearest_body(squad[1]);
+            if (body >= 0) {
+                Log("bot: LOOTBODY member %u uses body %d (%s)", squad[1], body, RttiName(EntityById(world, static_cast<uint16_t>(body))));
+                SendCommand2(client, 0x04, squad[1], FullId(world, static_cast<uint16_t>(body)), 0, 0);
+            }
+        }
+        if (g_test.hold > 0 && rel_s >= g_test.hold) BotFinish();
     } else if (_stricmp(s, "talk2") == 0 || _stricmp(s, "talk2same") == 0) {
         // Bunker save: two conversations at once with two NPCs (owner, two PCs, 2026-10-27: the host talked to one NPC
         // while the other player talked to another, and no NPC was ever freed again; the host's re-sync waits for
@@ -1958,7 +2077,10 @@ uint32_t __fastcall FrameTickHook(uint8_t* client) {
         RunDeferredCreates();  // shop_sync.inc
         DotsFrame();           // dots.inc
         if (uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr))
-            if (g_coop_host || g_coop_join) SettingsFrame(w);
+            if (g_coop_host || g_coop_join) {
+                SettingsFrame(w);
+                RunDuePrunes(w);
+            }
         if (uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr)) {
             DriftFrame(w);
             if (g_coop_host) DriftCheckHost();

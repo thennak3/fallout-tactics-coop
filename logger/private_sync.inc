@@ -1674,6 +1674,60 @@ void HandleCoopCommand(const uint8_t* r) {
     }
 }
 
+// After a take from a container or body (0x14 one stack, 0x15 Take All), the container's inventory list can keep an
+// entry for an item the take destroyed (its slot's sequence no longer matches) on every copy but the taker's, where
+// the open loot screen tidies it away (loot test, two PCs: "inventory of 291 here: -; the host's: 252" after a Take
+// All both copies ran alike). The drift check took it for a difference, and its correction copied the dead entry
+// back. Every copy drops such entries at the take's frame, so the lists agree again.
+void PruneDeadItems(uint8_t* world, uint16_t owner) {
+    if (!owner || owner >= EntityCount(world)) return;
+    uint8_t* e = EntityById(world, owner);
+    uintptr_t vt = *reinterpret_cast<uintptr_t*>(e);
+    size_t field = vt == kActorVtable ? kActorInventory : vt == kContainerVtable ? kContainerInventory : 0;
+    if (!field) return;
+    uint16_t inv_id = *reinterpret_cast<uint16_t*>(e + field + 2);
+    if (!inv_id || inv_id >= EntityCount(world)) return;
+    uint8_t* inv = EntityById(world, inv_id);
+    if (*reinterpret_cast<uintptr_t*>(inv) != kInventoryVtable) return;
+    uint8_t* head = *reinterpret_cast<uint8_t**>(inv + kInventoryList);
+    uint16_t slots[256], seqs[256];
+    int n = 0, dead = 0;
+    for (uint8_t* node = *reinterpret_cast<uint8_t**>(head); node && node != head && n < 256;
+         node = *reinterpret_cast<uint8_t**>(node)) {
+        uint16_t seq = *reinterpret_cast<uint16_t*>(node + 8), slot = *reinterpret_cast<uint16_t*>(node + 10);
+        uint16_t now = slot && slot < EntityCount(world) ? *reinterpret_cast<uint16_t*>(Entries(world) + slot * 8 + 6) : 0;
+        if (!slot || now != seq) {
+            Log("co-op: dropped a dead entry from %u's inventory: slot %u (sequence %u, the slot's now %u)", owner, slot, seq, now);
+            dead++;
+            continue;
+        }
+        slots[n] = slot, seqs[n] = seq, n++;
+    }
+    if (!dead) return;
+    RewriteIdList(head, slots, seqs, n);
+    *reinterpret_cast<int*>(inv + 0x1ad) = n;
+}
+
+struct PendingPrune { uint16_t owner; int frame; };
+PendingPrune g_prunes[32];
+
+void QueuePrune(uint16_t owner, int frame) {
+    for (auto& p : g_prunes)
+        if (!p.owner || (p.owner == owner && p.frame == frame)) {
+            p = {owner, frame};
+            return;
+        }
+}
+
+void RunDuePrunes(uint8_t* world) {  // FrameTickHook, before the frame's world step
+    int frame = *reinterpret_cast<int*>(world + kWorldFrame);
+    for (auto& p : g_prunes)
+        if (p.owner && frame >= p.frame) {
+            PruneDeadItems(world, p.owner);
+            p.owner = 0;
+        }
+}
+
 // A talk's lock is freed by kSyncDone once its conversation has closed. A talk that never opens one sent no
 // kSyncDone, and its NPC stayed busy for good (owner, two PCs: two players talking at once with the same character;
 // the later order took it elsewhere, and every later re-sync waited for that NPC). Every command acts on every copy
@@ -1774,6 +1828,18 @@ void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
         if (!mine) g_last_other_npc = npc;
     }
     g_actor_act(actor, edx, cmd);
+    if (cmd && (cmd[0] == 0x14 || cmd[0] == 0x15) && (g_coop_host || g_coop_join)) {
+        uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+        uint32_t from;
+        uint16_t taker;
+        memcpy(&from, cmd + 3, 4);
+        memcpy(&taker, cmd + 1, 2);
+        if (world) {  // destroys finish during the next frame: two frames on, at the frame's start (every copy alike)
+            int due = *reinterpret_cast<int*>(world + kWorldFrame) + 2;
+            QueuePrune(static_cast<uint16_t>(from >> 16), due);
+            QueuePrune(taker, due);
+        }
+    }
 }
 
 // Client send: this player's talk to an NPC someone else is talking to never leaves this copy.
