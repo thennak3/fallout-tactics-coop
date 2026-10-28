@@ -84,6 +84,8 @@ uint32_t InvHash(uint8_t* world) {
         uintptr_t vt = *reinterpret_cast<uintptr_t*>(EntityById(world, static_cast<uint16_t>(i)));
         if (vt != kActorVtable && vt != kContainerVtable) continue;
         if (InvString(world, static_cast<uint16_t>(i), s, sizeof(s))) h = Fnv(Fnv(h, &i, sizeof(i)), s, strlen(s));
+        EquipString(world, static_cast<uint16_t>(i), s, sizeof(s));  // hands and armour too
+        h = Fnv(h, s, strlen(s));
     }
     return h;
 }

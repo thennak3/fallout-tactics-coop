@@ -1778,11 +1778,14 @@ void ClearNpcLocks() {
     if (n) Log("co-op: new session: %d NPC lock(s) cleared", n);
 }
 
+bool HoldForShop(void* actor, void* edx, uint8_t* cmd);  // shop_sync.inc
+
 void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
     if (cmd && cmd[0] == kCoopCmd) {  // mostly handled when it arrived (CoopFromNetwork); some act at their frame
         CoopCommandAtFrame(cmd);
         return;
     }
+    if (cmd && (g_coop_host || g_coop_join) && HoldForShop(actor, edx, cmd)) return;
     if (cmd && cmd[0] != 0x17 && (g_coop_host || g_coop_join)) ReleaseSupersededTalk(cmd);
     if (cmd && cmd[0] == 0x17 && (g_coop_host || g_coop_join)) {  // a talk: that NPC is busy until kSyncDone
         uint16_t npc;

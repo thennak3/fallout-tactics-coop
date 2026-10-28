@@ -80,6 +80,23 @@ const uintptr_t kInventoryVtable = 0x818af8;
 const size_t kInventoryList = 0x1a9;
 const size_t kItemCount = 0x1ad;
 
+// An Actor's equipment: three handle slots {seq +0x100e+4i, slot +0x1010+4i}, i = 0, 1 the hands, 2 the armour
+// (getter: Actor vfunc +0x54c, 0x5581a0), and the active hand, byte +0x1029 (0/1, set by command 0x0b). The game
+// changes them with commands 5 drop, 6 equip, 7 unequip, 0x0b hand: "slot.seq,slot.seq,slot.seq/hand", "" if not
+// an Actor. Not part of InvString: the inventory list and the equipment are kept apart (the private-screen delta).
+const size_t kActorEquip = 0x100e, kActorHand = 0x1029;
+void EquipString(uint8_t* world, uint16_t actor, char* out, size_t size) {
+    out[0] = 0;
+    __try {
+        uint8_t* a = EntityById(world, actor);
+        if (*reinterpret_cast<uintptr_t*>(a) != kActorVtable) return;
+        const uint16_t* s = reinterpret_cast<const uint16_t*>(a + kActorEquip);
+        sprintf_s(out, size, "%u.%u,%u.%u,%u.%u/%u", s[1], s[0], s[3], s[2], s[5], s[4], a[kActorHand]);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        strcpy_s(out, size, "?");
+    }
+}
+
 // "id:count,id:count" (list order), or "-" when empty; false if the actor has no readable inventory.
 bool InvString(uint8_t* world, uint16_t actor, char* out, size_t size) {
     out[0] = 0;
@@ -182,9 +199,10 @@ void SnapshotAll(uint8_t* world, int frame) {
         float* p = EntityPos(world, static_cast<uint16_t>(i));
         Log("SNAP s=%ld f=%d id=%d pos=(%.3f,%.3f,%.3f) hp=%d", g_snap_tag, frame, i, p[0], p[1], p[2],
             ActorHp(world, static_cast<uint16_t>(i)));
-        char inv[2048];
+        char inv[2048], eq[64];
+        EquipString(world, static_cast<uint16_t>(i), eq, sizeof(eq));
         if (InvString(world, static_cast<uint16_t>(i), inv, sizeof(inv)))
-            Log("INV s=%ld f=%d id=%d items=%s", g_snap_tag, frame, i, inv);
+            Log("INV s=%ld f=%d id=%d items=%s|eq=%s", g_snap_tag, frame, i, inv, eq);
     }
 }
 
@@ -1300,6 +1318,61 @@ void BotLootTake(uint8_t* w) {
     }
 }
 
+// The inventory screen's equipment moves, as its drags and clicks send them (WSquadEquip 0x46f940 / 0x46f520 /
+// 0x470290): equip 0x631320(Client, actor*, item*, slot) cmd 6, unequip 0x631300(Client, actor*, item*) cmd 7, active
+// hand 0x631a80(Client, actor*, hand) cmd 0x0b. A random one for character a.
+void BotEquipMove(uint8_t* client, uint8_t* world, uint16_t a) {
+    uint32_t actor = FullId(world, a);
+    uint8_t* e = EntityById(world, a);
+    unsigned what = ChaosRand() % 3;
+    int slot = static_cast<int>(ChaosRand() % 3);
+    uint32_t worn = *reinterpret_cast<uint32_t*>(e + kActorEquip + 4 * slot);
+    uint16_t items[64];
+    int counts[64];
+    int k = InvItems(world, a, items, counts, 64);
+    if (what == 0 && k > 0) {
+        uint32_t item = FullId(world, items[ChaosRand() % k]);
+        Log("bot: CHAOS equip item %u on %u, slot %d", item >> 16, a, slot);
+        reinterpret_cast<void(__thiscall*)(void*, uint32_t*, uint32_t*, int)>(0x631320)(client, &actor, &item, slot);
+    } else if (what == 1 && (worn >> 16)) {
+        Log("bot: CHAOS unequip item %u from %u, slot %d", worn >> 16, a, slot);
+        reinterpret_cast<void(__thiscall*)(void*, uint32_t*, uint32_t*)>(0x631300)(client, &actor, &worn);
+    } else {
+        int hand = e[kActorHand] ? 0 : 1;
+        Log("bot: CHAOS active hand of %u -> %d", a, hand);
+        reinterpret_cast<void(__thiscall*)(void*, uint32_t*, int)>(0x631a80)(client, &actor, hand);
+    }
+}
+
+// [test] inv_chaos (trade scenarios, the copy that doesn't trade): while the other player walks to the merchant and
+// shops (a shop pauses nobody), this one gives stacks and equips, unequips and swaps hands among its squad, never
+// member 0 (the trader's). The owner's bunker night: one shopped, the other re-equipped the squad, and they split.
+void BotInventoryChaos(uint8_t* client, uint8_t* world, int rel_s) {
+    static int next = 0;
+    if (!g_chaos_rng) g_chaos_rng = GetTickCount() ^ 0x85ebca6bu;
+    if (rel_s < next || g_private_open) return;
+    next = rel_s + 5 + static_cast<int>(ChaosRand() % 15);
+    uint16_t squad[16];
+    int n = GetSquad(world, squad, 16);
+    if (n < 3) return;
+    int ia = 1 + static_cast<int>(ChaosRand() % (n - 1));
+    uint16_t a = squad[ia];
+    if (ChaosRand() % 2) {
+        BotEquipMove(client, world, a);
+        return;
+    }
+    int ib = 1 + static_cast<int>(ChaosRand() % (n - 2));
+    uint16_t b = squad[ib >= ia ? ib + 1 : ib];
+    uint16_t items[64];
+    int counts[64];
+    int k = InvItems(world, a, items, counts, 64);
+    if (k <= 0) return;
+    int i = static_cast<int>(ChaosRand() % k);
+    int c = counts[i] > 1 ? 1 + static_cast<int>(ChaosRand() % counts[i]) : 1;
+    Log("bot: CHAOS give %d of item %u (stack of %d) from %u to %u", c, items[i], counts[i], a, b);
+    SendCommand2(client, 0x13, a, FullId(world, b), FullId(world, items[i]), c << 3);
+}
+
 void BotChaos(uint8_t* client, uint8_t* world, int rel_s) {
     static int next = 0;
     if (!g_chaos_rng) {
@@ -1330,6 +1403,8 @@ void BotChaos(uint8_t* client, uint8_t* world, int rel_s) {
             Log("bot: CHAOS squad move to waypoint %d", t);
             BotMoveSquad(client, world, g_waypoints[t]);
         }
+    } else if (roll < 75 && ChaosRand() % 2) {
+        BotEquipMove(client, world, a);
     } else if (roll < 75 && n > 1) {  // a stack from one character to another, all of it or part
         int ib = static_cast<int>(ChaosRand() % (n - 1));
         uint16_t b = squad[ib >= ia ? ib + 1 : ib];
@@ -1943,6 +2018,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         // Session 1 must match on both copies until the talk; session 2 (from the trader's game) everywhere.
         if (g_snap_tag == 1 && rel_s >= 30 && Once(2) && !i_act) BotMoveMember(client, world, 1, 0);
         if (g_snap_tag == 1 && rel_s >= 60 && Once(3) && i_act) BotMoveMember(client, world, 2, 0);
+        if (g_test.inv_chaos && !i_act && rel_s >= 100) BotInventoryChaos(client, world, rel_s);
         for (int leg = 0; leg < 2; leg++)
             if (g_snap_tag == 1 && rel_s >= 30 + 80 * leg && Once(5 + leg) && i_act) BotRouteLeg(client, world, leg);
         if (g_snap_tag == 1 && rel_s >= 190 && Once(7) && i_act) {
@@ -2087,6 +2163,7 @@ uint32_t __fastcall FrameTickHook(uint8_t* client) {
                     *reinterpret_cast<uint8_t*>(0x8bdd8b));
         ReapplyBookkeeping();
         RunDeferredCreates();  // shop_sync.inc
+        RunHeldCommands();     // shop_sync.inc: item moves made while a shop was open
         DotsFrame();           // dots.inc
         if (uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr))
             if (g_coop_host || g_coop_join) {

@@ -41,6 +41,7 @@ void TableStepLog(uint8_t* world, const char* what) {
     ReadSlots(world, g_step_before, &g_step_n);
 }
 extern bool g_shop_close_waits;
+extern bool g_shop_hold;  // item moves wait while a shop is open (RunHeldCommands)
 void RunDeferredNew(uint8_t* world);
 bool g_shop_requested = false;  // this copy's Barter press went out as kShopOpen
 
@@ -239,6 +240,7 @@ void ExecuteShopOpen(const uint8_t* r) {
     memcpy(&claim, r + 15, 4);
     g_shop = {};
     g_shop.open = true;
+    g_shop_hold = true;  // item moves wait from this frame (RunHeldCommands)
     g_shop.buyer = buyer;
     g_shop.merchant = merchant;
     g_shop.mine = g_shop_requested && claim && claim == g_my_claim;
@@ -446,6 +448,65 @@ bool ShopOpenForOther(uint16_t* buyer) {
 }
 
 bool g_shop_close_waits = false;
+
+// ---- Item moves while a shop is open ----
+// A shop pauses nobody, and the shopper's copy makes and destroys entities as the deal is made (each offer), the
+// others only at its close (the delta). A command that makes or destroys entities in between (a give, a take, a drop,
+// an equip) ran on every copy at the same frame but took different slots off each copy's free list, and from then on
+// the copies disagreed about which entity was which (trade_host --inv-chaos; the owner's bunker night, 2026-10-27: one
+// shopped at the quartermaster while the other re-equipped the squad). So from the frame a shop opens (every copy)
+// until the start of the frame after it closed everywhere, those commands wait in order, then run on every copy there.
+struct HeldCommand {
+    void* actor;
+    void* edx;
+    uint16_t slot;
+    uint8_t cmd[27];
+};
+HeldCommand g_held[64];
+int g_nheld = 0;
+bool g_shop_hold = false;  // from a shop's open frame until its held commands ran
+
+bool MakesOrDestroysEntities(uint8_t c) {  // use, drop, equip, unequip, give, take one stack, take all
+    return c == 0x04 || c == 0x05 || c == 0x06 || c == 0x07 || c == 0x13 || c == 0x14 || c == 0x15;
+}
+
+bool HoldForShop(void* actor, void* edx, uint8_t* cmd) {  // ActorActHook: true if the command waits
+    if (!g_shop_hold || !MakesOrDestroysEntities(cmd[0])) return false;
+    if (g_nheld >= 64) {
+        Log("co-op: 64 commands already wait for the shop: command 0x%02x runs now", cmd[0]);
+        return false;
+    }
+    HeldCommand& h = g_held[g_nheld++];
+    h.actor = actor;
+    h.edx = edx;
+    memcpy(&h.slot, cmd + 1, 2);
+    memcpy(h.cmd, cmd, sizeof(h.cmd));
+    Log("co-op: command 0x%02x of %u waits for the shop to close (%d waiting)", cmd[0], h.slot, g_nheld);
+    return true;
+}
+
+void ClearHeldCommands() {  // a new session
+    g_shop_hold = false;
+    g_nheld = 0;
+}
+
+void RunHeldCommands() {  // frame hook, after RunDeferredCreates: every copy at the same frame
+    if (!g_shop_hold || g_shop.open || g_shop_close_waits) return;
+    g_shop_hold = false;
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    if (g_nheld && world)
+        Log("co-op: the shop is closed everywhere: %d waiting command(s) run at frame %d", g_nheld,
+            *reinterpret_cast<int*>(world + kWorldFrame));
+    for (int i = 0; i < g_nheld && world; i++) {
+        HeldCommand& h = g_held[i];
+        if (EntityById(world, h.slot) != h.actor) {  // the character is gone meanwhile (the same on every copy)
+            Log("co-op: command 0x%02x of %u dropped: that character is gone", h.cmd[0], h.slot);
+            continue;
+        }
+        ActorActHook(h.actor, h.edx, h.cmd);
+    }
+    g_nheld = 0;
+}
 
 // Frame hook, at the start of a frame: what a delta at its frame left for after its destroys finished: the creates
 // that waited for their slot (DeferCreate), the bookkeeping, then the shop's close.
