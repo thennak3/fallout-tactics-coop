@@ -3,8 +3,8 @@
 Play the Fallout Tactics: Brotherhood of Steel single-player campaign with friends. 2 to 4 players
 share one squad: everyone can order every squad member, and the host's campaign is the one being played.
 
-**Status: work in progress.** It works in automated tests with several copies of the game on one PC. It has not yet
-been tested across two PCs. See [What works](#what-works) and [Known issues](#known-issues).
+**Status: work in progress.** It works in automated tests with several copies of the game on one PC, and has been
+played on two PCs on one home network. See [What works](#what-works) and [Known issues](#known-issues).
 
 ## 1. Check your game version
 
@@ -66,8 +66,7 @@ your original `binkw32.dll`.
 
 ### Networking
 
-All players must be able to reach the host's PC. On the same home network this should just work (not yet tested
-across two PCs). For friends elsewhere, the simplest way is a virtual LAN such as Tailscale or ZeroTier, then join
+All players must be able to reach the host's PC. On the same home network this just works. For friends elsewhere, the simplest way is a virtual LAN such as Tailscale or ZeroTier, then join
 as if on one network. The mod uses port **47701** (TCP for the save copy, UDP to find the host) on top of the
 game's own multiplayer ports. Windows Firewall may ask to allow the game the first time: allow it.
 
@@ -81,13 +80,15 @@ Checked by the automated tests in `test/`:
 - In the bunker, without any reload: buying and selling (new items included) and quest variables a conversation
   changes. Tested with 2, 3 and 4 players.
 - Shopping pauses nobody: the other players keep playing while one shops. While a shop is open, the shopper's
-  character can't be ordered by the others, and the recruiter waits until the shop closes.
+  character can't be ordered by the others, and the recruiter waits until the shop closes. Item moves by the others
+  meanwhile (giving, equipping, taking, dropping) take effect when the shop closes, so the games stay the same.
 - The selection dots, with 2 and 4 players.
 - Recruiting and dismissing squad members, without a reload (the game pauses for everyone while the recruit screen
   is up, since it changes the squad everyone plays).
 - One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
   others are told someone got there first.
-- The world map: only the host picks where to go; the others follow.
+- The world map: only the host moves the party and picks where to go. The others see the host's party travel on
+  their own map; their clicks do nothing.
 - Turn-based combat, Individual and Squad, with 2 and 3 players. On the squad's turn every player can order the squad
   (in Individual mode, the character whose turn it is), and any player can press End Turn or switch turn-based off.
 - The host's game settings count for everyone: difficulty, turn-based mode, CTB speed, friendly fire, violence and
@@ -98,13 +99,21 @@ Checked by the automated tests in `test/`:
 - Long fights with every player acting at once (moving, swapping characters, giving items, opening containers): the
   games stay identical, with no corrections or reloads, for 2 and 3 players.
 - Joining by the host's network address (tested on one PC through its LAN address).
+- Equipping and swapping weapons and armour between squad members. If hands or armour ever differ between the
+  games, the host's drift check puts them right without a reload.
+- Leaving a co-op session to the main menu (it crashed in 0.9.2 and earlier).
 
 ## Known issues
 
 - While one player talks to anyone other than a merchant, or uses the recruiter, the other players' games pause until
   the conversation closes. Shops don't pause anyone (for the old behaviour, put the lines `[coop]` and
   `shop_no_pause=0` in a file `ftcoop.ini` next to `BOS.exe`, on every player's PC).
-- Not tested yet: two separate PCs, play over the internet.
+- Joining from the Multiplayer menu waits about 3 s for DirectPlay to close the menu's session search; the waiting
+  message shows meanwhile.
+- A character who joins the squad through a story conversation (not the recruiter) still means a save and reload
+  for everyone.
+- Fog of war on the world map isn't synced: ground the host explored while you weren't connected stays dark for you.
+- Played on two PCs on one home network; not tested over the internet yet.
 
 ## Build from source
 
