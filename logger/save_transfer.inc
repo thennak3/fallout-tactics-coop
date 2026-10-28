@@ -460,10 +460,11 @@ uint32_t GetBigDelta(uint32_t hash, uint8_t* out, uint32_t cap) {
     return ok ? n : 0;
 }
 
-// Joiner: ask the host for its current generation every 2 s (background thread, never touches game state).
+// Joiner: ask the host for its current generation every kJoinPollMs (background thread, never touches game state).
+// It was 2 s: every join and every re-sync waited up to that long before the joiner even heard of the new save.
 DWORD WINAPI GenerationPoller(LPVOID) {
     for (;;) {
-        Sleep(2000);
+        Sleep(kJoinPollMs);
         if (!g_coop_join) continue;  // stopped waiting (or never joined): don't register with the host
         SOCKET s = ConnectHost();
         char line[300];
@@ -559,7 +560,7 @@ void JoinerFollowHost(uint8_t* window) {
     if (!close_slot) return;
     static DWORD next_try = 0;
     if (GetTickCount() < next_try) return;
-    next_try = GetTickCount() + 2000;
+    next_try = GetTickCount() + kJoinPollMs;
     if (!FetchSave()) return;
     AssignFileToLoad(kReceivedName);
     g_join_pending = true;

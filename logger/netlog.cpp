@@ -124,6 +124,7 @@ bool g_test_load_started = false;
 bool g_menu_role_chosen = false;  // the Multiplayer menu's Host or Join (co-op) was pressed
 bool g_open_load_after = false;       // main menu: open the Load Game screen (after Start Co-op)
 bool g_load_screen_up = false;        // that screen is open (a session played from it runs inside it too)
+const DWORD kJoinPollMs = 250;        // a joiner's checks with the host (generation, save ready, session up): LAN-cheap
 char g_session_name[112] = "[Co-op]";  // host: the DirectPlay session's name, also the discovery reply
 void* MakeFOTString(const char* s);
 
@@ -436,6 +437,54 @@ uint8_t* HookWithTrampoline(uintptr_t fn, const uint8_t* prologue, size_t n, voi
     t[n] = 0xe9;
     *reinterpret_cast<int32_t*>(t + n + 1) = static_cast<int32_t>((fn + n) - reinterpret_cast<uintptr_t>(t + n + 5));
     return PatchJmp(fn, prologue, n, hook) ? t : nullptr;
+}
+
+// The game's network close (0x759960, DPTCPNetwork, vtable 0x7fd098) ends with IDirectPlay->Release() on its
+// interface (+0x1c): mov ecx,[eax]; push eax; call [ecx+8]. DirectPlay's TCP provider (dpwsockx) waits there about
+// 3 s for one of its own threads (dpwsockx+0x7eca: WaitForSingleObject(thread, INFINITE)), and the game's main thread
+// waited with it. Only the Multiplayer screen's network does that (its session search; Start Co-op and Join close
+// it); a session's own network releases in 30-160 ms (resync). Sampled 2026-10-28: the main thread in dplayx ->
+// dpwsockx -> WaitForSingleObject, from 0x75997c, the whole 3 s. The release now runs on a thread of its own, so the
+// game goes on (the waiting message, the save's download); creating the next DirectPlay object still waits for it
+// (dplayx serializes the two), so a joiner's session starts no sooner. Stopping the search first (EnumSessions
+// DPENUMSESSIONS_STOPASYNC) was refused (E_INVALIDARG) and changed nothing.
+const uintptr_t kNetCloseRelease = 0x759976;
+const uint8_t kNetCloseReleaseBytes[] = {0x8b, 0x08, 0x50, 0xff, 0x51, 0x08};
+
+DWORD WINAPI ReleaseDirectPlay(LPVOID p) {
+    DWORD t0 = GetTickCount();
+    __try {
+        IUnknown* u = static_cast<IUnknown*>(p);
+        u->Release();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("co-op: exception 0x%08x releasing DirectPlay in the background", GetExceptionCode());
+        return 0;
+    }
+    Log("co-op: DirectPlay released in the background (%lu ms the game no longer waits)", GetTickCount() - t0);
+    return 0;
+}
+
+ULONG __stdcall NetCloseReleaseHook(IUnknown* p) {  // in place of the Release call: same arguments, callee pops
+    HANDLE t = CreateThread(nullptr, 0, ReleaseDirectPlay, p, 0, nullptr);
+    if (t) {
+        CloseHandle(t);
+        return 0;
+    }
+    return p->Release();
+}
+
+bool PatchNetCloseRelease() {  // push eax; call NetCloseReleaseHook (6 bytes, as the original's)
+    uint8_t* p = reinterpret_cast<uint8_t*>(kNetCloseRelease);
+    if (memcmp(p, kNetCloseReleaseBytes, sizeof(kNetCloseReleaseBytes)) != 0) return false;
+    DWORD old;
+    if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old)) return false;
+    p[0] = 0x50;
+    p[1] = 0xe8;
+    *reinterpret_cast<int32_t*>(p + 2) =
+        static_cast<int32_t>(reinterpret_cast<uintptr_t>(&NetCloseReleaseHook) - (kNetCloseRelease + 6));
+    VirtualProtect(p, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 6);
+    return true;
 }
 
 bool PatchCall(uintptr_t site, uintptr_t expect_target, void* hook) {
@@ -887,7 +936,7 @@ void WaitPopupTick(uint8_t* w) {
     if (vt != 0x827ce8 && vt != 0x827ce0) return;
     static DWORD next = 0;
     if (GetTickCount() < next) return;
-    next = GetTickCount() + 1000;
+    next = GetTickCount() + kJoinPollMs;
     if (!g_have_received && g_host_lobby_open) g_have_received = FetchSave();
     if (g_have_received) {
         Log("co-op: the host's game is ready: closing the waiting message");
@@ -975,6 +1024,7 @@ void __fastcall MainMenuUpdateHook(void* self, void* /*edx*/) {
     } else if (settled && g_wait_popup_pending && PostToGameWindow(kWaitPopupMessage)) {
         g_wait_popup_pending = false;
         g_wait_popup_up = true;  // from now until the box closes: the box, not this menu, fetches and loads
+        Log("co-op: main menu: the waiting message goes up");
     } else if (settled && g_test.enabled && g_test.menu[0] && !g_menu_role_chosen && !menu_posted) {
         menu_posted = PostToGameWindow(kBotMultiplayerMessage);
     } else if (settled && !g_test_load_started && !g_load_screen_up) {
@@ -984,7 +1034,7 @@ void __fastcall MainMenuUpdateHook(void* self, void* /*edx*/) {
             if (g_wait_popup_up) {
                 // the waiting message fetches and loads
             } else if (!g_have_received && g_host_lobby_open && GetTickCount() >= next_fetch) {
-                next_fetch = GetTickCount() + 2000;
+                next_fetch = GetTickCount() + kJoinPollMs;
                 g_have_received = FetchSave();
             }
             if (g_have_received && !g_wait_popup_up) load = kReceivedName;  // the host's save, not our own choice
@@ -1505,7 +1555,7 @@ void __fastcall DummyUpdateHook(void* self, void* /*edx*/) {
         if (!g_joined && GetTickCount() >= g_next_join_try) {
             g_joined = JoinHost(client);
             if (g_joined) g_join_pending = false;
-            g_next_join_try = GetTickCount() + 2000;
+            g_next_join_try = GetTickCount() + kJoinPollMs;  // "0 session(s) found": the host's session shows a moment later
         }
         return;
     }
@@ -1759,6 +1809,7 @@ void Init() {
     Log("co-op: step gate hooks %s (the hold for a drift correction)", gate ? "ok" : "FAILED");
     bool tick = PatchJmp(kWindowTick, kWindowTickPrologue, sizeof(kWindowTickPrologue), (void*)&WindowTickHook);
     Log("co-op: frame hook %s, window-tick hook %s", frame ? "ok" : "FAILED", tick ? "ok" : "FAILED");
+    Log("co-op: network-close hook %s (DirectPlay released in the background)", PatchNetCloseRelease() ? "ok" : "FAILED");
     Log(PatchCall(kSpawnCallSite, kWorldSpawnPlayer, (void*)&SpawnPlayerHook)
             ? "spawn hook installed (campaign squad only for player 1)"
             : "spawn call site unexpected, spawn hook not installed");
