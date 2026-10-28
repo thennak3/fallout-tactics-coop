@@ -1115,6 +1115,7 @@ void __fastcall WindowTickHook(uint8_t* w) {
     }
     JoinerFollowHost(w);  // after the tick, so the window is not closed mid-update
     BotDriveMultiSetup(w);
+    WorldMapTick(w);  // worldmap_sync.inc
     if (g_test.enabled && g_test.menu_cancel && strstr(RttiName(w), "WSaveLoad@@")) {
         // The Load Game screen opened by Start Co-op: cancel it. The call that opened it returns to the menu, the
         // same way as leaving a session played inside it (0x4ca7b0 returned that way crashed, 2026-10-27).
@@ -1266,6 +1267,35 @@ void __fastcall WindowTickHook(uint8_t* w) {
     if (g_test.enabled && g_coop_host && _stricmp(g_test.scenario, "encounter") == 0 && strstr(RttiName(w), "WWorldWindow")) {
         static int ticks = 0;  // let the world map settle (about 2 s), then meet a random encounter
         if (++ticks == 60) BotWorldMapEncounter(w);
+    }
+    if (g_test.enabled && _stricmp(g_test.scenario, "worldmap") == 0) {
+        // The world map: the joiner tries to travel (refused), the host travels to open ground; both log their party
+        // (WMPOS) so the runner can see the joiner's follow the host's; once the host's has stopped, it picks a mission.
+        static uint8_t* campaign_window = nullptr;
+        if (*reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) campaign_window = w;
+        if (strstr(RttiName(w), "WWorldWindow@@")) {
+            static int ticks = 0, arrived = -1;
+            ++ticks;
+            uint8_t* camp = *reinterpret_cast<uint8_t**>(kCampaignPtr);
+            float* party = reinterpret_cast<float*>(camp + 0xa5);
+            if (ticks % 10 == 0) Log("WMPOS t=%d x=%.3f y=%.3f moving=%d", ticks, party[0], party[1], w[0x101]);
+            if (ticks == 30 && g_coop_join) {
+                float dest[2] = {party[0] - 40.0f, party[1] + 30.0f};
+                Log("bot: the joiner tries to travel on the world map to (%.1f, %.1f)", dest[0], dest[1]);
+                reinterpret_cast<void(__thiscall*)(void*, float*)>(0x6ba410)(w, dest);
+            }
+            if (ticks == 40 && g_coop_host) {
+                float dest[2] = {party[0] + 50.0f, party[1] + 20.0f};
+                Log("bot: WMAP the host travels to (%.1f, %.1f)", dest[0], dest[1]);
+                reinterpret_cast<void(__thiscall*)(void*, float*)>(0x6ba410)(w, dest);
+            }
+            if (g_coop_host && ticks > 45 && !w[0x101] && arrived < 0) {
+                arrived = ticks;
+                Log("bot: WMAP the host's party stopped at (%.3f, %.3f)", party[0], party[1]);
+            }
+            if (g_coop_host && arrived >= 0 && ticks == arrived + 90 && campaign_window)
+                BotWorldMapStartMission(campaign_window);
+        }
     }
     if (g_test.enabled && _stricmp(g_test.scenario, "exit") == 0 && *reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) {
         static int ticks = 0;  // the joiner tries first (refused), the host chooses a little later
@@ -1837,7 +1867,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             }
         }
         if ((session >= 2 && rel_s >= 200) || (session == 1 && rel_s >= 500)) BotFinish();
-    } else if (_stricmp(s, "transition") == 0 || _stricmp(s, "encounter") == 0) {
+    } else if (_stricmp(s, "transition") == 0 || _stricmp(s, "encounter") == 0 || _stricmp(s, "worldmap") == 0) {
         if (g_snap_tag == 1 && rel_s >= 60 && Once(0)) BotEndMission("World Map");
         if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();
     } else if (_stricmp(s, "dropin") == 0) {

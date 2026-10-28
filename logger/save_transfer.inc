@@ -276,7 +276,9 @@ void ServeOne(SOCKET c) {
     LeaveCriticalSection(&g_serve_lock);
     if (gen_req) {
         char line[300];
-        int n = sprintf_s(line, "GEN %ld %d %s\n", gen, g_lobby_open ? 1 : 0, name);
+        char wmap[96];
+        WorldMapLine(wmap, sizeof(wmap));  // the host's party on the world map, if it is there
+        int n = sprintf_s(line, "GEN %ld %d %s%s\n", gen, g_lobby_open ? 1 : 0, name, wmap);
         SendAll(c, line, n);
         return;
     }
@@ -474,6 +476,7 @@ DWORD WINAPI GenerationPoller(LPVOID) {
             long gen = 0;
             int lobby = 0;
             int got = sscanf_s(line, "GEN %ld %d", &gen, &lobby);
+            WorldMapFromHost(line);
             if (got >= 1 && gen > g_host_gen) {
                 InterlockedExchange(&g_host_gen, gen);
                 Log("join: host announced generation %ld (%s)", gen, line);

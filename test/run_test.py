@@ -52,6 +52,7 @@ TESTS = {
     "soak": ("soak", "host", 0),  # minimum computed from --soak-frames
     "fetch_save": ("move", "host", 7),  # joiner loads a different save; only the transfer can sync it
     "encounter": ("encounter", "host", 5),  # mission -> world map -> random encounter (mode 2); host re-syncs, joiner follows
+    "worldmap": ("worldmap", "host", 5),  # on the world map the host travels and the joiner watches; its own travel is refused
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
     "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
     "drift_host": ("drift", "host", 4),
@@ -749,14 +750,29 @@ def main():
               "join: following the host to generation 2 from the world map" in join)
         g2 = [k for k in shared if k[0] == 2]
         check("at least 4 shared snapshot frames in generation 2, all identical", len(g2) >= 4, f"{len(g2)} frames")
-    elif scenario in ("transition", "encounter"):
+    elif scenario in ("transition", "encounter", "worldmap"):
         check("both bots ended the mission (ActionEndMission -> World Map)",
               'bot: END MISSION -> "World Map"' in host and 'bot: END MISSION -> "World Map"' in join)
-        if scenario == "encounter":
+        if scenario == "worldmap":
+            check("the joiner's own travel on the world map was refused",
+                  "bot: the joiner tries to travel on the world map" in join
+                  and "refused this player's world map travel" in join)
+            check("the host's party travelled", "bot: WMAP the host travels to" in host)
+            check("the joiner saw the host's party travel", "co-op: world map: the host's party travels from" in join)
+            stop = re.search(r"bot: WMAP the host's party stopped at \(([-\d.]+), ([-\d.]+)\)", host)
+            jpos = [(float(a), float(b), int(c)) for a, b, c in re.findall(r"WMPOS t=\d+ x=([-\d.]+) y=([-\d.]+) moving=(\d)", join)]
+            hx, hy = (float(stop.group(1)), float(stop.group(2))) if stop else (None, None)
+            near = [p for p in jpos if stop and abs(p[0] - hx) < 0.01 and abs(p[1] - hy) < 0.01 and p[2] == 0]
+            check("the joiner's party stopped where the host's did", bool(near),
+                  f"host {hx},{hy}; joiner last {jpos[-1] if jpos else None}")
+            moved = jpos and stop and any(abs(p[0] - jpos[0][0]) > 1 for p in jpos)
+            check("the joiner's party moved on its map while the host's travelled", bool(moved))
+            check("host bot started a mission from the world map", "bot: WORLD MAP -> " in host)
+        elif scenario == "encounter":
             m = re.search(r"bot: ENCOUNTER dispatched \(mission mode now (\d+)\)", host)
             check("host met a random encounter on the world map (mission mode 2)", bool(m) and m.group(1) == "2",
                   m.group(0) if m else "no encounter line")
-        else:
+        elif scenario == "transition":
             check("host bot started a mission from the world map", "bot: WORLD MAP -> " in host)
         check("host's mission started alone and re-synced",
               "host: session without a load" in host and "host: re-sync (session started without a co-op lobby)" in host)

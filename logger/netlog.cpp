@@ -506,6 +506,7 @@ void* MakeFOTString(const char* s) {
     return str;
 }
 
+#include "worldmap_sync.inc"
 #include "save_transfer.inc"
 
 // Main thread, from the joiner's single-player lobby. Returns true once connected to the host.
@@ -1847,6 +1848,7 @@ void Init() {
         }
     }
     Log("co-op: world-map hook %s (only the host chooses where to go)", gotomap ? "ok" : "FAILED");
+    Log("co-op: world-map travel hooks %s (the host moves the party, the others watch)", InstallWorldMapHooks() ? "ok" : "FAILED");
     Log("co-op: actor-command hook %s (co-op commands, NPC locks)",
         PatchSlot(kActorActSlot, kActorAct, (void*)&ActorActHook, &g_actor_act) ? "ok" : "FAILED");
     InstallDots();
