@@ -122,7 +122,7 @@ Checked by the automated tests in `test/`:
 
 ## Build from source
 
-Needs the Visual Studio 2022 Build Tools (x86 C++). Run `logger\build.bat`; it writes `logger\netlog.dll`.
+Needs the Visual Studio 2022 Build Tools (x86 C++). Run `src\build.bat`; it writes `src\netlog.dll`.
 
 ## Tests
 

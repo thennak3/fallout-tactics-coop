@@ -1,6 +1,14 @@
-// netlog: research logger for Fallout Tactics (GOG 1.27 BOS.exe only).
-// Loaded from FTSE's init.lua via package.loadlib. Patches the receive slot of the Server and Client
-// vtables to log every session message, in single-player (NullNetwork) as well as multiplayer.
+// netlog.dll: campaign co-op for Fallout Tactics (GOG 1.27 BOS.exe only; the hash is checked before anything is
+// patched). Loaded by FTSE's ftse.lua (package.loadlib); patches the game in memory, never on disk. It started as a
+// research logger of the session messages (hence the name and netlog.txt), and still logs them.
+// One translation unit: this file holds the hooks, the menus and the lockstep plumbing, and includes
+//   save_transfer.inc  the host's file server: saves, deltas, joiner polls (generation, pings)
+//   worldmap_sync.inc  the world map: the host's party, travel, pings, fog
+//   bot_scenarios.inc  the test bots and snapshots (test mode), and private_sync.inc (conversations, trades,
+//                      recruits: snapshots and deltas) with settings_sync.inc and shop_sync.inc
+//   dots.inc           selection dots and ping drawing
+//   drift.inc          the drift check and its corrections
+//   recruit_sync.inc   the recruit screen on every copy
 // The key left of "1" writes a numbered marker to the log so actions can be matched to messages.
 #include <winsock2.h>
 #include <ws2tcpip.h>

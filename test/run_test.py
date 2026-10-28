@@ -36,7 +36,7 @@ HOST_DIR = os.path.join(ROOT, "test-install", "Fallout Tactics")
 JOIN_DIR = os.path.join(ROOT, "test-install-2", "Fallout Tactics")
 # --joiners 2 or 3: more joiner copies (4 players at most), windows in a 2x2 grid (ddraw.ini posX/posY).
 EXTRA_JOIN_DIRS = [os.path.join(ROOT, f"test-install-{n}", "Fallout Tactics") for n in (3, 4)]
-DLL = os.path.join(HERE, "..", "logger", "netlog.dll")
+DLL = os.path.join(HERE, "..", "src", "netlog.dll")
 RUNS = os.path.join(ROOT, "re", "test_runs")
 SAVE = "user/save/New Save Game.sav"
 OTHER_SAVE = "user/save/QuickSave.sav"  # differs from SAVE; the fetch_save joiner loads it
