@@ -92,6 +92,8 @@ Checked by the automated tests in `test/`:
   their own map.
 - Map pings: right-click the world map (a joiner can also left-click) to mark a spot with a flag in your colour.
   Everyone sees it for 10 seconds; it stays on that spot as the map scrolls.
+- Fog of war on the world map: everyone uncovers the same ground (joiners start from the host's save and follow
+  the host's party).
 - Turn-based combat, Individual and Squad, with 2 and 3 players. On the squad's turn every player can order the squad
   (in Individual mode, the character whose turn it is), and any player can press End Turn or switch turn-based off.
 - The host's game settings count for everyone: difficulty, turn-based mode, CTB speed, friendly fire, violence and
@@ -115,7 +117,6 @@ Checked by the automated tests in `test/`:
   message shows meanwhile.
 - A character who joins the squad through a story conversation (not the recruiter) still means a save and reload
   for everyone.
-- Fog of war on the world map isn't synced: ground the host explored while you weren't connected stays dark for you.
 - Played on two PCs on one home network; not tested over the internet yet.
 - Map pings use the right mouse button; that a real right click reaches the map that way is not yet tested.
 

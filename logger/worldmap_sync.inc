@@ -95,6 +95,35 @@ void WorldMapTick(uint8_t* w) {
     }
 }
 
+// ---- Fog of war on the world map ----
+// Campaign +0x1ad: a vector of columns, 16 bytes each (+4 begin, +8 end of the column's cells); a cell is 0x38 bytes,
+// its first int the fog state, 0 unseen to 2 seen (get 0x6a3c40(x, y), set 0x6a3d80(x, y, state), ECX = campaign;
+// 0x6a3e60 reveals around the party, radius 1 or 2 by campaign +0x20). Calls f(x, y, int* state) for every cell.
+template <typename F>
+int ForEachFogCell(uint8_t* camp, F f) {
+    uint8_t* cb = *reinterpret_cast<uint8_t**>(camp + 0x1ad);
+    uint8_t* ce = *reinterpret_cast<uint8_t**>(camp + 0x1b1);
+    if (!cb || ce <= cb) return 0;
+    int n = 0;
+    for (int x = 0; x < static_cast<int>((ce - cb) / 16); x++) {
+        uint8_t* b = *reinterpret_cast<uint8_t**>(cb + x * 16 + 4);
+        uint8_t* e = *reinterpret_cast<uint8_t**>(cb + x * 16 + 8);
+        if (!b || e <= b) continue;
+        for (int y = 0; y < static_cast<int>((e - b) / 0x38); y++, n++) f(x, y, reinterpret_cast<int*>(b + y * 0x38));
+    }
+    return n;
+}
+
+uint32_t FogHash(uint8_t* camp, int* seen) {
+    uint32_t h = 2166136261u;
+    *seen = 0;
+    ForEachFogCell(camp, [&](int, int, int* s) {
+        h = (h ^ static_cast<uint32_t>(*s)) * 16777619u;
+        if (*s) ++*seen;
+    });
+    return h;
+}
+
 // ---- Pings: "I want to go there" (owner, 2026-10-28) ----
 // Any player marks a spot on the world map (a right click; a joiner's left click too, since it can't travel); every
 // copy draws a marker there in that player's colour (the selection dots' colours: host red, then blue, yellow,

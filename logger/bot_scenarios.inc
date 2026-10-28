@@ -1315,14 +1315,18 @@ void __fastcall WindowTickHook(uint8_t* w) {
                 PostMessageA(g_pump_hwnd, WM_MOUSEMOVE, 0, MAKELPARAM((wr[0] + wr[2]) / 2, (wr[1] + wr[3]) / 2));
                 Log("bot: cursor parked mid-map at (%d, %d)", (wr[0] + wr[2]) / 2, (wr[1] + wr[3]) / 2);
             }
-            if (ticks % 10 == 0) Log("WMPOS t=%d x=%.3f y=%.3f moving=%d", ticks, party[0], party[1], w[0x101]);
+            if (ticks % 10 == 0) {
+                int seen = 0;
+                uint32_t fog = FogHash(camp, &seen);
+                Log("WMPOS t=%d x=%.3f y=%.3f moving=%d fog=%08x seen=%d", ticks, party[0], party[1], w[0x101], fog, seen);
+            }
             if (ticks == 30 && g_coop_join) {
                 float dest[2] = {party[0] - 40.0f, party[1] + 30.0f};
                 Log("bot: the joiner tries to travel on the world map to (%.1f, %.1f)", dest[0], dest[1]);
                 reinterpret_cast<void(__thiscall*)(void*, float*)>(0x6ba410)(w, dest);
             }
             if (ticks == 40 && g_coop_host) {
-                float dest[2] = {party[0] + 50.0f, party[1] + 20.0f};
+                float dest[2] = {party[0] + 250.0f, party[1] + 120.0f};  // far enough to uncover new ground
                 Log("bot: WMAP the host travels to (%.1f, %.1f)", dest[0], dest[1]);
                 reinterpret_cast<void(__thiscall*)(void*, float*)>(0x6ba410)(w, dest);
             }

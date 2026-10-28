@@ -774,6 +774,12 @@ def main():
                   f"host {ph.get('blue')}, joiner {pj.get('blue')}")
             check("the host's right click became a red ping on both maps", "red" in ph and ph.get("red") == pj.get("red"),
                   f"host {ph.get('red')}, joiner {pj.get('red')}")
+            fog = lambda log: [(h, int(n)) for h, n in re.findall(r"WMPOS t=\d+ .* fog=([0-9a-f]+) seen=(\d+)", log)]
+            fh, fj = fog(host), fog(join)
+            check("the host's trip uncovered new ground (fog)", len(fh) > 1 and fh[-1][1] > fh[0][1],
+                  f"seen {fh[0][1] if fh else None} -> {fh[-1][1] if fh else None}")
+            check("the joiner's fog of war ends the same as the host's", bool(fh and fj) and fh[-1] == fj[-1],
+                  f"host {fh[-1] if fh else None}, joiner {fj[-1] if fj else None}")
             # A real right button can't be checked here: the test windows sit in the background, and the game takes no
             # posted mouse input there (2026-10-28: a posted WM_RBUTTONDOWN never reached the map). Right = 2 is a guess.
             check("host bot started a mission from the world map", "bot: WORLD MAP -> " in host)
