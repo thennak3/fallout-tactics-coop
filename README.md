@@ -3,8 +3,8 @@
 Play the Fallout Tactics: Brotherhood of Steel single-player campaign with friends. 2 to 4 players
 share one squad: everyone can order every squad member, and the host's campaign is the one being played.
 
-**Status: work in progress.** It works in automated tests with several copies of the game on one PC, and has been
-played on two PCs on one home network. See [What works](#what-works) and [Known issues](#known-issues).
+**Status: beta.** The campaign is playable in co-op; expect bugs. Every feature is covered by automated tests with
+several copies of the game on one PC, and it has been played on two PCs on one home network. See [What works](#what-works) and [Known issues](#known-issues).
 
 ## 1. Check your game version
 
