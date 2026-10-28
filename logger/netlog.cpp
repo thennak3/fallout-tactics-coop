@@ -116,11 +116,13 @@ struct TestConfig {
     char menu[8];  // "host" or "join": choose the role through the Multiplayer menu instead of ftcoop.ini
     int index;     // joiner number (1-3) when several joiner copies run: simul orders squad member <index>
     int hold;      // dropin: frames to stay in the joined session (at least 400)
+    bool menu_cancel;  // after Start Co-op: open the Load Game screen as a person would, cancel it, then load as usual
 };
 TestConfig g_test = {};
 bool g_test_load_started = false;
 bool g_menu_role_chosen = false;  // the Multiplayer menu's Host or Join (co-op) was pressed
 bool g_open_load_after = false;       // main menu: open the Load Game screen (after Start Co-op)
+bool g_load_screen_up = false;        // that screen is open (a session played from it runs inside it too)
 char g_session_name[112] = "[Co-op]";  // host: the DirectPlay session's name, also the discovery reply
 void* MakeFOTString(const char* s);
 
@@ -506,7 +508,10 @@ int CountReadyPlayers(uint8_t* server) {
 const UINT kBotLoadMessage = WM_APP + 0x51;
 const UINT kBotMultiplayerMessage = WM_APP + 0x52;  // test: press the main menu's Multiplayer button
 const UINT kOpenLoadMessage = WM_APP + 0x53;        // after Start Co-op: open the Load Game screen
-const uintptr_t kSinglePlayerLoad = 0x4ca7b0;       // Single Player > Load: __fastcall(parent): dialog, then load
+const uintptr_t kSinglePlayerLoad = 0x4ca7b0;       // Single Player > Load: __thiscall(menu, int unused): dialog,
+                                                    // then load; it pops its int (ret 4): called without one, our
+                                                    // frame was 4 bytes off and leaving a session to the menu
+                                                    // failed the stack check (crash 0xc0000409, 2026-10-27)
 const uintptr_t kPumpHandlerCall = 0x7849cc;
 const uintptr_t kPumpHandler = 0x7857f0;
 const uintptr_t kMainMenuMultiplayer = 0x6c0c10;  // the Multiplayer button: __thiscall(menu, 1), ret 4 (via 0x6c1ba0)
@@ -915,7 +920,9 @@ uint32_t __fastcall PumpHandlerHook(void* app, void* /*edx*/, HWND hwnd, UINT ms
     }
     if (msg == kOpenLoadMessage && g_main_menu) {
         Log("co-op: opening the Load Game screen for the co-op host");
-        reinterpret_cast<void(__fastcall*)(void*)>(kSinglePlayerLoad)(g_main_menu);
+        g_load_screen_up = true;  // the menu still ticks under it: no bot load meanwhile
+        reinterpret_cast<void(__thiscall*)(void*, int)>(kSinglePlayerLoad)(g_main_menu, 0);
+        g_load_screen_up = false;
         Log("co-op: back on the main menu after the Load Game screen");
         return 0;
     }
@@ -969,7 +976,7 @@ void __fastcall MainMenuUpdateHook(void* self, void* /*edx*/) {
         g_wait_popup_up = true;  // from now until the box closes: the box, not this menu, fetches and loads
     } else if (settled && g_test.enabled && g_test.menu[0] && !g_menu_role_chosen && !menu_posted) {
         menu_posted = PostToGameWindow(kBotMultiplayerMessage);
-    } else if (settled && !g_test_load_started) {
+    } else if (settled && !g_test_load_started && !g_load_screen_up) {
         const char* load = nullptr;
         if (g_coop_join && g_fetch_save) {  // a joiner only ever loads the host's save
             static DWORD next_fetch = 0;
@@ -1086,7 +1093,7 @@ const uintptr_t kOperatorNew = 0x6c4dd0;         // void* __cdecl(size)
 const uintptr_t kMakeCallback = 0x4ac1d0;        // void* __thiscall(owner, storage*, handler, 0), ret 0xc
 const uintptr_t kUnregisterCallback = 0x6c7d40;  // void __thiscall(owner, storage*): drop a callback from the owner list
 const uintptr_t kButtonCtor = 0x65bcb0;          // __thiscall(button, parent, int pos[2], callback, FOTString*, style), ret 0x14
-const uintptr_t kLoadGameButton = 0x4ca7b0;      // Single Player > Load: __fastcall(parent window): dialog, then load
+const uintptr_t kLoadGameButton = 0x4ca7b0;      // Single Player > Load: __thiscall(menu, int unused), ret 4: dialog, then load
 const size_t kMultiSetupIp = 0x135, kMultiSetupName = 0x139, kMultiSetupClient = 0x100, kMultiSetupList = 0x125;
 const char kCoopPrefix[] = "[Co-op]";
 const size_t kSessionRecordName = 8;
@@ -1375,7 +1382,7 @@ void __fastcall StartCoopButton(uint8_t* w, void* /*edx*/, int /*arg*/) {
     BecomeHost();
     g_menu_role_chosen = true;
     // The test bot loads its own save from the main menu instead (not in watch mode, where a person plays).
-    g_open_load_after = !g_test.enabled || _stricmp(g_test.scenario, "watch") == 0;
+    g_open_load_after = !g_test.enabled || _stricmp(g_test.scenario, "watch") == 0 || g_test.menu_cancel;
     CloseMultiSetup(w);
 }
 
@@ -1847,6 +1854,7 @@ void Init() {
         GetPrivateProfileStringA("test", "menu", "", g_test.menu, sizeof(g_test.menu), ".\\ftcoop.ini");
         g_test.index = GetPrivateProfileIntA("test", "index", 1, ".\\ftcoop.ini");
         g_test.hold = GetPrivateProfileIntA("test", "hold", 0, ".\\ftcoop.ini");
+        g_test.menu_cancel = GetPrivateProfileIntA("test", "menu_cancel", 0, ".\\ftcoop.ini") != 0;
         Log("bot: TEST MODE save=\"%s\" actor=%s joiners=%d timeout=%ds scenario=%s menu=%s", g_test.save, g_test.actor,
             g_test.joiners, g_test.timeout_s, g_test.scenario, g_test.menu[0] ? g_test.menu : "-");
         CreateThread(nullptr, 0, TestWatchdog, nullptr, 0, nullptr);

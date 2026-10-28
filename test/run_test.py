@@ -94,6 +94,7 @@ HOST_IP = "127.0.0.1"  # --host-ip: the address joiners connect to (this PC's LA
 FORCE_FILE_SERVER = False  # set in main: trades with more than one joiner use the file-server path
 ENTITY_LOG = False  # --entity-log: every entity made or destroyed, with the code that did it
 CHAOS_NO_SELECT = False  # --chaos-no-select: the chaos bots never change their selection
+MENU_CANCEL = False  # --menu-cancel: the host cancels the Load Game screen Start Co-op opens (the call returns to the menu)
 SHOP_NO_PAUSE = True  # a shop pauses nobody (the default); --shop-pause: the old held conversation
 DROPIN_DELAY_S = 10  # dropin: start the joiner this long after the host, so the host is already playing
 
@@ -119,6 +120,8 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
         f.write(f"index={index}\nhold={hold}\n")
         if ENTITY_LOG:
             f.write("entity_log=1\n")
+        if MENU_CANCEL and menu and mode == "host":
+            f.write("menu_cancel=1\n")
         if CHAOS_NO_SELECT:
             f.write("chaos_select=0\n")
 
@@ -186,9 +189,11 @@ def main():
     ap.add_argument("--inline-delta", action="store_true", help="3-4 player trades: send the deal through lockstep, not the file server")
     ap.add_argument("--shop-pause", action="store_true", help="the old way: a shop holds every copy while it is open")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
+    ap.add_argument("--menu-cancel", action="store_true", help="menu tests: the host opens Load Game from Start Co-op, cancels it, then loads")
     ap.add_argument("--save", default=None, help="save both copies start from (default New Save Game.sav)")
     args = ap.parse_args()
-    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE, ENTITY_LOG, CHAOS_NO_SELECT
+    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE, ENTITY_LOG, CHAOS_NO_SELECT, MENU_CANCEL
+    MENU_CANCEL = args.menu_cancel
     HOST_IP = args.host_ip
     SHOP_NO_PAUSE = not args.shop_pause
     ENTITY_LOG = args.entity_log
@@ -338,6 +343,10 @@ def main():
     if menu:
         check("Start Co-op button added to the Multiplayer screen", "menu: Start Co-op button added" in host)
         check("host pressed Start Co-op", "menu: Multiplayer > Start Co-op" in host and "co-op mode at start: off" in host)
+        if MENU_CANCEL:
+            check("host cancelled the Load Game screen Start Co-op opened", "bot: cancelling the Load Game screen" in host)
+            check("host came back to the main menu from it, alive",
+                  "co-op: back on the main menu after the Load Game screen" in host and 'posting the load of' in host)
         check("host's DirectPlay session is named [Co-op] <name>", re.search(r'session "\[Co-op\] [^"]+", DPTCPNetwork', host) is not None)
         check("joiner's session list showed the host's co-op session", 'bot: the session list shows "[Co-op]' in join)
         m = re.search(r'session "(\[Co-op\][^"]*)", DPTCPNetwork', host)

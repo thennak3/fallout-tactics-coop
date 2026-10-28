@@ -1079,6 +1079,18 @@ void __fastcall WindowTickHook(uint8_t* w) {
     }
     JoinerFollowHost(w);  // after the tick, so the window is not closed mid-update
     BotDriveMultiSetup(w);
+    if (g_test.enabled && g_test.menu_cancel && strstr(RttiName(w), "WSaveLoad@@")) {
+        // The Load Game screen opened by Start Co-op: cancel it. The call that opened it returns to the menu, the
+        // same way as leaving a session played inside it (0x4ca7b0 returned that way crashed, 2026-10-27).
+        static DWORD opened = 0;
+        static bool cancelled = false;
+        if (!opened) opened = GetTickCount();
+        if (!cancelled && GetTickCount() - opened > 1500) {
+            cancelled = true;
+            Log("bot: cancelling the Load Game screen");
+            reinterpret_cast<void(__thiscall*)(void*, int)>((*reinterpret_cast<void***>(w))[0x34 / 4])(w, 0);
+        }
+    }
     WaitPopupTick(w);
     PrivateScreenTick(w);
     if ((g_coop_host || g_coop_join) && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {

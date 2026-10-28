@@ -32,7 +32,8 @@ char g_drift_reason[96] = "";  // host: set by the file server thread, acted on 
 uint8_t g_drift_kinds = 0;     // host: what differed (kDrift*), with the reason
 const DWORD kDriftFixWindowMs = 10000;  // a drift back within this of a correction: a reload
 DWORD g_drift_fix_tick = 0;  // the last correction
-int g_drift_fix_frame = 0;   // comparisons start again after this frame
+int g_drift_fix_frame = 0;   // comparisons start again after this frame, in this generation (every load restarts
+long g_drift_fix_gen = -1;   // the frame count: kept across loads, one correction stopped every later comparison)
 DWORD g_drift_last_resync = 0;
 const DWORD kLockBlocksResyncMs = 120000;  // an NPC lock this old holds up no re-sync (a held host still does)
 void StartWorldFix(uint8_t* world, uint8_t kinds);
@@ -134,7 +135,10 @@ void KindsText(uint8_t k, char* out, size_t cap) {
 void DriftFromJoiner(unsigned id, const char* name, const char* p) {
     struct Seen {
         unsigned id;
+        long gen;  // last_frame belongs to this generation (a load restarts the frame count)
         int last_frame, misses;
+        int same;    // matching checks since the last "matches" line (a silent check looks like none)
+        DWORD said;
         uint8_t kinds;
     };
     static Seen seen[8] = {};
@@ -152,7 +156,9 @@ void DriftFromJoiner(unsigned id, const char* name, const char* p) {
     DriftRec j = {};
     while (sscanf_s(p, "%ld:%d:%x:%x:%x:%x:%x,%n", &gen, &frame, &j.pos, &j.table, &j.used, &j.inv, &j.attr, &used) == 7) {
         p += used;
-        if (frame <= s->last_frame || gen != g_serve_gen || frame <= g_drift_fix_frame) continue;
+        if (gen != g_serve_gen || (gen == g_drift_fix_gen && frame <= g_drift_fix_frame)) continue;
+        if (s->gen != gen) s->gen = gen, s->last_frame = 0, s->misses = 0, s->kinds = 0;
+        if (frame <= s->last_frame) continue;
         bool mine = false;
         DriftRec m = {};
         AcquireSRWLockShared(&g_drift_lock);
@@ -170,6 +176,13 @@ void DriftFromJoiner(unsigned id, const char* name, const char* p) {
         if (!k) {
             s->misses = 0;
             s->kinds = 0;
+            s->same++;
+            if (GetTickCount() - s->said >= 60000) {
+                Log("co-op: drift: %s's game matches ours (%d checks, last at frame %d, generation %ld)", name, s->same,
+                    frame, gen);
+                s->same = 0;
+                s->said = GetTickCount();
+            }
             continue;
         }
         char what[96];
@@ -262,6 +275,7 @@ void ReleaseFixHold(const char* why) {
     if (!g_fix_hold) return;
     g_fix_hold = false;
     g_drift_fix_frame = g_fix_frame + 1;  // the hashes made before it: not compared again
+    g_drift_fix_gen = g_coop_host ? static_cast<long>(g_serve_gen) : g_loaded_gen;
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     if (world) *reinterpret_cast<float*>(world + 0x2e7) = *reinterpret_cast<float*>(world + 0x2f7);  // no frames owed
     Log("co-op: drift: going on (%s, held %lu ms)", why, GetTickCount() - g_fix_since);
