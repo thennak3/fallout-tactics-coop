@@ -15,6 +15,7 @@
 //       free list pointed at the talker's slot first, so the entity lands in the same slot;
 //   'N' slot count: a stack's count (Collectable +0x1ad);
 //   'I' owner n {slot, seq}: an Actor's inventory list, in order (Inventory entity +0x1a9 list, +0x1ad count);
+//   'T' count: the entity table grew to count slots on the talker's copy, the game's way (GrowTable), first;
 //   'G' actor 3 x {seq, slot} hand: an Actor's two hands and armour (+0x100e) and its active hand (+0x1029);
 //   'Q' n {slot, seq}: the squad (players[1] +0x4b list);
 //   'H' slot hp: an Actor's HP;
@@ -50,7 +51,7 @@ bool g_applying_at_frame = false;  // ApplyDelta from a delta at its frame: no s
 enum { kDiffNone = 0, kDiffApplied = 1, kDiffFull = 2 };
 const size_t kWorldFreeHead = 0x74f;
 const uintptr_t kEntitySerial = 0x8be148;
-const int kMaxSlots = 8192;
+const int kMaxSlots = 65536;  // every u16 id (the game's growth tops out at 64000)
 const int kChunk = 22;        // payload bytes per chunk command ([5..26]; chunks arrive in order on one stream)
 const int kMaxChunks = 800;   // the game allows 1000 commands in one tick (0x63bc10, commands.cpp line 22)
 int g_recreate_recruits = 0;  // [coop] recreate_recruits: experimental, see PrivateScreensDiff
@@ -199,6 +200,61 @@ uint32_t HashSquad(uint8_t* world) {
     uint16_t squad[16];
     int n = GetSquad(world, squad, 16);
     return Fnv(Fnv(2166136261u, &n, sizeof(n)), squad, n * sizeof(uint16_t));
+}
+
+// ---- The entity table growing (0x4e50c0, the game's entity allocation) ----
+// With the free list empty (head 0) the game grows the table to max(1000, 2 * size) (vector insert 0x4e7ed0) and
+// chains the new slots N..2N-1 in order: head N, slot i -> i + 1, the last -> 0, each with the dummy entity and seq 0.
+// Your private screen may be open when that happens (the owner's character screen, 2026-10-27: 2000 -> 4000 slots);
+// the delta then says so ('T') and every copy grows the same way, instead of a save and reload.
+int NextTableSize(int n) { return n * 2 > 999 ? n * 2 : 1000; }
+
+bool GrownBySteps(int from, int to) {  // `to` is where the game's own growth from `from` lands
+    for (int n = from; n < to && n > 0;) {
+        n = NextTableSize(n);
+        if (n == to) return true;
+    }
+    return false;
+}
+
+void ExtendAsGrown(SlotState* s, int from, int to) {  // the slots a growth from `from` to `to` made, as made
+    for (int n = from; n < to;) {
+        int m = NextTableSize(n);
+        for (int i = n; i < m && i < kMaxSlots; i++) s[i] = {false, static_cast<int16_t>(i + 1 < m ? i + 1 : 0), 0};
+        n = m;
+    }
+}
+
+// Grows this copy's table to `to` with the game's own code: the free head set to 0 so the allocation grows it, then
+// the slot it handed out given back, and the head as it was (the delta's 'B' writes the bookkeeping after this).
+bool GrowTable(uint8_t* world, int to) {
+    uint16_t* head = reinterpret_cast<uint16_t*>(world + kWorldFreeHead);
+    while (EntityCount(world) < to) {
+        int n = EntityCount(world);
+        uint16_t was = *head;
+        uint8_t fake[8] = {};  // the allocation writes the slot at +4 and the entry's pointer to this
+        *head = 0;
+        __try {
+            reinterpret_cast<void(__thiscall*)(void*, void*)>(0x4e50c0)(world, fake);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            *head = was;
+            Log("co-op: exception 0x%08x growing the entity table", GetExceptionCode());
+            return false;
+        }
+        uint8_t* e = Entries(world);
+        uint16_t got = *reinterpret_cast<uint16_t*>(fake + 4);
+        if (EntityCount(world) != NextTableSize(n) || got != n) {
+            Log("co-op: the entity table grew to %d (slot %u handed out), not as the game does", EntityCount(world), got);
+            *head = was;
+            return false;
+        }
+        *reinterpret_cast<void**>(e + got * 8) = *reinterpret_cast<void**>(e);  // the dummy again
+        *reinterpret_cast<int16_t*>(e + got * 8 + 4) = static_cast<int16_t>(got + 1);
+        *reinterpret_cast<int16_t*>(e + got * 8 + 6) = 0;
+        *head = was;
+        Log("co-op: entity table grown here %d -> %d slots, as the game grows it", n, EntityCount(world));
+    }
+    return EntityCount(world) == to;
 }
 
 void ReadSlots(uint8_t* world, SlotState* out, int* count) {
@@ -552,10 +608,17 @@ int PrivateScreensDiff() {
             int n = ShopDealDiff(w, world, now, count);
             w.U8('E');
             result = n || nvars ? kDiffApplied : kDiffNone;
-        } else if (var_fail || count != g_snap_count) {
+        } else if (var_fail || (count != g_snap_count && !GrownBySteps(g_snap_count, count))) {
             Log("co-op: private screens changed %s: full re-sync", var_fail ? var_fail : "the entity table size");
             result = kDiffFull;
         } else {
+            if (count != g_snap_count) {  // grown as the game grows it: the others grow theirs first
+                Log("co-op: the entity table grew %d -> %d slots while the screens were open: in the delta", g_snap_count, count);
+                ExtendAsGrown(g_snap_slots, g_snap_count, count);
+                g_snap_count = count;
+                w.U8('T');
+                w.U32(static_cast<uint32_t>(count));
+            }
             // A destroy is deferred: DestructEntity (vtable slot 10) sets +0x141 and the entity leaves its slot during
             // the next frame (its next_free and seq stay). Such an entity counts as gone here, and its slot goes into the
             // bookkeeping, so the copies agree once the destroys have finished (recruit: a dismissed member's gear was
@@ -1385,6 +1448,13 @@ void ApplyDelta(const uint8_t* data, int len) {
             RewriteIdList(*reinterpret_cast<uint8_t**>(invent + kInventoryList), slots, seqs, n);
             *reinterpret_cast<int*>(invent + 0x1ad) = n;
             invs++;
+        } else if (op == 'T') {
+            int to = static_cast<int>(r.U32());
+            if (EntityCount(world) == to) {
+            } else if (EntityCount(world) > to || !GrownBySteps(EntityCount(world), to) || !GrowTable(world, to)) {
+                Log("co-op: entity table: %d slots here, the talker's %d: cannot grow to it", EntityCount(world), to);
+                conflicts++;
+            }
         } else if (op == 'G') {
             uint16_t id = r.U16();
             uint8_t gear[13];

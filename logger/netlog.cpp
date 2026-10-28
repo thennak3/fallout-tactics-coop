@@ -118,6 +118,7 @@ struct TestConfig {
     int hold;      // dropin: frames to stay in the joined session (at least 400)
     bool menu_cancel;  // after Start Co-op: open the Load Game screen as a person would, cancel it, then load as usual
     bool inv_chaos;    // trade scenarios: the copy that doesn't trade gives and equips at random meanwhile
+    bool grow_table;   // talk scenarios: the talker's entity table grows while its conversation is open
 };
 TestConfig g_test = {};
 bool g_test_load_started = false;
@@ -1909,6 +1910,7 @@ void Init() {
         g_test.hold = GetPrivateProfileIntA("test", "hold", 0, ".\\ftcoop.ini");
         g_test.menu_cancel = GetPrivateProfileIntA("test", "menu_cancel", 0, ".\\ftcoop.ini") != 0;
         g_test.inv_chaos = GetPrivateProfileIntA("test", "inv_chaos", 0, ".\\ftcoop.ini") != 0;
+        g_test.grow_table = GetPrivateProfileIntA("test", "grow_table", 0, ".\\ftcoop.ini") != 0;
         Log("bot: TEST MODE save=\"%s\" actor=%s joiners=%d timeout=%ds scenario=%s menu=%s", g_test.save, g_test.actor,
             g_test.joiners, g_test.timeout_s, g_test.scenario, g_test.menu[0] ? g_test.menu : "-");
         CreateThread(nullptr, 0, TestWatchdog, nullptr, 0, nullptr);

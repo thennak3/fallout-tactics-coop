@@ -317,21 +317,21 @@ void ApplyFreeOrder(uint8_t* world, const uint8_t* p, int n, uint32_t serial, ui
     uint8_t* e = Entries(world);
     void* dummy = *reinterpret_cast<void**>(e);
     int count = EntityCount(world);
-    static uint16_t order[8192];
-    static uint8_t placed[8192];
+    static uint16_t order[65536];
+    static uint8_t placed[65536];
     int k = 0;
     memset(placed, 0, sizeof(placed));
     for (int i = 0; i < n; i++) {
         uint16_t slot, seq;
         memcpy(&slot, p + i * 4, 2);
         memcpy(&seq, p + i * 4 + 2, 2);
-        if (slot >= count || slot >= 8192 || placed[slot] || !SlotFree(e, dummy, slot)) continue;
+        if (slot >= count || slot >= 65536 || placed[slot] || !SlotFree(e, dummy, slot)) continue;
         *reinterpret_cast<uint16_t*>(e + slot * 8 + 6) = seq;
         placed[slot] = 1;
         order[k++] = slot;
     }
     int extra = 0;
-    for (int i = 1; i < count && i < 8192; i++)
+    for (int i = 1; i < count && i < 65536; i++)
         if (!placed[i] && SlotFree(e, dummy, i)) {
             order[k++] = static_cast<uint16_t>(i);
             extra++;
@@ -394,9 +394,9 @@ void SendWorldFix(uint8_t* world, uint8_t kinds) {
     }
     int frees = 0;
     if (kinds & kDriftTable) {
-        static uint16_t slots[8192], seqs[8192];
+        static uint16_t slots[65536], seqs[65536];
         uint16_t term;
-        frees = ReadFreeOrder(world, slots, seqs, 8192, &term);
+        frees = ReadFreeOrder(world, slots, seqs, 65536, &term);
         w.U8('F');
         w.U16(static_cast<uint16_t>(frees));
         w.U32(*reinterpret_cast<uint32_t*>(kEntitySerial));

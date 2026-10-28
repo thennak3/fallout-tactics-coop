@@ -947,8 +947,26 @@ void BotLocalChange(uint8_t* world) {  // stands in for a trade: a change only t
 
 // Talk scenario, from the open conversation's window tick (no game frames run meanwhile): change this copy's game
 // once, then end the conversation 60 ticks later.
+bool GrowTable(uint8_t* world, int to);  // private_sync.inc
+int NextTableSize(int n);
+
 void BotSpeechTick(uint8_t* w) {
     static int ticks = 0;
+    if (ticks == 0 && g_test.grow_table) {
+        // [test] grow_table: the entity table grows while this conversation is open, the way it does once the free
+        // list runs out (the game's allocation, 0x4e50c0), and the free list goes on from the new slots as it would
+        // then; the others must grow theirs from the delta ('T'), not reload.
+        uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+        int n = EntityCount(world), m = NextTableSize(n);
+        uint16_t* head = reinterpret_cast<uint16_t*>(world + 0x74f);
+        uint16_t old_head = *head;
+        if (GrowTable(world, m)) {
+            *reinterpret_cast<int16_t*>(Entries(world) + (m - 1) * 8 + 4) = static_cast<int16_t>(old_head);
+            *head = static_cast<uint16_t>(n);
+            Log("bot: GROW the entity table %d -> %d during the conversation; free list from %d, then the old %u", n, m, n,
+                old_head);
+        }
+    }
     if (ticks == 0) {
         g_bot_done_step[1] = true;
         extern bool g_my_conv_light;

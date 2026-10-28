@@ -95,6 +95,7 @@ HOST_IP = "127.0.0.1"  # --host-ip: the address joiners connect to (this PC's LA
 FORCE_FILE_SERVER = False  # set in main: trades with more than one joiner use the file-server path
 ENTITY_LOG = False  # --entity-log: every entity made or destroyed, with the code that did it
 CHAOS_NO_SELECT = False  # --chaos-no-select: the chaos bots never change their selection
+GROW_TABLE = False  # --grow-table: talks: the talker's entity table grows while its conversation is open
 INV_CHAOS = False  # --inv-chaos: trades: the copy that doesn't trade gives and equips at random meanwhile
 MENU_CANCEL = False  # --menu-cancel: the host cancels the Load Game screen Start Co-op opens (the call returns to the menu)
 SHOP_NO_PAUSE = True  # a shop pauses nobody (the default); --shop-pause: the old held conversation
@@ -124,6 +125,8 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
             f.write("entity_log=1\n")
         if INV_CHAOS:
             f.write("inv_chaos=1\n")
+        if GROW_TABLE:
+            f.write("grow_table=1\n")
         if MENU_CANCEL and menu and mode == "host":
             f.write("menu_cancel=1\n")
         if CHAOS_NO_SELECT:
@@ -193,13 +196,15 @@ def main():
     ap.add_argument("--inline-delta", action="store_true", help="3-4 player trades: send the deal through lockstep, not the file server")
     ap.add_argument("--shop-pause", action="store_true", help="the old way: a shop holds every copy while it is open")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
+    ap.add_argument("--grow-table", action="store_true", help="talks: the talker's entity table grows mid-conversation; no reload")
     ap.add_argument("--inv-chaos", action="store_true", help="trades: the other copy gives, equips and unequips at random meanwhile")
     ap.add_argument("--menu-cancel", action="store_true", help="menu tests: the host opens Load Game from Start Co-op, cancels it, then loads")
     ap.add_argument("--save", default=None, help="save both copies start from (default New Save Game.sav)")
     args = ap.parse_args()
-    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE, ENTITY_LOG, CHAOS_NO_SELECT, MENU_CANCEL, INV_CHAOS
+    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE, ENTITY_LOG, CHAOS_NO_SELECT, MENU_CANCEL, INV_CHAOS, GROW_TABLE
     MENU_CANCEL = args.menu_cancel
     INV_CHAOS = args.inv_chaos
+    GROW_TABLE = args.grow_table
     HOST_IP = args.host_ip
     SHOP_NO_PAUSE = not args.shop_pause
     ENTITY_LOG = args.entity_log
