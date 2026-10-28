@@ -48,6 +48,11 @@ bool g_load_pending = false;        // host: a load is under way (its session lo
 bool g_file_server_started = false;
 volatile LONG g_lobby_open = 0;     // host: a co-op lobby is holding the start (answered in GEN)
 DWORD g_session_start_tick = 0;     // host: GetTickCount() at the current session's start (0xce)
+// The host's game settings as " SET ..." (settings_sync.inc): the host's GEN replies carry them, so a joiner has them
+// from its first frame, before the in-game record acts. Joiner: the host's last reply.
+SRWLOCK g_settings_line_lock = SRWLOCK_INIT;
+char g_settings_line[96] = "";
+void HostSettingsLine(char* out, size_t size);  // settings_sync.inc
 
 // Host: joiners known from their GEN polls. Live = polled in the last kJoinerTimeoutMs. Each poll reports what
 // the joiner is doing: 'W' waiting at the main menu for a lobby, 'L' loading or in its lobby, 'P' playing; and the
@@ -293,7 +298,9 @@ void ServeOne(SOCKET c) {
         char line[700];
         char wmap[300];
         WorldMapLine(wmap, sizeof(wmap));  // the host's party on the world map, if it is there
-        int n = sprintf_s(line, "GEN %ld %d %s%s\n", gen, g_lobby_open ? 1 : 0, name, wmap);
+        char set[96];
+        HostSettingsLine(set, sizeof(set));
+        int n = sprintf_s(line, "GEN %ld %d %s%s%s\n", gen, g_lobby_open ? 1 : 0, name, wmap, set);
         SendAll(c, line, n);
         return;
     }
@@ -517,6 +524,13 @@ DWORD WINAPI GenerationPoller(LPVOID) {
             int lobby = 0;
             int got = sscanf_s(line, "GEN %ld %d", &gen, &lobby);
             WorldMapFromHost(line);
+            const char* set = nullptr;  // the last one: the save's name comes before it and may hold anything
+            for (const char* q = line; (q = strstr(q, " SET ")) != nullptr; q++) set = q;
+            if (set) {
+                AcquireSRWLockExclusive(&g_settings_line_lock);
+                strncpy_s(g_settings_line, set, strcspn(set, "\r\n"));
+                ReleaseSRWLockExclusive(&g_settings_line_lock);
+            }
             if (got >= 1 && gen > g_host_gen) {
                 InterlockedExchange(&g_host_gen, gen);
                 Log("join: host announced generation %ld (%s)", gen, line);

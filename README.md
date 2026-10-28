@@ -101,7 +101,8 @@ Checked by the automated tests in `test/`:
   (in Individual mode, the character whose turn it is), and any player can press End Turn or switch turn-based off.
 - The host's game settings count for everyone: difficulty, turn-based mode, CTB speed, friendly fire, violence and
   fast turn-based come from the host's options. Changing them on another player's PC has no effect while you play
-  together.
+  together. (In 0.10.1 and earlier, a joiner's own turn-based option counted for the first frames of a session,
+  which could split the games from the start.)
 - Random encounters on the world map: the host's game rolls and enters them, and the others follow into the
   encounter.
 - Long fights with every player acting at once (moving, swapping characters, giving items, opening containers): the

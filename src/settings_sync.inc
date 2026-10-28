@@ -8,6 +8,12 @@
 // a co-op record (kGameSettings) and act on every copy at the same frame; every frame after that, every copy puts the
 // last values back, so a player's own options change nothing until the host's copy sends them. The host sends
 // whenever its own values change (its options screen writes them) and at the start of every session (a late joiner).
+// The record acts a few frames into a session, and those frames were enough: a joiner set to Individual started a
+// turn-based round at frame 41 that the host never had (host_move --joiner-turnbased 1, frame 39 to 41). So the host's
+// GEN replies carry the values too (" SET ...", save_transfer.inc), and a joiner puts them in from its first frame.
+// The host answers from the game's options record 0x8bd998 (same layout as the World's copy; StandardApplication
+// 0x6c4180 loads bos.cfg into it with 0x650550 before the menu), so the line is there before any session exists.
+const uintptr_t kOptions = 0x8bd998;
 const size_t kWorldSettings = 0x749;
 
 struct GameSettings {
@@ -17,8 +23,7 @@ struct GameSettings {
     uint8_t fast_tb;
 };
 
-GameSettings ReadSettings(const uint8_t* world) {
-    const uint8_t* g = world + kWorldSettings;
+GameSettings ReadSettingsAt(const uint8_t* g) {
     GameSettings s;
     s.difficulty = *reinterpret_cast<const int32_t*>(g + 0x30);
     s.opponent_offset = *reinterpret_cast<const int32_t*>(g + 0x34);
@@ -29,6 +34,14 @@ GameSettings ReadSettings(const uint8_t* world) {
     s.violence = *reinterpret_cast<const int32_t*>(g + 0x68);
     s.fast_tb = g[0x7f];
     return s;
+}
+
+GameSettings ReadSettings(const uint8_t* world) { return ReadSettingsAt(world + kWorldSettings); }
+
+void HostSettingsLine(char* out, size_t size) {  // file server thread: the host's own options, as its GEN reply ends
+    GameSettings s = ReadSettingsAt(reinterpret_cast<const uint8_t*>(kOptions));
+    sprintf_s(out, size, " SET %d %d %.9g %.9g %d %d %d %d", s.difficulty, s.opponent_offset, s.ctb_speed,
+              s.friendly_fire, s.tb_single, s.tb_multi, s.violence, s.fast_tb);
 }
 
 void WriteSettings(uint8_t* world, const GameSettings& s) {
@@ -110,5 +123,22 @@ void SettingsFrame(uint8_t* world) {  // FrameTickHook, before the world step
         if (g_have_settings) WriteSettings(world, g_settings);  // a change of its own acts with its record, as everyone's
         return;
     }
-    if (g_have_settings) WriteSettings(world, g_settings);
+    if (g_have_settings) {
+        WriteSettings(world, g_settings);
+        return;
+    }
+    // Before the host's first record: the values from its GEN replies.
+    char line[96];
+    AcquireSRWLockShared(&g_settings_line_lock);
+    strcpy_s(line, g_settings_line);
+    ReleaseSRWLockShared(&g_settings_line_lock);
+    GameSettings s;
+    int fast_tb = 0;
+    if (sscanf_s(line, " SET %d %d %f %f %d %d %d %d", &s.difficulty, &s.opponent_offset, &s.ctb_speed,
+                 &s.friendly_fire, &s.tb_single, &s.tb_multi, &s.violence, &fast_tb) != 8) return;
+    s.fast_tb = static_cast<uint8_t>(fast_tb);
+    GameSettings mine = ReadSettings(world);
+    if (SameSettings(mine, s)) return;
+    LogSettings("ours, replaced by the host's from its lobby", mine);
+    WriteSettings(world, s);
 }
