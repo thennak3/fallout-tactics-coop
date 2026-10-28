@@ -1337,12 +1337,12 @@ void __fastcall WindowTickHook(uint8_t* w) {
             if (ticks == 50 && g_coop_join) {
                 int pt[2] = {150, 120};
                 Log("bot: PING the joiner clicks its map at (150, 120)");
-                mouse(w, pt, 1, 0);
+                mouse(w, pt, 0x00a1b201, 0);  // the button in the low byte only, as the game's input passes it
             }
             if (ticks == 55 && g_coop_host) {
                 int pt[2] = {300, 200};
                 Log("bot: PING the host right-clicks its map at (300, 200)");
-                mouse(w, pt, 2, 0);
+                mouse(w, pt, 0x7f3a5c02, 0);
             }
             static DWORD pinged_at = 0;
             if (ticks == 50) pinged_at = GetTickCount();
@@ -1599,6 +1599,8 @@ void DumpActors(uint8_t* world, int frame) {
     }
     fflush(f);
 }
+
+bool BotMissionPings(int rel);  // dots.inc
 
 bool Once(int step) {
     if (g_bot_done_step[step]) return false;
@@ -1869,6 +1871,8 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
     } else if (_stricmp(s, "move") == 0) {
         if (rel >= 30 && Once(0) && i_act) BotMoveMember(client, world, 0, 0);
         if (rel >= 410) BotFinish();
+    } else if (_stricmp(s, "ping") == 0) {
+        if (BotMissionPings(rel)) BotFinish();  // dots.inc
     } else if (_stricmp(s, "simul") == 0) {
         // Same frame: the host orders member 0, the joiner orders member 1.
         if (rel >= 30 && Once(0)) BotMoveMember(client, world, g_coop_host ? 0 : g_test.index, 0);

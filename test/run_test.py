@@ -52,7 +52,8 @@ TESTS = {
     "soak": ("soak", "host", 0),  # minimum computed from --soak-frames
     "fetch_save": ("move", "host", 7),  # joiner loads a different save; only the transfer can sync it
     "encounter": ("encounter", "host", 5),  # mission -> world map -> random encounter (mode 2); host re-syncs, joiner follows
-    "worldmap": ("worldmap", "host", 5),  # on the world map the host travels and the joiner watches; its own travel is refused
+    "worldmap": ("worldmap", "host", 5),
+    "mission_ping": ("ping", "host", 4),  # the host, then the joiner, middle-click the mission view: both flags on both copies, fading  # on the world map the host travels and the joiner watches; its own travel is refused
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
     "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
     "drift_host": ("drift", "host", 4),  # the joiner moves an NPC on its copy only; the host notices and corrects it, no reload
@@ -780,8 +781,9 @@ def main():
                   f"seen {fh[0][1] if fh else None} -> {fh[-1][1] if fh else None}")
             check("the joiner's fog of war ends the same as the host's", bool(fh and fj) and fh[-1] == fj[-1],
                   f"host {fh[-1] if fh else None}, joiner {fj[-1] if fj else None}")
-            # A real right button can't be checked here: the test windows sit in the background, and the game takes no
-            # posted mouse input there (2026-10-28: a posted WM_RBUTTONDOWN never reached the map). Right = 2 is a guess.
+            # A real right button can't be posted here (the test windows sit in the background, and the game takes no
+            # posted mouse input there), so the bots call the window's slot with junk above the button's low byte, as
+            # the game's input passes it (0x726980). The window procedure numbers left 1, right 2, middle 3.
             check("host bot started a mission from the world map", "bot: WORLD MAP -> " in host)
         elif scenario == "encounter":
             m = re.search(r"bot: ENCOUNTER dispatched \(mission mode now (\d+)\)", host)
@@ -797,6 +799,25 @@ def main():
         g2 = [k for k in shared if k[0] == 2]
         check("at least 4 shared snapshot frames in generation 2, all identical",
               len(g2) >= 4 and all(s_host[k] == s_join[k] for k in g2), f"{len(g2)} generation-2 frames")
+    elif scenario == "ping":
+        for c, who, log in (("red", "host", host), ("blue", "joiner", join)):
+            check(f"the {who} middle-clicked its view", "bot: PING this copy middle-clicks its view" in log)
+        pings = lambda log: dict((c, (float(x), float(y))) for c, x, y in
+                                 re.findall(r"co-op: mission: (red|blue) pinged \(([-\d.]+), ([-\d.]+)\)", log))
+        ph, pj = pings(host), pings(join)
+        for c, who in (("red", "host"), ("blue", "joiner")):
+            check(f"the {who}'s middle click became a {c} ping on both copies", c in ph and ph.get(c) == pj.get(c),
+                  f"host {ph.get(c)}, joiner {pj.get(c)}")
+        drawn = lambda log: [(c, int(x), int(y), int(cx), int(cy), int(age)) for c, x, y, cx, cy, age in re.findall(
+            r"bot: mission drawn with ping (red|blue) at \((-?\d+), (-?\d+)\), camera \((-?\d+), (-?\d+)\), age (\d+)", log)]
+        for who, log, got in (("host", host, ph), ("joiner", join, pj)):
+            d = drawn(log)
+            off = [r for r in d if r[0] in got and (r[1] - r[3], r[2] - r[4]) != tuple(int(v) for v in got[r[0]])]
+            check(f"the {who} drew both flags on their spot of the map (drawn point less its camera)",
+                  {r[0] for r in d} == {"red", "blue"} and not off, f"{len(d)} draws, off {off[:2]}")
+            check(f"the {who} drew them while they faded and not after 8 s",
+                  any(r[5] > 5000 for r in d) and all(r[5] < 8000 for r in d), f"ages {[r[5] for r in d]}")
+            check(f"the {who} took its three screenshots", log.count("dots: window captured as") >= 3)
     elif scenario == "resync":
         check("host re-synced: quick-save then quick-load",
               "host: re-sync (bot: mid-mission re-sync): quick-save" in host and "quick-save written" in host)

@@ -125,24 +125,38 @@ uint32_t FogHash(uint8_t* camp, int* seen) {
 }
 
 // ---- Pings: "I want to go there" (owner, 2026-10-28) ----
-// Any player marks a spot on the world map (a right click; a joiner's left click too, since it can't travel); every
-// copy draws a marker there in that player's colour (the selection dots' colours: host red, then blue, yellow,
-// green) for kPingMs. One ping per player: a new one replaces it. A joiner's goes to the host ("PING <id> x y", the
-// host knows its colour); the host's GEN answer carries every live ping with its age, so all copies draw the same.
-const DWORD kPingMs = 10000;
+// Any player marks a spot: on the world map with a right click (a joiner's left click too, since it can't travel),
+// in a mission with a middle click (owner, 2026-10-28: "show someone where to go"). Every copy draws a flag there in
+// that player's colour (the selection dots' colours: host red, then blue, yellow, green) for kPingMs, fading out
+// over the last kPingFadeMs. One ping per player: a new one replaces it. A joiner's goes to the host ("PING <id>
+// <where> x y", the host knows its colour); the host's GEN answer carries every live ping with its age, so all
+// copies draw the same. A world map ping is in map coordinates; a mission one in the mission view's map pixels
+// (dots.inc), so it stays on the ground as each player's camera moves.
+const DWORD kPingMs = 8000, kPingFadeMs = 3000;
+enum { kPingWorldMap = 0, kPingMission = 1 };
 struct MapPing {
     float x, y;
     DWORD born;  // GetTickCount() here; 0: none
+    int where;   // kPingWorldMap or kPingMission
 };
 MapPing g_pings[4] = {};  // by colour, under g_wm_lock
+const char* const kPingPlace[2] = {"world map", "mission"};
 
-void AddPing(int colour, float x, float y) {  // host
-    if (colour < 0 || colour > 3) return;
+void AddPing(int colour, int where, float x, float y) {  // host
+    if (colour < 0 || colour > 3 || where < 0 || where > 1) return;
     AcquireSRWLockExclusive(&g_wm_lock);
-    g_pings[colour] = {x, y, GetTickCount() | 1};
+    g_pings[colour] = {x, y, GetTickCount() | 1, where};
     ReleaseSRWLockExclusive(&g_wm_lock);
     static const char* const names[4] = {"red", "blue", "yellow", "green"};
-    Log("co-op: world map: %s pinged (%.1f, %.1f)", names[colour], x, y);
+    Log("co-op: %s: %s pinged (%.1f, %.1f)", kPingPlace[where], names[colour], x, y);
+}
+
+// A ping's colour as it fades: solid for the first kPingMs - kPingFadeMs, then its alpha down to nothing.
+uint32_t PingColour(uint32_t argb, DWORD born) {
+    DWORD age = GetTickCount() - born, solid = kPingMs - kPingFadeMs;
+    if (age <= solid) return argb;
+    uint32_t a = age >= kPingMs ? 0 : 255 * (kPingMs - age) / kPingFadeMs;
+    return (argb & 0xffffff) | (a << 24);
 }
 
 int LivePings(MapPing* out) {  // every copy: the pings to draw now, by colour (born 0 where none)
@@ -159,28 +173,34 @@ int LivePings(MapPing* out) {  // every copy: the pings to draw now, by colour (
     return n;
 }
 
-void SendPingToHost(float x, float y);  // save_transfer.inc
+void SendPingToHost(int where, float x, float y);  // save_transfer.inc
+
+void PingHere(int where, float x, float y) {  // this player pings
+    if (g_coop_host) {
+        AddPing(0, where, x, y);
+    } else {
+        Log("co-op: %s: this player pings (%.1f, %.1f)", kPingPlace[where], x, y);
+        SendPingToHost(where, x, y);
+    }
+}
 
 // WWorldWindow mouse-down (vtable slot 51, 0x82dbd0 -> 0x6ba2a0): __thiscall(ww, int pt[2] window-local, int button,
 // int), ret 0xc. Button 1 travels (or enters a location under the party); others did nothing. The world point is pt
-// plus the view's scroll (campaign +0x9d/+0xa1), as the game computes a destination.
+// plus the view's scroll (campaign +0x9d/+0xa1), as the game computes a destination. The button is only the low byte:
+// the input code (0x726980) passes it with whatever its register held above it (the window procedure's 1 left, 2
+// right, 3 middle), so a right click compared as a whole int never pinged (owner, 2026-10-28).
 typedef char(__fastcall* MapMouseFn)(uint8_t*, void*, int*, int, int);
 MapMouseFn g_map_mouse = nullptr;
 const uintptr_t kMapMouseSlot = 0x82dbd0, kMapMouse = 0x6ba2a0;
 
 char __fastcall MapMouseHook(uint8_t* ww, void* edx, int* pt, int button, int extra) {
-    if (g_test.enabled && pt) Log("bot: world map mouse-down, button %d at (%d, %d)", button, pt[0], pt[1]);
-    if ((g_coop_host || g_coop_join) && pt && (button == 2 || (button == 1 && g_coop_join))) {
+    int b = button & 0xff;
+    if (g_test.enabled && pt) Log("bot: world map mouse-down, button %d (%08x) at (%d, %d)", b, button, pt[0], pt[1]);
+    if ((g_coop_host || g_coop_join) && pt && (b == 2 || (b == 1 && g_coop_join))) {
         uint8_t* camp = *reinterpret_cast<uint8_t**>(kCampaignPtr2);
         if (camp) {
-            float x = static_cast<float>(pt[0]) + *reinterpret_cast<float*>(camp + 0x9d);
-            float y = static_cast<float>(pt[1]) + *reinterpret_cast<float*>(camp + 0xa1);
-            if (g_coop_host) {
-                AddPing(0, x, y);
-            } else {
-                Log("co-op: world map: this player pings (%.1f, %.1f)", x, y);
-                SendPingToHost(x, y);
-            }
+            PingHere(kPingWorldMap, static_cast<float>(pt[0]) + *reinterpret_cast<float*>(camp + 0x9d),
+                     static_cast<float>(pt[1]) + *reinterpret_cast<float*>(camp + 0xa1));
             return 1;
         }
     }
@@ -188,7 +208,7 @@ char __fastcall MapMouseHook(uint8_t* ww, void* edx, int* pt, int button, int ex
 }
 
 // Host, the file server's GEN answer: " WMAP x y dx dy moving" while its world map ticked in the last second, and
-// " PINGS colour:x:y:age_ms ..." while any ping is live.
+// " PINGS colour:where:x:y:age_ms ..." while any ping is live.
 void WorldMapLine(char* out, size_t cap) {
     out[0] = 0;
     AcquireSRWLockShared(&g_wm_lock);
@@ -203,7 +223,7 @@ void WorldMapLine(char* out, size_t cap) {
     n += sprintf_s(out + n, cap - n, " PINGS");
     for (int k = 0; k < 4; k++)
         if (p[k].born)
-            n += sprintf_s(out + n, cap - n, " %d:%.1f:%.1f:%lu", k, p[k].x, p[k].y, GetTickCount() - p[k].born);
+            n += sprintf_s(out + n, cap - n, " %d:%d:%.1f:%.1f:%lu", k, p[k].where, p[k].x, p[k].y, GetTickCount() - p[k].born);
 }
 
 void PingsFromHost(const char* line) {  // joiner, the poller thread
@@ -211,22 +231,24 @@ void PingsFromHost(const char* line) {  // joiner, the poller thread
     MapPing got[4] = {};
     if (p) {
         p += 6;
-        int k, used;
+        int k, where, used;
         float x, y;
         unsigned long age;
-        while (sscanf_s(p, " %d:%f:%f:%lu%n", &k, &x, &y, &age, &used) == 4) {
+        while (sscanf_s(p, " %d:%d:%f:%f:%lu%n", &k, &where, &x, &y, &age, &used) == 5) {
             p += used;
-            if (k >= 0 && k < 4 && age < kPingMs) got[k] = {x, y, (GetTickCount() - age) | 1};
+            if (k >= 0 && k < 4 && (where == kPingWorldMap || where == kPingMission) && age < kPingMs)
+                got[k] = {x, y, (GetTickCount() - age) | 1, where};
         }
     }
     AcquireSRWLockExclusive(&g_wm_lock);
     for (int k = 0; k < 4; k++) {
-        if (got[k].born && (!g_pings[k].born || g_pings[k].x != got[k].x || g_pings[k].y != got[k].y)) {
+        bool same = g_pings[k].born && g_pings[k].x == got[k].x && g_pings[k].y == got[k].y &&
+                    g_pings[k].where == got[k].where;
+        if (got[k].born && !same) {
             static const char* const names[4] = {"red", "blue", "yellow", "green"};
-            Log("co-op: world map: %s pinged (%.1f, %.1f)", names[k], got[k].x, got[k].y);
+            Log("co-op: %s: %s pinged (%.1f, %.1f)", kPingPlace[got[k].where], names[k], got[k].x, got[k].y);
         }
-        if (!got[k].born || !g_pings[k].born || g_pings[k].x != got[k].x || g_pings[k].y != got[k].y)
-            g_pings[k] = got[k];  // the same ping keeps the time it was first heard here
+        if (!got[k].born || !same) g_pings[k] = got[k];  // the same ping keeps the time it was first heard here
     }
     ReleaseSRWLockExclusive(&g_wm_lock);
 }

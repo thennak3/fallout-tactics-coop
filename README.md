@@ -65,6 +65,7 @@ your original `binkw32.dll`.
   players joined.
 - On the world map, only the host moves the party and chooses where to go; everyone else watches it travel.
   Right-click the map to ping a spot in your colour and show where you'd like to go.
+- In a mission, middle-click to ping a spot in your colour: everyone sees a flag there for 8 seconds.
 
 ### Networking
 
@@ -91,8 +92,9 @@ Checked by the automated tests in `test/`:
   others are told someone got there first.
 - The world map: only the host moves the party and picks where to go. The others see the host's party travel on
   their own map.
-- Map pings: right-click the world map (a joiner can also left-click) to mark a spot with a flag in your colour.
-  Everyone sees it for 10 seconds; it stays on that spot as the map scrolls.
+- Pings: right-click the world map (a joiner can also left-click), or middle-click in a mission, to mark a spot with
+  a flag in your colour. Everyone sees it for 8 seconds, fading out over the last 3; it stays on that spot of the map
+  as the view scrolls. (A real right click never pinged in 0.10.1 and earlier.)
 - Fog of war on the world map: everyone uncovers the same ground (joiners start from the host's save and follow
   the host's party).
 - Turn-based combat, Individual and Squad, with 2 to 4 players, including combat that starts by itself. On the squad's turn every player can order the squad
@@ -117,7 +119,6 @@ Checked by the automated tests in `test/`:
 - A character who joins the squad through a story conversation (not the recruiter) still means a save and reload
   for everyone.
 - Played on two PCs on one home network; not tested over the internet yet.
-- Map pings use the right mouse button; that a real right click reaches the map that way is not yet tested.
 
 ## Build from source
 

@@ -271,9 +271,60 @@ void __fastcall PortraitDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
 
 int* Rect(uint8_t* w) { return reinterpret_cast<int*>(w + 0xc3); }
 
+// Mission pings (worldmap_sync.inc): a middle click on the game view (vtable 0x804570 slot 51, 0x49d4e0, the same
+// mouse-down signature as the world map's). The view's camera is World+0x30: the game keeps the cursor in map pixels
+// as the view point less the camera's +0x1c/+0x20 (World+0x1e0, mouse move 0x49d860), so a ping is kept that way and
+// drawn at its map pixel plus this copy's camera: on the same ground for everyone, wherever each camera is.
+const uintptr_t kViewMouseSlot = 0x804570 + 51 * 4, kViewMouse = 0x49d4e0;
+MapMouseFn g_view_mouse = nullptr;
+
+int* ViewCamera() {
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    uint8_t* cam = world ? *reinterpret_cast<uint8_t**>(world + 0x30) : nullptr;
+    return cam ? reinterpret_cast<int*>(cam + 0x1c) : nullptr;
+}
+
+char __fastcall ViewMouseHook(uint8_t* view, void* edx, int* pt, int button, int extra) {
+    int* cam = ViewCamera();
+    if ((g_coop_host || g_coop_join) && pt && cam && (button & 0xff) == 3) {
+        if (g_test.enabled) Log("bot: mission view middle-click (%08x) at (%d, %d), camera (%d, %d)", button, pt[0], pt[1],
+                                cam[0], cam[1]);
+        PingHere(kPingMission, static_cast<float>(pt[0] - cam[0]), static_cast<float>(pt[1] - cam[1]));
+        return 1;
+    }
+    return g_view_mouse(view, edx, pt, button, extra);
+}
+
+void DrawPing(uint8_t* renderer, int x, int y, uint32_t argb, DWORD born);  // below, with the world map's
+
+// Draws this copy's live mission pings on the view; true when there were any.
+bool DrawMissionPings(uint8_t* view, uint8_t* renderer) {
+    MapPing p[4];
+    int* cam = ViewCamera();
+    if (!cam || !LivePings(p)) return false;
+    static DWORD said = 0;
+    bool say = g_test.enabled && GetTickCount() - said > 1000, drew = false;
+    for (int k = 0; k < 4; k++) {
+        if (!p[k].born || p[k].where != kPingMission) continue;
+        int x = static_cast<int>(p[k].x) + cam[0], y = static_cast<int>(p[k].y) + cam[1];
+        DrawPing(renderer, x, y, kDotColour[k], p[k].born);
+        if (say) Log("bot: mission drawn with ping %s at (%d, %d), camera (%d, %d), age %lu ms", kDotName[k], x, y,
+                     cam[0], cam[1], GetTickCount() - p[k].born);
+        drew = true;
+    }
+    if (say && drew) said = GetTickCount();
+    return drew;
+}
+
 void __fastcall ViewDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
     g_view_draw(self, edx, renderer);
     g_view = self;
+    // Pings first, under the dots. Drawn again every frame while one shows (it fades, and the view scrolls), and once
+    // more after the last one is gone so it leaves no trace.
+    static bool pinged_last = false;
+    bool pinged = DrawMissionPings(self, renderer);
+    if (pinged || pinged_last) reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(self))[3])(self);
+    pinged_last = pinged;
     // The bottom panel is a child of the mission screen (children from +0x18, next sibling +0x24). Found there, not
     // through the small portraits: with one character selected the bar shows a single large portrait instead, and
     // the small ones never draw (QuestBarter.sav: no dots at all).
@@ -330,14 +381,16 @@ void FillBox(uint8_t* renderer, int x0, int y0, int x1, int y1, uint32_t argb) {
     for (int i = 0; x0 + i <= x1 - i && y0 + i <= y1 - i; i++) FillRect(renderer, x0 + i, y0 + i, x1 - i, y1 - i, argb);
 }
 
-void DrawPing(uint8_t* renderer, int x, int y, uint32_t argb) {
-    FillBox(renderer, x - 2, y - 26, x + 2, y - 7, 0xff000000);  // a flag: the pole and its pennant, then the
-    FillBox(renderer, x + 1, y - 26, x + 13, y - 18, 0xff000000);  // marker at its foot
+void DrawPing(uint8_t* renderer, int x, int y, uint32_t argb, DWORD born) {
+    uint32_t black = PingColour(0xff000000, born), white = PingColour(0xffffffff, born);
+    argb = PingColour(argb, born);
+    FillBox(renderer, x - 2, y - 26, x + 2, y - 7, black);  // a flag: the pole and its pennant, then the
+    FillBox(renderer, x + 1, y - 26, x + 13, y - 18, black);  // marker at its foot
     FillBox(renderer, x + 2, y - 25, x + 12, y - 19, argb);
     FillBox(renderer, x - 1, y - 25, x + 1, y - 8, argb);
-    FillBox(renderer, x - 8, y - 8, x + 8, y + 8, 0xff000000);
+    FillBox(renderer, x - 8, y - 8, x + 8, y + 8, black);
     FillBox(renderer, x - 6, y - 6, x + 6, y + 6, argb);
-    FillBox(renderer, x - 2, y - 2, x + 2, y + 2, 0xffffffff);
+    FillBox(renderer, x - 2, y - 2, x + 2, y + 2, white);
 }
 
 void __fastcall WorldMapDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
@@ -350,10 +403,10 @@ void __fastcall WorldMapDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
     bool say = g_test.enabled && n && GetTickCount() - said > 1000;
     if (say) said = GetTickCount();
     for (int k = 0; k < 4 && n; k++) {
-        if (!p[k].born) continue;
+        if (!p[k].born || p[k].where != kPingWorldMap) continue;
         int x = static_cast<int>(p[k].x - *reinterpret_cast<float*>(camp + 0x9d));
         int y = static_cast<int>(p[k].y - *reinterpret_cast<float*>(camp + 0xa1));
-        DrawPing(renderer, x, y, kDotColour[k]);
+        DrawPing(renderer, x, y, kDotColour[k], p[k].born);
         if (say) Log("bot: world map drawn with ping %s at (%d, %d), window (%d, %d)-(%d, %d)", kDotName[k], x, y,
                      Rect(self)[0], Rect(self)[1], Rect(self)[2], Rect(self)[3]);
     }
@@ -361,6 +414,32 @@ void __fastcall WorldMapDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
     // after the last one is gone so it leaves no trace.
     if (n || drew_last) reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(self))[3])(self);
     drew_last = n > 0;
+}
+
+// Test (mission_ping): the host middle-clicks its view, then the joiner, through the view's mouse-down slot as the
+// game's input calls it (the button in the low byte, junk above); each copy logs its camera and takes screenshots
+// while both pings show, while they fade and after they are gone. True when done, at the same frame on every copy.
+bool BotMissionPings(int rel) {
+    static DWORD clicked = 0;
+    static int shots = 0;
+    int* cam = ViewCamera();
+    if (!g_view || !cam) return false;
+    if (rel % 15 == 0) Log("bot: PINGCAM rel=%d camera (%d, %d)", rel, cam[0], cam[1]);
+    typedef char(__thiscall * MouseFn)(void*, int*, int, int);
+    MouseFn mouse = reinterpret_cast<MouseFn>((*reinterpret_cast<void***>(g_view))[51]);
+    if (!clicked && rel >= (g_coop_host ? 40 : 55)) {
+        int pt[2] = {g_coop_host ? 300 : 500, g_coop_host ? 200 : 260};
+        Log("bot: PING this copy middle-clicks its view at (%d, %d)", pt[0], pt[1]);
+        mouse(g_view, pt, g_coop_host ? 0x5a5a5a03 : 0x12345603, 0);
+        clicked = GetTickCount();
+    }
+    static const DWORD kShotAt[3] = {2500, 6500, 9500};  // both solid, fading, gone
+    if (clicked && shots < 3 && GetTickCount() - clicked > kShotAt[shots] && g_shot_event) {
+        Log("bot: PING screenshot %d of this copy's view", shots + 1);
+        SetEvent(g_shot_event);
+        shots++;
+    }
+    return shots == 3 && rel >= 330;  // both copies on the same frame (by the clock, the host left the joiner behind)
 }
 
 void* __fastcall ViewDtorHook(uint8_t* self, void* edx, unsigned flags) {
@@ -425,6 +504,8 @@ void InstallDots() {
                 PatchSlot(kViewDtorSlot, kViewDtor, (void*)&ViewDtorHook, &g_view_dtor) ? "ok" : "FAILED");
     Log("co-op: world map draw hook %s (pings)",
         PatchSlot(kWorldMapDrawSlot, kWorldMapDraw, (void*)&WorldMapDrawHook, &g_worldmap_draw) ? "ok" : "FAILED");
+    Log("co-op: mission view middle-click hook %s (pings)",
+        PatchSlot(kViewMouseSlot, kViewMouse, (void*)&ViewMouseHook, &g_view_mouse) ? "ok" : "FAILED");
 }
 
 void StartShotThread() {  // after the test config is read
