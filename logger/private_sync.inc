@@ -15,6 +15,7 @@
 //       free list pointed at the talker's slot first, so the entity lands in the same slot;
 //   'N' slot count: a stack's count (Collectable +0x1ad);
 //   'I' owner n {slot, seq}: an Actor's inventory list, in order (Inventory entity +0x1a9 list, +0x1ad count);
+//   'G' actor 3 x {seq, slot} hand: an Actor's two hands and armour (+0x100e) and its active hand (+0x1029);
 //   'Q' n {slot, seq}: the squad (players[1] +0x4b list);
 //   'H' slot hp: an Actor's HP;
 //   'F' n serial term n {slot, seq}: the entity table's free list in the host's order (drift.inc): every copy chains
@@ -1384,6 +1385,25 @@ void ApplyDelta(const uint8_t* data, int len) {
             RewriteIdList(*reinterpret_cast<uint8_t**>(invent + kInventoryList), slots, seqs, n);
             *reinterpret_cast<int*>(invent + 0x1ad) = n;
             invs++;
+        } else if (op == 'G') {
+            uint16_t id = r.U16();
+            uint8_t gear[13];
+            if (!r.Has(sizeof(gear))) break;
+            memcpy(gear, r.p, sizeof(gear));
+            r.p += sizeof(gear);
+            uint8_t* a = IsActor(world, id) ? EntityById(world, id) : nullptr;
+            if (!a) {
+                Log("co-op: actor %u is not here: its equipment is not set", id);
+                conflicts++;
+            } else if (memcmp(a + kActorEquip, gear, 12) != 0 || a[kActorHand] != gear[12]) {
+                char before[64], after[64];
+                EquipString(world, id, before, sizeof(before));
+                memcpy(a + kActorEquip, gear, 12);  // the three handles {seq, slot}, as the host has them
+                a[kActorHand] = gear[12];
+                EquipString(world, id, after, sizeof(after));
+                Log("co-op: equipment of %u here: %s; the host's: %s", id, before, after);
+                invs++;
+            }
         } else if (op == 'F') {
             uint16_t nf = r.U16();
             uint32_t serial = r.U32();

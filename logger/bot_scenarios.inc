@@ -1798,6 +1798,27 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             }
         }
         if ((session >= 2 && rel_s >= 200) || (session == 1 && rel_s >= 500)) BotFinish();  // corrected: no reload
+    } else if (_stricmp(s, "driftequip") == 0) {
+        // The same with equipment: the joiner empties a squad member's hand and swaps its active hand on its copy
+        // only; the host must see the inventories differ and correct the hands and armour ('G'), with no reload.
+        if (session == 1 && rel_s >= 100 && Once(0) && g_coop_join) {
+            uint16_t squad[16];
+            int n = GetSquad(world, squad, 16);
+            for (int k = 0; k < n; k++) {
+                uint8_t* e = EntityById(world, squad[k]);
+                for (int slot = 0; slot < 3; slot++) {
+                    uint32_t* h = reinterpret_cast<uint32_t*>(e + kActorEquip + 4 * slot);
+                    if (!(*h >> 16)) continue;
+                    Log("bot: DRIFT emptied slot %d (item %u) of %u and swapped its hand on this copy only, at frame %d",
+                        slot, *h >> 16, squad[k], frame);
+                    *h = 0;
+                    e[kActorHand] ^= 1;
+                    k = n;
+                    break;
+                }
+            }
+        }
+        if ((session >= 2 && rel_s >= 200) || (session == 1 && rel_s >= 500)) BotFinish();
     } else if (_stricmp(s, "transition") == 0 || _stricmp(s, "encounter") == 0) {
         if (g_snap_tag == 1 && rel_s >= 60 && Once(0)) BotEndMission("World Map");
         if (g_snap_tag >= 2 && rel_s >= 300) BotFinish();

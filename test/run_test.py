@@ -55,6 +55,7 @@ TESTS = {
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
     "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
     "drift_host": ("drift", "host", 4),
+    "drift_equip": ("driftequip", "host", 4),  # the joiner empties a hand on its copy only; the host corrects it, no reload
     "joinload": ("joinload", "join", 5),
     "play": ("play", "host", 4),
     "tbauto": ("tbauto", "all", 4),  # as turnbased, but the combat starts by itself: the host's squad fires (--host-turnbased)
@@ -382,6 +383,12 @@ def main():
     s_host, s_join = snapshots(host), snapshots(join)
     shared = sorted(set(s_host) & set(s_join))
     talk_frame = free_frame = None
+    if scenario == "driftequip":  # from the joiner's change until the correction the copies differ on purpose
+        nd = re.search(r"bot: DRIFT emptied slot .* at frame (\d+)", join)
+        talk_frame = int(nd.group(1)) if nd else None
+        hd = re.search(r"co-op: drift: holding after frame (\d+)", host)
+        fix_frame = int(hd.group(1)) if hd else None
+        shared = [k for k in shared if (talk_frame is not None and k[1] < talk_frame) or (fix_frame is not None and k[1] > fix_frame)]
     if scenario == "drift":  # session 1 differs on purpose from the joiner's nudge; session 2 must not
         nd = re.search(r"bot: DRIFT moved NPC \d+ on this copy only, at frame (\d+)", join)
         talk_frame = int(nd.group(1)) if nd else None
@@ -839,6 +846,18 @@ def main():
         check("no reload anywhere: no re-sync, no new generation, the joiner stayed in the session",
               "host: re-sync (" not in host and "join: following the host to generation 2" not in join
               and "game session returned to the main menu" not in join)
+    elif scenario == "driftequip":
+        check("the joiner's bot emptied a hand on its copy only", talk_frame is not None)
+        dd = re.findall(r"co-op: drift: .*'s game differs from ours at frame (\d+) \(generation \d+\): (.*)", host)
+        check("the host saw the inventories differ", any("inventories" in k for _, k in dd), dd[:2])
+        check("the host corrected it instead of reloading", "co-op: drift: sent the correction:" in host
+              and "host: re-sync (" not in host and "following the host to generation" not in join)
+        check("the joiner's equipment was put back", re.search(r"co-op: equipment of \d+ here: ", join) is not None,
+              (re.search(r"co-op: equipment of .*", join) or [""])[0])
+        hd = re.search(r"co-op: drift: holding after frame (\d+)", host)
+        after = [k for k in shared if hd and k[1] > int(hd.group(1))]
+        check("at least 4 shared frames after it, all identical (equipment too)", len(after) >= 4
+              and all(i_host.get(k) == i_join.get(k) for k in after), f"{len(after)} frames")
     elif scenario == "drift":
         check("the joiner's bot moved an NPC on its copy only", talk_frame is not None)
         dd = re.findall(r"co-op: drift: .*'s game differs from ours at frame (\d+)", host)

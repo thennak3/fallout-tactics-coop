@@ -382,6 +382,13 @@ void SendWorldFix(uint8_t* world, uint8_t kinds) {
             w.U8('I');
             w.U16(static_cast<uint16_t>(i));
             PutIdList(w, world, items, k);
+            if (vt == kActorVtable) {  // and its hands and armour (EquipString), which the list doesn't hold
+                uint8_t* a = EntityById(world, static_cast<uint16_t>(i));
+                w.U8('G');
+                w.U16(static_cast<uint16_t>(i));
+                w.Put(a + kActorEquip, 12);
+                w.U8(a[kActorHand]);
+            }
             invs++;
         }
     }
