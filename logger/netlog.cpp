@@ -465,7 +465,17 @@ DWORD WINAPI ReleaseDirectPlay(LPVOID p) {
     return 0;
 }
 
+// The Multiplayer screen's network (its session search) is the one whose release takes 3 s, and even released on a
+// thread of its own, the next DirectPlay object waits for it. So when Start Co-op or Join closes that screen, its
+// release is skipped: the object is left alive (once per Start Co-op or Join), and the next one starts at once.
+DWORD g_forget_release_until = 0;
+
 ULONG __stdcall NetCloseReleaseHook(IUnknown* p) {  // in place of the Release call: same arguments, callee pops
+    if (g_forget_release_until && GetTickCount() < g_forget_release_until) {
+        g_forget_release_until = 0;
+        Log("co-op: the Multiplayer screen's DirectPlay is left alive (its release would hold everything up 3 s)");
+        return 0;
+    }
     HANDLE t = CreateThread(nullptr, 0, ReleaseDirectPlay, p, 0, nullptr);
     if (t) {
         CloseHandle(t);
@@ -1405,6 +1415,7 @@ bool JoinCoop(uint8_t* w, const char* session) {
     if (char* at = strstr(g_wait_session, " @")) *at = 0;  // the name, without the host's addresses
     g_wait_popup_pending = true;  // the main menu shows "waiting for the host" until the save arrives
     g_menu_role_chosen = true;
+    g_forget_release_until = GetTickCount() + 5000;  // NetCloseReleaseHook: this screen's release is skipped
     CloseMultiSetup(w);
     return true;
 }
@@ -1436,6 +1447,7 @@ void __fastcall StartCoopButton(uint8_t* w, void* /*edx*/, int /*arg*/) {
     g_menu_role_chosen = true;
     // The test bot loads its own save from the main menu instead (not in watch mode, where a person plays).
     g_open_load_after = !g_test.enabled || _stricmp(g_test.scenario, "watch") == 0 || g_test.menu_cancel;
+    g_forget_release_until = GetTickCount() + 5000;  // NetCloseReleaseHook: this screen's release is skipped
     CloseMultiSetup(w);
 }
 

@@ -254,17 +254,21 @@ void RecordWaypoints(uint8_t* world) {
 
 int PickWalkTarget(uint8_t* world, uint16_t walker, unsigned variant) {
     float* a = EntityPos(world, walker);
-    int cand[128], nc = 0, far_i = -1;
-    float far_d = 0;
+    int cand[128], nc = 0, far_i = -1, near_i = -1;
+    float far_d = 0, near_d = 1e9f;
     for (int i = 0; i < g_waypoint_count; i++) {
         float* p = g_waypoints[i];
         float dy = p[1] - a[1];
         float d = sqrtf((p[0] - a[0]) * (p[0] - a[0]) + (p[2] - a[2]) * (p[2] - a[2]));
-        if (dy <= -1.0f || dy >= 1.0f || d < kMoveMin || d > kMoveMax) continue;
+        if (dy <= -1.0f || dy >= 1.0f) continue;
+        if (d >= 5.0f && d < near_d) { near_d = d; near_i = i; }
+        if (d < kMoveMin || d > kMoveMax) continue;
         cand[nc++] = i;
         if (d > far_d) { far_d = d; far_i = i; }
     }
-    if (nc == 0) return -1;
+    // A member the other player's bot already walked off may have none in range (a drop-in arrives later, dropin
+    // 2026-10-28): the nearest one on its floor at least 5 units away then.
+    if (nc == 0) return near_i;
     return variant == 0 ? far_i : cand[variant % nc];
 }
 
