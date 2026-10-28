@@ -62,7 +62,8 @@ your original `binkw32.dll`.
 - Everyone controls the whole squad. Agree among yourselves who moves whom. Coloured dots above each name tab
   show which players have that character selected: the host is red, then blue, yellow and green in the order
   players joined.
-- On the world map, only the host chooses where to go; everyone else follows.
+- On the world map, only the host moves the party and chooses where to go; everyone else watches it travel.
+  Right-click the map to ping a spot in your colour and show where you'd like to go.
 
 ### Networking
 
@@ -88,7 +89,9 @@ Checked by the automated tests in `test/`:
 - One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
   others are told someone got there first.
 - The world map: only the host moves the party and picks where to go. The others see the host's party travel on
-  their own map; their clicks do nothing.
+  their own map.
+- Map pings: right-click the world map (a joiner can also left-click) to mark a spot with a flag in your colour.
+  Everyone sees it for 10 seconds; it stays on that spot as the map scrolls.
 - Turn-based combat, Individual and Squad, with 2 and 3 players. On the squad's turn every player can order the squad
   (in Individual mode, the character whose turn it is), and any player can press End Turn or switch turn-based off.
 - The host's game settings count for everyone: difficulty, turn-based mode, CTB speed, friendly fire, violence and
@@ -114,6 +117,7 @@ Checked by the automated tests in `test/`:
   for everyone.
 - Fog of war on the world map isn't synced: ground the host explored while you weren't connected stays dark for you.
 - Played on two PCs on one home network; not tested over the internet yet.
+- Map pings use the right mouse button; that a real right click reaches the map that way is not yet tested.
 
 ## Build from source
 
