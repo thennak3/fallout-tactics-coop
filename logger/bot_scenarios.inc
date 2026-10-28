@@ -1024,6 +1024,8 @@ const uintptr_t kGoToMap = 0x6b6580;       // void __thiscall(WCampaignWindow*, 
 const uintptr_t kMissionDone = 0x6a85d0;   // char __thiscall(campaign*, FOTString*), ret 4
 const uintptr_t kMissionMark = 0x6a87d0;   // void __thiscall(campaign*, FOTString*), ret 4
 
+extern HANDLE g_shot_event;  // dots.inc: test mode, capture the window now
+
 void BotWorldMapStartMission(uint8_t* campaign_window) {
     uint8_t* campaign = *reinterpret_cast<uint8_t**>(kCampaignPtr);
     uint8_t* begin = *reinterpret_cast<uint8_t**>(campaign + 0x1cd);
@@ -1275,9 +1277,15 @@ void __fastcall WindowTickHook(uint8_t* w) {
         if (*reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) campaign_window = w;
         if (strstr(RttiName(w), "WWorldWindow@@")) {
             static int ticks = 0, arrived = -1;
+            static DWORD arrived_at = 0;
             ++ticks;
             uint8_t* camp = *reinterpret_cast<uint8_t**>(kCampaignPtr);
             float* party = reinterpret_cast<float*>(camp + 0xa5);
+            int* wr = reinterpret_cast<int*>(w + 0xc3);
+            if (ticks == 1) {  // the cursor starts in the window's corner and the map edge-scrolls: park it mid-map
+                PostMessageA(g_pump_hwnd, WM_MOUSEMOVE, 0, MAKELPARAM((wr[0] + wr[2]) / 2, (wr[1] + wr[3]) / 2));
+                Log("bot: cursor parked mid-map at (%d, %d)", (wr[0] + wr[2]) / 2, (wr[1] + wr[3]) / 2);
+            }
             if (ticks % 10 == 0) Log("WMPOS t=%d x=%.3f y=%.3f moving=%d", ticks, party[0], party[1], w[0x101]);
             if (ticks == 30 && g_coop_join) {
                 float dest[2] = {party[0] - 40.0f, party[1] + 30.0f};
@@ -1289,12 +1297,47 @@ void __fastcall WindowTickHook(uint8_t* w) {
                 Log("bot: WMAP the host travels to (%.1f, %.1f)", dest[0], dest[1]);
                 reinterpret_cast<void(__thiscall*)(void*, float*)>(0x6ba410)(w, dest);
             }
+            // Pings: the joiner's left click and the host's right click, through the window's own mouse-down slot (as
+            // the game's input calls it).
+            typedef char(__thiscall * MouseFn)(void*, int*, int, int);
+            MouseFn mouse = reinterpret_cast<MouseFn>((*reinterpret_cast<void***>(w))[51]);
+            if (ticks == 50 && g_coop_join) {
+                int pt[2] = {150, 120};
+                Log("bot: PING the joiner clicks its map at (150, 120)");
+                mouse(w, pt, 1, 0);
+            }
+            if (ticks == 55 && g_coop_host) {
+                int pt[2] = {300, 200};
+                Log("bot: PING the host right-clicks its map at (300, 200)");
+                mouse(w, pt, 2, 0);
+            }
+            static DWORD pinged_at = 0;
+            if (ticks == 50) pinged_at = GetTickCount();
+            if (pinged_at && g_coop_join) {  // the test windows edge-scroll (the cursor): keep both pings in view
+                MapPing pp[4];
+                float cx = 0, cy = 0;
+                int np = LivePings(pp);
+                for (int k = 0; k < 4 && np; k++)
+                    if (pp[k].born) cx += pp[k].x / np, cy += pp[k].y / np;
+                if (np) {
+                    *reinterpret_cast<float*>(camp + 0x9d) = cx - (wr[2] - wr[0]) / 2.0f;
+                    *reinterpret_cast<float*>(camp + 0xa1) = cy - (wr[3] - wr[1]) / 2.0f;
+                }
+            }
+            if (pinged_at && GetTickCount() - pinged_at > 2000 && g_coop_join) {  // both pings drawn by now
+                pinged_at = 0;
+                Log("bot: PING screenshot of the joiner's map");
+                if (g_shot_event) SetEvent(g_shot_event);
+            }
             if (g_coop_host && ticks > 45 && !w[0x101] && arrived < 0) {
                 arrived = ticks;
+                arrived_at = GetTickCount();
                 Log("bot: WMAP the host's party stopped at (%.3f, %.3f)", party[0], party[1]);
             }
-            if (g_coop_host && arrived >= 0 && ticks == arrived + 90 && campaign_window)
+            if (g_coop_host && arrived_at && GetTickCount() - arrived_at > 5000 && campaign_window) {  // the pings seen first
+                arrived_at = 0;
                 BotWorldMapStartMission(campaign_window);
+            }
         }
     }
     if (g_test.enabled && _stricmp(g_test.scenario, "exit") == 0 && *reinterpret_cast<uintptr_t*>(w) == kCampaignWindowVtable) {

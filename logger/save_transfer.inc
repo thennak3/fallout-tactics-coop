@@ -257,6 +257,21 @@ void ServeOne(SOCKET c) {
         ServeSelection(c, req);
         return;
     }
+    if (strncmp(req, "PING ", 5) == 0) {  // "PING <joiner id> x y": a joiner's world map ping, in its colour
+        unsigned id = 0;
+        float x = 0, y = 0;
+        int colour = -1;
+        if (sscanf_s(req, "PING %x %f %f", &id, &x, &y) == 3) {
+            EnterCriticalSection(&g_serve_lock);
+            for (int i = 0; i < g_joiner_count; i++)
+                if (g_joiners[i].id == id && g_joiners[i].colour) colour = g_joiners[i].colour;
+            LeaveCriticalSection(&g_serve_lock);
+        }
+        if (colour > 0) AddPing(colour, x, y);
+        else Log("co-op: world map: a ping from joiner %08x, who has no colour yet: dropped", id);
+        SendAll(c, "OK\n", 3);
+        return;
+    }
     if (strncmp(req, "DPUT ", 5) == 0 || strncmp(req, "DGET ", 5) == 0) {
         ServeDelta(c, req);
         return;
@@ -275,8 +290,8 @@ void ServeOne(SOCKET c) {
     if (gen_req && id) NoteJoiner(id, who[0] ? who : "a player", state, their_gen);
     LeaveCriticalSection(&g_serve_lock);
     if (gen_req) {
-        char line[300];
-        char wmap[96];
+        char line[700];
+        char wmap[300];
         WorldMapLine(wmap, sizeof(wmap));  // the host's party on the world map, if it is there
         int n = sprintf_s(line, "GEN %ld %d %s%s\n", gen, g_lobby_open ? 1 : 0, name, wmap);
         SendAll(c, line, n);
@@ -396,6 +411,31 @@ void StartFileServer() {
     CreateThread(nullptr, 0, FileServerThread, nullptr, 0, nullptr);
 }
 
+SOCKET ConnectHost();
+
+// Joiner, from the world map's mouse-down (main thread): the ping goes to the host on a thread of its own, so a slow
+// host never stalls the game.
+DWORD WINAPI PingThread(LPVOID p) {
+    float* xy = static_cast<float*>(p);
+    char req[96];
+    int n = sprintf_s(req, "PING %08x %.1f %.1f\n", g_joiner_id, xy[0], xy[1]);
+    delete[] xy;
+    SOCKET s = ConnectHost();
+    char reply[16];
+    if (s != INVALID_SOCKET) {
+        if (!SendAll(s, req, n) || !RecvLine(s, reply, sizeof(reply))) Log("co-op: world map: the ping did not reach the host");
+        closesocket(s);
+    }
+    return 0;
+}
+
+void SendPingToHost(float x, float y) {
+    float* xy = new float[2]{x, y};
+    HANDLE t = CreateThread(nullptr, 0, PingThread, xy, 0, nullptr);
+    if (t) CloseHandle(t);
+    else delete[] xy;
+}
+
 SOCKET ConnectHost() {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     DWORD timeout = 10000;
@@ -469,7 +509,7 @@ DWORD WINAPI GenerationPoller(LPVOID) {
         Sleep(kJoinPollMs);
         if (!g_coop_join) continue;  // stopped waiting (or never joined): don't register with the host
         SOCKET s = ConnectHost();
-        char line[300];
+        char line[700];
         char req[64];
         int rl = sprintf_s(req, "GEN %08x %c %ld %s\n", g_joiner_id, g_join_state, g_loaded_gen, g_player_name);
         if (s != INVALID_SOCKET && SendAll(s, req, rl) && RecvLine(s, line, sizeof(line))) {

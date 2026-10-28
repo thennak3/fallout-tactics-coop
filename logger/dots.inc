@@ -318,6 +318,51 @@ void __fastcall ViewDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
     if (drew) reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(self))[3])(self);
 }
 
+// World map pings (worldmap_sync.inc): WWorldWindow's draw (vtable 0x82db04 slot 4, 0x6bbb00), then a marker at each
+// live ping in the window's own coordinates, the world point less the view's scroll (campaign +0x9d/+0xa1): a black
+// ring, the player's colour inside, a white centre, and a stalk above so it reads as a flag on the map.
+const uintptr_t kWorldMapDrawSlot = 0x82db04 + 4 * 4, kWorldMapDraw = 0x6bbb00;
+PortraitDrawFn g_worldmap_draw = nullptr;
+
+// The renderer's rectangle (+0x24) is an outline, one pixel wide: a filled box is outlines, each one pixel in (as
+// DrawDot does). Corners inclusive.
+void FillBox(uint8_t* renderer, int x0, int y0, int x1, int y1, uint32_t argb) {
+    for (int i = 0; x0 + i <= x1 - i && y0 + i <= y1 - i; i++) FillRect(renderer, x0 + i, y0 + i, x1 - i, y1 - i, argb);
+}
+
+void DrawPing(uint8_t* renderer, int x, int y, uint32_t argb) {
+    FillBox(renderer, x - 2, y - 26, x + 2, y - 7, 0xff000000);  // a flag: the pole and its pennant, then the
+    FillBox(renderer, x + 1, y - 26, x + 13, y - 18, 0xff000000);  // marker at its foot
+    FillBox(renderer, x + 2, y - 25, x + 12, y - 19, argb);
+    FillBox(renderer, x - 1, y - 25, x + 1, y - 8, argb);
+    FillBox(renderer, x - 8, y - 8, x + 8, y + 8, 0xff000000);
+    FillBox(renderer, x - 6, y - 6, x + 6, y + 6, argb);
+    FillBox(renderer, x - 2, y - 2, x + 2, y + 2, 0xffffffff);
+}
+
+void __fastcall WorldMapDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
+    g_worldmap_draw(self, edx, renderer);
+    static bool drew_last = false;
+    MapPing p[4];
+    uint8_t* camp = *reinterpret_cast<uint8_t**>(kCampaignPtr2);
+    int n = camp ? LivePings(p) : 0;
+    static DWORD said = 0;
+    bool say = g_test.enabled && n && GetTickCount() - said > 1000;
+    if (say) said = GetTickCount();
+    for (int k = 0; k < 4 && n; k++) {
+        if (!p[k].born) continue;
+        int x = static_cast<int>(p[k].x - *reinterpret_cast<float*>(camp + 0x9d));
+        int y = static_cast<int>(p[k].y - *reinterpret_cast<float*>(camp + 0xa1));
+        DrawPing(renderer, x, y, kDotColour[k]);
+        if (say) Log("bot: world map drawn with ping %s at (%d, %d), window (%d, %d)-(%d, %d)", kDotName[k], x, y,
+                     Rect(self)[0], Rect(self)[1], Rect(self)[2], Rect(self)[3]);
+    }
+    // Drawn again next frame while any ping shows (the map scrolls and redraws only what changed), and once more
+    // after the last one is gone so it leaves no trace.
+    if (n || drew_last) reinterpret_cast<void(__thiscall*)(void*)>((*reinterpret_cast<void***>(self))[3])(self);
+    drew_last = n > 0;
+}
+
 void* __fastcall ViewDtorHook(uint8_t* self, void* edx, unsigned flags) {
     if (g_view == self) g_view = nullptr;
     return g_view_dtor(self, edx, flags);
@@ -378,6 +423,8 @@ void InstallDots() {
     Log("co-op: view hook %s (selection dots above the name tabs)",
         PatchSlot(kViewDrawSlot, kViewDraw, (void*)&ViewDrawHook, &g_view_draw) &&
                 PatchSlot(kViewDtorSlot, kViewDtor, (void*)&ViewDtorHook, &g_view_dtor) ? "ok" : "FAILED");
+    Log("co-op: world map draw hook %s (pings)",
+        PatchSlot(kWorldMapDrawSlot, kWorldMapDraw, (void*)&WorldMapDrawHook, &g_worldmap_draw) ? "ok" : "FAILED");
 }
 
 void StartShotThread() {  // after the test config is read

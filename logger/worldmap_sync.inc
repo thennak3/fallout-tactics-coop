@@ -47,14 +47,6 @@ void __fastcall WorldMapEncounterHook(uint8_t* ww, void* edx, float dt) {
     reinterpret_cast<void(__fastcall*)(uint8_t*, void*, float)>(g_roll_trampoline)(ww, edx, dt);
 }
 
-bool InstallWorldMapHooks() {
-    g_travel_trampoline = HookWithTrampoline(kWorldMapTravel, kWorldMapTravelPrologue, sizeof(kWorldMapTravelPrologue),
-                                             (void*)&WorldMapTravelHook);
-    g_roll_trampoline = HookWithTrampoline(kWorldMapEncounterRoll, kWorldMapEncounterPrologue,
-                                           sizeof(kWorldMapEncounterPrologue), (void*)&WorldMapEncounterHook);
-    return g_travel_trampoline && g_roll_trampoline;
-}
-
 // Window-tick hook, every window: the world map's own tick ran just before.
 void WorldMapTick(uint8_t* w) {
     if (!g_coop_host && !g_coop_join) return;
@@ -103,19 +95,116 @@ void WorldMapTick(uint8_t* w) {
     }
 }
 
-// Host, the file server's GEN answer: " WMAP x y dx dy moving" while its world map ticked in the last second.
+// ---- Pings: "I want to go there" (owner, 2026-10-28) ----
+// Any player marks a spot on the world map (a right click; a joiner's left click too, since it can't travel); every
+// copy draws a marker there in that player's colour (the selection dots' colours: host red, then blue, yellow,
+// green) for kPingMs. One ping per player: a new one replaces it. A joiner's goes to the host ("PING <id> x y", the
+// host knows its colour); the host's GEN answer carries every live ping with its age, so all copies draw the same.
+const DWORD kPingMs = 10000;
+struct MapPing {
+    float x, y;
+    DWORD born;  // GetTickCount() here; 0: none
+};
+MapPing g_pings[4] = {};  // by colour, under g_wm_lock
+
+void AddPing(int colour, float x, float y) {  // host
+    if (colour < 0 || colour > 3) return;
+    AcquireSRWLockExclusive(&g_wm_lock);
+    g_pings[colour] = {x, y, GetTickCount() | 1};
+    ReleaseSRWLockExclusive(&g_wm_lock);
+    static const char* const names[4] = {"red", "blue", "yellow", "green"};
+    Log("co-op: world map: %s pinged (%.1f, %.1f)", names[colour], x, y);
+}
+
+int LivePings(MapPing* out) {  // every copy: the pings to draw now, by colour (born 0 where none)
+    AcquireSRWLockShared(&g_wm_lock);
+    memcpy(out, g_pings, sizeof(g_pings));
+    ReleaseSRWLockShared(&g_wm_lock);
+    int n = 0;
+    for (int k = 0; k < 4; k++) {
+        if (out[k].born && GetTickCount() - out[k].born < kPingMs)
+            n++;
+        else
+            out[k].born = 0;
+    }
+    return n;
+}
+
+void SendPingToHost(float x, float y);  // save_transfer.inc
+
+// WWorldWindow mouse-down (vtable slot 51, 0x82dbd0 -> 0x6ba2a0): __thiscall(ww, int pt[2] window-local, int button,
+// int), ret 0xc. Button 1 travels (or enters a location under the party); others did nothing. The world point is pt
+// plus the view's scroll (campaign +0x9d/+0xa1), as the game computes a destination.
+typedef char(__fastcall* MapMouseFn)(uint8_t*, void*, int*, int, int);
+MapMouseFn g_map_mouse = nullptr;
+const uintptr_t kMapMouseSlot = 0x82dbd0, kMapMouse = 0x6ba2a0;
+
+char __fastcall MapMouseHook(uint8_t* ww, void* edx, int* pt, int button, int extra) {
+    if (g_test.enabled && pt) Log("bot: world map mouse-down, button %d at (%d, %d)", button, pt[0], pt[1]);
+    if ((g_coop_host || g_coop_join) && pt && (button == 2 || (button == 1 && g_coop_join))) {
+        uint8_t* camp = *reinterpret_cast<uint8_t**>(kCampaignPtr2);
+        if (camp) {
+            float x = static_cast<float>(pt[0]) + *reinterpret_cast<float*>(camp + 0x9d);
+            float y = static_cast<float>(pt[1]) + *reinterpret_cast<float*>(camp + 0xa1);
+            if (g_coop_host) {
+                AddPing(0, x, y);
+            } else {
+                Log("co-op: world map: this player pings (%.1f, %.1f)", x, y);
+                SendPingToHost(x, y);
+            }
+            return 1;
+        }
+    }
+    return g_map_mouse(ww, edx, pt, button, extra);
+}
+
+// Host, the file server's GEN answer: " WMAP x y dx dy moving" while its world map ticked in the last second, and
+// " PINGS colour:x:y:age_ms ..." while any ping is live.
 void WorldMapLine(char* out, size_t cap) {
     out[0] = 0;
     AcquireSRWLockShared(&g_wm_lock);
     WorldMapState s = g_wm_host;
     DWORD t = g_wm_host_tick;
     ReleaseSRWLockShared(&g_wm_lock);
+    int n = 0;
     if (t && GetTickCount() - t < 1000)
-        sprintf_s(out, cap, " WMAP %.4f %.4f %.4f %.4f %d", s.x, s.y, s.dx, s.dy, s.moving);
+        n = sprintf_s(out, cap, " WMAP %.4f %.4f %.4f %.4f %d", s.x, s.y, s.dx, s.dy, s.moving);
+    MapPing p[4];
+    if (!LivePings(p)) return;
+    n += sprintf_s(out + n, cap - n, " PINGS");
+    for (int k = 0; k < 4; k++)
+        if (p[k].born)
+            n += sprintf_s(out + n, cap - n, " %d:%.1f:%.1f:%lu", k, p[k].x, p[k].y, GetTickCount() - p[k].born);
+}
+
+void PingsFromHost(const char* line) {  // joiner, the poller thread
+    const char* p = strstr(line, " PINGS");
+    MapPing got[4] = {};
+    if (p) {
+        p += 6;
+        int k, used;
+        float x, y;
+        unsigned long age;
+        while (sscanf_s(p, " %d:%f:%f:%lu%n", &k, &x, &y, &age, &used) == 4) {
+            p += used;
+            if (k >= 0 && k < 4 && age < kPingMs) got[k] = {x, y, (GetTickCount() - age) | 1};
+        }
+    }
+    AcquireSRWLockExclusive(&g_wm_lock);
+    for (int k = 0; k < 4; k++) {
+        if (got[k].born && (!g_pings[k].born || g_pings[k].x != got[k].x || g_pings[k].y != got[k].y)) {
+            static const char* const names[4] = {"red", "blue", "yellow", "green"};
+            Log("co-op: world map: %s pinged (%.1f, %.1f)", names[k], got[k].x, got[k].y);
+        }
+        if (!got[k].born || !g_pings[k].born || g_pings[k].x != got[k].x || g_pings[k].y != got[k].y)
+            g_pings[k] = got[k];  // the same ping keeps the time it was first heard here
+    }
+    ReleaseSRWLockExclusive(&g_wm_lock);
 }
 
 // Joiner, the poller thread: the host's party, from that answer.
 void WorldMapFromHost(const char* line) {
+    PingsFromHost(line);
     const char* p = strstr(line, " WMAP ");
     if (!p) return;
     WorldMapState s = {};
@@ -124,4 +213,16 @@ void WorldMapFromHost(const char* line) {
     g_wm_host = s;
     g_wm_host_tick = GetTickCount() | 1;
     ReleaseSRWLockExclusive(&g_wm_lock);
+}
+
+template <typename Fn>
+bool PatchSlot(uintptr_t slot, uintptr_t expect, void* hook, Fn* original);  // netlog.cpp
+
+bool InstallWorldMapHooks() {
+    if (!PatchSlot(kMapMouseSlot, kMapMouse, (void*)&MapMouseHook, &g_map_mouse)) return false;
+    g_travel_trampoline = HookWithTrampoline(kWorldMapTravel, kWorldMapTravelPrologue, sizeof(kWorldMapTravelPrologue),
+                                             (void*)&WorldMapTravelHook);
+    g_roll_trampoline = HookWithTrampoline(kWorldMapEncounterRoll, kWorldMapEncounterPrologue,
+                                           sizeof(kWorldMapEncounterPrologue), (void*)&WorldMapEncounterHook);
+    return g_travel_trampoline && g_roll_trampoline;
 }

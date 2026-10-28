@@ -767,6 +767,15 @@ def main():
                   f"host {hx},{hy}; joiner last {jpos[-1] if jpos else None}")
             moved = jpos and stop and any(abs(p[0] - jpos[0][0]) > 1 for p in jpos)
             check("the joiner's party moved on its map while the host's travelled", bool(moved))
+            pings = lambda log: dict((c, (float(x), float(y))) for c, x, y in
+                                     re.findall(r"co-op: world map: (red|blue) pinged \(([-\d.]+), ([-\d.]+)\)", log))
+            ph, pj = pings(host), pings(join)
+            check("the joiner's click became a blue ping on both maps", "blue" in ph and ph.get("blue") == pj.get("blue"),
+                  f"host {ph.get('blue')}, joiner {pj.get('blue')}")
+            check("the host's right click became a red ping on both maps", "red" in ph and ph.get("red") == pj.get("red"),
+                  f"host {ph.get('red')}, joiner {pj.get('red')}")
+            # A real right button can't be checked here: the test windows sit in the background, and the game takes no
+            # posted mouse input there (2026-10-28: a posted WM_RBUTTONDOWN never reached the map). Right = 2 is a guess.
             check("host bot started a mission from the world map", "bot: WORLD MAP -> " in host)
         elif scenario == "encounter":
             m = re.search(r"bot: ENCOUNTER dispatched \(mission mode now (\d+)\)", host)
