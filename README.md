@@ -4,7 +4,8 @@ Play the Fallout Tactics: Brotherhood of Steel single-player campaign with frien
 share one squad: everyone can order every squad member, and the host's campaign is the one being played.
 
 **Status: beta.** The campaign is playable in co-op; expect bugs. Every feature is covered by automated tests with
-several copies of the game on one PC, and it has been played on two PCs on one home network. See [What works](#what-works) and [Known issues](#known-issues).
+several copies of the game on one PC, and it has been played on two PCs on one home network. See
+[What works](#what-works) and [Known issues](#known-issues).
 
 ## 1. Check your game version
 
@@ -67,8 +68,8 @@ your original `binkw32.dll`.
 
 ### Networking
 
-All players must be able to reach the host's PC. On the same home network this just works. For friends elsewhere, the simplest way is a virtual LAN such as Tailscale or ZeroTier, then join
-as if on one network. The mod uses port **47701** (TCP for the save copy, UDP to find the host) on top of the
+All players must be able to reach the host's PC. On the same home network this just works. For friends elsewhere,
+the simplest way is a virtual LAN such as Tailscale or ZeroTier, then join as if on one network. The mod uses port **47701** (TCP for the save copy, UDP to find the host) on top of the
 game's own multiplayer ports. Windows Firewall may ask to allow the game the first time: allow it.
 
 ## What works
@@ -94,7 +95,7 @@ Checked by the automated tests in `test/`:
   Everyone sees it for 10 seconds; it stays on that spot as the map scrolls.
 - Fog of war on the world map: everyone uncovers the same ground (joiners start from the host's save and follow
   the host's party).
-- Turn-based combat, Individual and Squad, with 2 and 3 players. On the squad's turn every player can order the squad
+- Turn-based combat, Individual and Squad, with 2 to 4 players, including combat that starts by itself. On the squad's turn every player can order the squad
   (in Individual mode, the character whose turn it is), and any player can press End Turn or switch turn-based off.
 - The host's game settings count for everyone: difficulty, turn-based mode, CTB speed, friendly fire, violence and
   fast turn-based come from the host's options. Changing them on another player's PC has no effect while you play
@@ -113,8 +114,6 @@ Checked by the automated tests in `test/`:
 - While one player talks to anyone other than a merchant, or uses the recruiter, the other players' games pause until
   the conversation closes. Shops don't pause anyone (for the old behaviour, put the lines `[coop]` and
   `shop_no_pause=0` in a file `ftcoop.ini` next to `BOS.exe`, on every player's PC).
-- Joining from the Multiplayer menu waits about 3 s for DirectPlay to close the menu's session search; the waiting
-  message shows meanwhile.
 - A character who joins the squad through a story conversation (not the recruiter) still means a save and reload
   for everyone.
 - Played on two PCs on one home network; not tested over the internet yet.
@@ -133,22 +132,26 @@ copies also use [cnc-ddraw](https://github.com/FunkyFr3sh/cnc-ddraw) so several 
 needed to play.
 
 ```
-python -I test/run_test.py trade_host     # one test
-python -I test/run_suite.py               # every test (slow)
+python -I test/run_test.py trade_host                  # one test
+python -I test/run_test.py trade_host --inv-chaos      # with the other player moving items meanwhile
+python -I test/run_test.py chaos --save user/save/containers.sav --hold-frames 2000
+python -I test/run_suite.py                            # every test (slow)
 ```
 
 The tests load saves from the host copy's `core/user/save`: `New Save Game.sav` and `QuickSave.sav` (two different
 mission saves), `bunker.sav` (made in the bunker, with the merchant and the recruiter nearby) for the bunker tests,
-and `QuestBarter.sav` (in the bunker, squad member 1 next to General Barnaky, member 2 next to the quartermaster, a
-level-up pending) for the quest, level-up and shop-and-talk tests.
-The list of tests is in `test/run_test.py`.
+`QuestBarter.sav` (in the bunker, squad member 1 next to General Barnaky, member 2 next to the quartermaster, a
+level-up pending) for the quest, level-up and shop-and-talk tests, and `containers.sav` (containers to loot nearby)
+for the loot and chaos tests. The list of tests and their options is in `test/run_test.py`.
 
 ## How it works
 
 The game already has a lockstep multiplayer layer: every player's orders go to the host and come back to everyone
 on the same frame. The mod runs the campaign inside a multiplayer session, shares the squad, copies the host's save to
-joiners, and syncs the single-player screens that the multiplayer code never sent. A write-up of the reverse
-engineering will go in the [coop-anything](https://github.com/cranebeaker/coop-anything) playbook.
+joiners, and syncs the single-player screens that the multiplayer code never sent. The source is in `src/`
+(`netlog.cpp` lists which file holds what). The full write-up, with the reverse engineering notes, is in the
+[coop-anything](https://github.com/cranebeaker/coop-anything) playbook under `games/fallout-tactics` (in review:
+[pull request #240](https://github.com/cranebeaker/coop-anything/pull/240)).
 
 ## License
 

@@ -55,14 +55,14 @@ TESTS = {
     "worldmap": ("worldmap", "host", 5),  # on the world map the host travels and the joiner watches; its own travel is refused
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
     "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
-    "drift_host": ("drift", "host", 4),
+    "drift_host": ("drift", "host", 4),  # the joiner moves an NPC on its copy only; the host notices and corrects it, no reload
     "drift_equip": ("driftequip", "host", 4),  # the joiner empties a hand on its copy only; the host corrects it, no reload
-    "joinload": ("joinload", "join", 5),
-    "play": ("play", "host", 4),
+    "joinload": ("joinload", "join", 5),  # the joiner presses quick-load mid-mission: refused (only the host loads)
+    "play": ("play", "host", 4),  # a person plays both copies (--save, --hold-frames); the bots only log and compare
     "tbauto": ("tbauto", "all", 4),  # as turnbased, but the combat starts by itself: the host's squad fires (--host-turnbased)
     "turnbased": ("turnbased", "all", 4),  # the host turns turn-based on; every copy orders its member each squad turn, the players take turns ending it
     "chaos": ("chaos", "all", 6),  # every copy's bot moves, gives, opens screens and containers at random (--save, --hold-frames)
-    "invscreen": ("invscreen", "host", 10),  # exploration: the host sits in its inventory (--hold-frames: seconds; 0 = control)  # a person plays both copies (--save, --hold-frames); the bots only log and compare  # the joiner presses quick-load mid-mission: refused (only the host loads)  # the joiner moves an NPC on its copy only; the host notices and re-syncs
+    "invscreen": ("invscreen", "host", 10),  # exploration: the host sits in its inventory (--hold-frames: seconds; 0 = control)
     "survey": ("survey", "host", 0),  # exploration: the NPCs next to the first two squad members (use with --save)
     "quest_host": ("quest", "host", 4),  # QuestBarter.sav: the host talks to the quest giver; the joiner gets the changes
     "quest_join": ("quest", "join", 4),  # the same from the joiner
@@ -72,12 +72,12 @@ TESTS = {
     "levelrace": ("levelup", "all", 4),  # QuestBarter.sav: both press Level on the same frame; one screen wins
     "menu_join": ("move", "join", 7),  # both pick their role in the Multiplayer menu (Host / Join), not ftcoop.ini
     "dropin": ("dropin", "host", 4),  # host plays alone; a joiner arrives later through the menu; host re-syncs
-    "lootbody": ("lootbody", "all", 4),
-    "loot": ("loot", "all", 4),  # containers.sav: the joiner takes all, the host one stack (loot screens)  # exploration: the joiner uses a body (the host's squad makes one if needed)
-    "talk2": ("talk2", "all", 4),
-    "talk2same": ("talk2same", "all", 4),  # the same, with the same character: the joiner's talk is lost, its NPC must be freed  # bunker save: host and joiner talk to two different NPCs at the same moment
+    "lootbody": ("lootbody", "all", 4),  # exploration: the joiner uses a body (the host's squad makes one if needed)
+    "loot": ("loot", "all", 4),  # containers.sav: the joiner takes all, the host one stack (loot screens)
+    "talk2": ("talk2", "all", 4),  # bunker save: host and joiner talk to two different NPCs at the same moment
+    "talk2same": ("talk2same", "all", 4),  # the same, with the same character: the joiner's talk is lost, its NPC must be freed
     "talk_host": ("talk", "host", 4),  # bunker save: the host talks to an NPC, changes its game, ends: joiner gets it
-    "talk_join": ("talk", "join", 4),  # the same from the joiner: its save goes to the host, everyone reloads it
+    "talk_join": ("talk", "join", 4),  # the same from the joiner: its delta goes to every copy, no reload
     "trade_host": ("trade", "host", 4),  # bunker: both move; the host walks to the merchant, barters, trades; joiner gets it
     "trade_join": ("trade", "join", 4),  # the same with the joiner trading
     "recruit_host": ("recruit", "host", 4),  # bunker: the host talks to the recruiter and recruits; the joiner gets the squad
@@ -398,7 +398,7 @@ def main():
     if scenario == "drift":  # session 1 differs on purpose from the joiner's nudge; session 2 must not
         nd = re.search(r"bot: DRIFT moved NPC \d+ on this copy only, at frame (\d+)", join)
         talk_frame = int(nd.group(1)) if nd else None
-        fx = re.search(r"co-op: drift correction applied here too at frame (\d+)", host)
+        fx = re.search(r"co-op: drift: holding after frame (\d+)", host)  # every copy holds there for the correction
         fix_frame = int(fx.group(1)) if fx else None
         shared = [k for k in shared if k[0] >= 2 or (talk_frame is not None and k[1] < talk_frame)
                   or (fix_frame is not None and k[1] > fix_frame)]
@@ -899,11 +899,11 @@ def main():
         dd = re.findall(r"co-op: drift: .*'s game differs from ours at frame (\d+)", host)
         check("the host saw the joiner's game differ, from the next checked frame",
               bool(dd) and talk_frame is not None and int(dd[0]) - talk_frame <= 2 * 25, dd[:3])
-        check("the host sent its positions instead of reloading", "co-op: drift: sent every actor's position and HP" in host
+        check("the host sent its positions instead of reloading", "co-op: drift: sent the correction:" in host
               and "host: re-sync (" not in host and "join: following the host to generation 2" not in join)
-        fx = re.search(r"co-op: drift correction applied here too at frame (\d+)", host)
-        ap = re.search(r"co-op: a conversation's changes applied at frame (\d+) \(theirs\)", join)
-        check("both copies took the correction at the same frame", bool(fx) and bool(ap) and fx.group(1) == ap.group(1),
+        fx = re.search(r"co-op: drift: holding after frame (\d+)", host)
+        ap = re.search(r"co-op: drift: holding after frame (\d+)", join)
+        check("both copies held for the correction at the same frame", bool(fx) and bool(ap) and fx.group(1) == ap.group(1),
               f"host {fx.group(1) if fx else None}, joiner {ap.group(1) if ap else None}")
         after = [k for k in shared if fx and k[1] > int(fx.group(1))]
         check("at least 4 shared frames after it, all identical", len(after) >= 4
