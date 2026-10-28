@@ -160,6 +160,31 @@ void SnapshotAll(uint8_t* world, int frame) {
     }
     h = (h ^ *reinterpret_cast<uint16_t*>(world + 0x74f)) * 16777619u;
     Log("ETAB s=%ld f=%d n=%d hash=%08x", g_snap_tag, frame, count, h);
+    {  // the free list: unused slots, and how many of them its chain reaches from the head (a gap: slots lost to it,
+       // so the table grows sooner; the owner's grew 2000 -> 16000 in an evening, 2026-10-27)
+        int unused = 0, reach = 0, bad = 0;
+        static uint8_t seen[65536];
+        memset(seen, 0, count < 65536 ? count : 65536);
+        for (int i = 1; i < count; i++) {
+            void* p = *reinterpret_cast<void**>(e + i * 8);
+            if (!p || p == dummy) unused++;
+        }
+        for (uint16_t s = *reinterpret_cast<uint16_t*>(world + 0x74f); s && s < count && !seen[s];
+             s = *reinterpret_cast<uint16_t*>(e + s * 8 + 4)) {
+            seen[s] = 1;
+            void* p = *reinterpret_cast<void**>(e + s * 8);
+            if (p && p != dummy) bad++;  // a used slot on the free list
+            reach++;
+        }
+        char lost[256] = "";
+        size_t ll = 0;
+        for (int i = 1; i < count && ll + 8 < sizeof(lost); i++) {
+            void* p = *reinterpret_cast<void**>(e + i * 8);
+            if ((!p || p == dummy) && !seen[i]) ll += sprintf_s(lost + ll, sizeof(lost) - ll, " %d", i);
+        }
+        Log("FREE s=%ld f=%d unused=%d reach=%d lost=%d used_on_list=%d%s%s", g_snap_tag, frame, unused, reach,
+            unused - (reach - bad), bad, ll ? " e.g." : "", lost);
+    }
     {  // every entry, to diff copies offline: used (0/1), next_free, seq as hex, 4096 entries at most
         static char line[4096 * 12 + 64];
         size_t len = 0;

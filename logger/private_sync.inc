@@ -994,6 +994,31 @@ bool ReadIdList(DeltaReader& r, uint16_t* slots, uint16_t* seqs, int* n, int max
 const uint8_t* g_reapply_b = nullptr;  // the delta's 'B' op, written again on the next frame
 int g_reapply_wait = 0;
 
+// The bookkeeping above is the talker's as of its diff, written again on every copy once the deferred destroys have
+// finished, so every copy's free list agrees whatever order those destroys ran in. But those destroys had pushed
+// their slots onto the free list, and writing the older head back cut them off it: unused for good, so the table
+// grew sooner (recruit_host: 94 slots lost per recruit visit; the owner's table went 2000 -> 16000 in an evening,
+// 2026-10-27). So every unused slot the chain no longer reaches goes back on it, in slot order: the tables are the
+// same on every copy here, so the free lists come out the same too.
+void RelinkLostFreeSlots(uint8_t* world) {
+    uint8_t* e = Entries(world);
+    void* dummy = *reinterpret_cast<void**>(e);
+    int count = EntityCount(world);
+    static uint8_t on_list[65536];
+    memset(on_list, 0, count < 65536 ? count : 65536);
+    uint16_t* head = reinterpret_cast<uint16_t*>(world + kWorldFreeHead);
+    for (uint16_t s = *head; s && s < count && !on_list[s]; s = *reinterpret_cast<uint16_t*>(e + s * 8 + 4)) on_list[s] = 1;
+    int relinked = 0;
+    for (int i = count - 1; i >= 1; i--) {  // pushed from the top down: the lowest lost slot ends up first
+        void* p = *reinterpret_cast<void**>(e + i * 8);
+        if ((p && p != dummy) || on_list[i]) continue;
+        *reinterpret_cast<uint16_t*>(e + i * 8 + 4) = *head;
+        *head = static_cast<uint16_t>(i);
+        relinked++;
+    }
+    if (relinked) Log("co-op: %d free slots the bookkeeping had cut off the free list are on it again", relinked);
+}
+
 void ApplyBookkeeping(uint8_t* world, const uint8_t* p) {
     uint16_t count, head, nb;
     uint32_t serial;
@@ -1014,6 +1039,7 @@ void ApplyBookkeeping(uint8_t* world, const uint8_t* p) {
     }
     if (head != 0xffff) *reinterpret_cast<uint16_t*>(world + kWorldFreeHead) = head;
     if (serial) *reinterpret_cast<uint32_t*>(kEntitySerial) = serial;
+    RelinkLostFreeSlots(world);
 }
 
 // Main thread, at the start of every frame: the deferred destroys of the last delta have run; write its bookkeeping
