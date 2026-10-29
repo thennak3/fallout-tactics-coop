@@ -272,24 +272,47 @@ void __fastcall PortraitDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
 int* Rect(uint8_t* w) { return reinterpret_cast<int*>(w + 0xc3); }
 
 // Mission pings (worldmap_sync.inc): a middle click on the game view (vtable 0x804570 slot 51, 0x49d4e0, the same
-// mouse-down signature as the world map's). The view's camera is World+0x30: the game keeps the cursor in map pixels
-// as the view point less the camera's +0x1c/+0x20 (World+0x1e0, mouse move 0x49d860), so a ping is kept that way and
-// drawn at its map pixel plus this copy's camera: on the same ground for everyone, wherever each camera is.
+// mouse-down signature as the world map's). A world point is drawn at its isometric pixel (the projection 0x6e14f0,
+// __thiscall(World+0x34, int out[2], float xyz[3])) plus the scroll the projection keeps at World+0x58/+0x5c (ints,
+// set by 0x6e13d0 when the view moves), plus the draw target's offset *(World+0x30)+0x1c/+0x20 (the view draw at
+// 0x4a0180; its inverse 0x65a890). A ping is kept as the click less both: its pixel on the ground, the same for every
+// copy wherever each one looks, and drawn at that pixel plus this copy's scroll and offset, so it moves with the ground
+// and comes into sight when the view does. (0.10.3 and earlier left the scroll in: the flag stayed put on the screen
+// while the ground moved under it, owner.)
 const uintptr_t kViewMouseSlot = 0x804570 + 51 * 4, kViewMouse = 0x49d4e0;
+const uintptr_t kProject = 0x6e14f0, kSetViewCentre = 0x6e13d0;
 MapMouseFn g_view_mouse = nullptr;
 
-int* ViewCamera() {
+int* ViewCamera() {  // the draw target's offset
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     uint8_t* cam = world ? *reinterpret_cast<uint8_t**>(world + 0x30) : nullptr;
     return cam ? reinterpret_cast<int*>(cam + 0x1c) : nullptr;
 }
 
+int* ViewScroll() {
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    return world ? reinterpret_cast<int*>(world + 0x58) : nullptr;
+}
+
+// Where the game draws a world point in the view (test: the oracle a ping is measured against).
+bool ProjectToView(const float* xyz, int out[2]) {
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    int* cam = ViewCamera();
+    if (!world || !cam) return false;
+    reinterpret_cast<void(__thiscall*)(void*, int*, const float*)>(kProject)(world + 0x34, out, xyz);
+    out[0] += cam[0];
+    out[1] += cam[1];
+    return true;
+}
+
 char __fastcall ViewMouseHook(uint8_t* view, void* edx, int* pt, int button, int extra) {
     int* cam = ViewCamera();
-    if ((g_coop_host || g_coop_join) && pt && cam && (button & 0xff) == 3) {
-        if (g_test.enabled) Log("bot: mission view middle-click (%08x) at (%d, %d), camera (%d, %d)", button, pt[0], pt[1],
-                                cam[0], cam[1]);
-        PingHere(kPingMission, static_cast<float>(pt[0] - cam[0]), static_cast<float>(pt[1] - cam[1]));
+    int* scroll = ViewScroll();
+    if ((g_coop_host || g_coop_join) && pt && cam && scroll && (button & 0xff) == 3) {
+        if (g_test.enabled)
+            Log("bot: mission view middle-click (%08x) at (%d, %d), camera (%d, %d), scroll (%d, %d)", button, pt[0], pt[1],
+                cam[0], cam[1], scroll[0], scroll[1]);
+        PingHere(kPingMission, static_cast<float>(pt[0] - cam[0] - scroll[0]), static_cast<float>(pt[1] - cam[1] - scroll[1]));
         return 1;
     }
     return g_view_mouse(view, edx, pt, button, extra);
@@ -298,22 +321,31 @@ char __fastcall ViewMouseHook(uint8_t* view, void* edx, int* pt, int button, int
 void DrawPing(uint8_t* renderer, int x, int y, uint32_t argb, DWORD born);  // below, with the world map's
 
 // Draws this copy's live mission pings on the view; true when there were any.
+extern uint16_t g_ping_anchor;  // test: the squad member the bot's flag is measured against (0: none)
 bool DrawMissionPings(uint8_t* view, uint8_t* renderer) {
     MapPing p[4];
     int* cam = ViewCamera();
-    if (!cam || !LivePings(p)) return false;
+    int* scroll = ViewScroll();
+    if (!cam || !scroll || !LivePings(p)) return false;
     static DWORD said = 0;
-    bool say = g_test.enabled && GetTickCount() - said > 1000, drew = false;
+    bool say = g_test.enabled && GetTickCount() - said > 250, live = false;
+    int w = Rect(view)[2] - Rect(view)[0], h = Rect(view)[3] - Rect(view)[1];
+    int anchor[2] = {0, 0};
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    bool anchored = say && g_ping_anchor && world && ProjectToView(EntityPos(world, g_ping_anchor), anchor);
     for (int k = 0; k < 4; k++) {
         if (!p[k].born || p[k].where != kPingMission) continue;
-        int x = static_cast<int>(p[k].x) + cam[0], y = static_cast<int>(p[k].y) + cam[1];
-        DrawPing(renderer, x, y, kDotColour[k], p[k].born);
-        if (say) Log("bot: mission drawn with ping %s at (%d, %d), camera (%d, %d), age %lu ms", kDotName[k], x, y,
-                     cam[0], cam[1], GetTickCount() - p[k].born);
-        drew = true;
+        live = true;
+        int x = static_cast<int>(p[k].x) + scroll[0] + cam[0], y = static_cast<int>(p[k].y) + scroll[1] + cam[1];
+        bool seen = x > -20 && x < w + 20 && y > -10 && y < h + 30;  // the flag reaches 26 up and 13 right of its foot
+        if (seen) DrawPing(renderer, x, y, kDotColour[k], p[k].born);
+        if (say)
+            Log("bot: mission %s ping %s at (%d, %d), anchor (%d, %d), scroll (%d, %d), view %dx%d, age %lu ms",
+                seen ? "drawn with" : "off screen:", kDotName[k], x, y, anchor[0], anchor[1], scroll[0], scroll[1], w, h,
+                GetTickCount() - p[k].born);
     }
-    if (say && drew) said = GetTickCount();
-    return drew;
+    if (say && live) said = GetTickCount();
+    return live;  // a ping off screen still redraws the view: it comes into sight as the view scrolls
 }
 
 void __fastcall ViewDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
@@ -419,19 +451,40 @@ void __fastcall WorldMapDrawHook(uint8_t* self, void* edx, uint8_t* renderer) {
 // Test (mission_ping): the host middle-clicks its view, then the joiner, through the view's mouse-down slot as the
 // game's input calls it (the button in the low byte, junk above); each copy logs its camera and takes screenshots
 // while both pings show, while they fade and after they are gone. True when done, at the same frame on every copy.
+uint16_t g_ping_anchor = 0;
+// Each copy then moves its own view (0x6e13d0, the view's centre in world units): a little (the flag stays in sight
+// and must keep its place against the anchor, squad member 0, as the game draws it), far off (out of sight: not
+// drawn), and back where it was (drawn again, in the same place against the anchor).
 bool BotMissionPings(int rel) {
     static DWORD clicked = 0;
-    static int shots = 0;
+    static int shots = 0, phase = 0;
+    static float home[3];
     int* cam = ViewCamera();
-    if (!g_view || !cam) return false;
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    if (!g_view || !cam || !world) return false;
     if (rel % 15 == 0) Log("bot: PINGCAM rel=%d camera (%d, %d)", rel, cam[0], cam[1]);
     typedef char(__thiscall * MouseFn)(void*, int*, int, int);
     MouseFn mouse = reinterpret_cast<MouseFn>((*reinterpret_cast<void***>(g_view))[51]);
     if (!clicked && rel >= (g_coop_host ? 40 : 55)) {
-        int pt[2] = {g_coop_host ? 300 : 500, g_coop_host ? 200 : 260};
-        Log("bot: PING this copy middle-clicks its view at (%d, %d)", pt[0], pt[1]);
+        uint16_t squad[16];
+        int a[2];
+        if (GetSquad(world, squad, 16) < 1 || !ProjectToView(EntityPos(world, squad[0]), a)) return false;
+        g_ping_anchor = squad[0];
+        memcpy(home, world + 0x4c, sizeof(home));  // the view's centre (0x6e13d0 keeps it at World+0x4c..0x54)
+        int pt[2] = {a[0] + (g_coop_host ? 40 : -40), a[1] + 20};
+        Log("bot: PING this copy middle-clicks its view at (%d, %d), anchor %u at (%d, %d)", pt[0], pt[1], squad[0], a[0], a[1]);
         mouse(g_view, pt, g_coop_host ? 0x5a5a5a03 : 0x12345603, 0);
         clicked = GetTickCount();
+    }
+    static const DWORD kPhaseAt[3] = {1500, 3000, 4500};
+    static const float kShift[3] = {8.0f, 3000.0f, 0.0f};  // world units along x (about 24 pixels each): near, far off, home
+    static const char* const kPhase[3] = {"near", "away", "back"};
+    if (clicked && phase < 3 && GetTickCount() - clicked > kPhaseAt[phase]) {
+        float c[3] = {home[0] + kShift[phase], home[1], home[2]};
+        reinterpret_cast<void(__thiscall*)(void*, const float*)>(kSetViewCentre)(world + 0x34, c);
+        int* sc = ViewScroll();
+        Log("bot: PING view moved %s: scroll now (%d, %d)", kPhase[phase], sc[0], sc[1]);
+        phase++;
     }
     static const DWORD kShotAt[3] = {2500, 6500, 9500};  // both solid, fading, gone
     if (clicked && shots < 3 && GetTickCount() - clicked > kShotAt[shots] && g_shot_event) {

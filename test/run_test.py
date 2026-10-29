@@ -866,16 +866,46 @@ def main():
         for c, who in (("red", "host"), ("blue", "joiner")):
             check(f"the {who}'s middle click became a {c} ping on both copies", c in ph and ph.get(c) == pj.get(c),
                   f"host {ph.get(c)}, joiner {pj.get(c)}")
-        drawn = lambda log: [(c, int(x), int(y), int(cx), int(cy), int(age)) for c, x, y, cx, cy, age in re.findall(
-            r"bot: mission drawn with ping (red|blue) at \((-?\d+), (-?\d+)\), camera \((-?\d+), (-?\d+)\), age (\d+)", log)]
-        for who, log, got in (("host", host, ph), ("joiner", join, pj)):
-            d = drawn(log)
-            off = [r for r in d if r[0] in got and (r[1] - r[3], r[2] - r[4]) != tuple(int(v) for v in got[r[0]])]
-            check(f"the {who} drew both flags on their spot of the map (drawn point less its camera)",
-                  {r[0] for r in d} == {"red", "blue"} and not off, f"{len(d)} draws, off {off[:2]}")
+        # Each copy's flags against its anchor (squad member 0, where the game draws it), through the view's moves:
+        # near (in sight), away (out of sight), back. In order of the log, with the phase each line falls in.
+        rec = re.compile(r"bot: mission (drawn with|off screen:) ping (red|blue) at \((-?\d+), (-?\d+)\), anchor "
+                         r"\((-?\d+), (-?\d+)\), scroll \((-?\d+), (-?\d+)\), view \d+x\d+, age (\d+)|"
+                         r"bot: PING view moved (near|away|back)")
+        rel = {}
+        for who, log in (("host", host), ("joiner", join)):
+            phase, d = "start", []
+            for m in rec.finditer(log):
+                if m.group(10):
+                    phase = m.group(10)
+                    continue
+                if (m.group(5), m.group(6)) == ("0", "0"):  # this copy had not picked its anchor yet
+                    continue
+                d.append((phase, m.group(1) == "drawn with", m.group(2), int(m.group(3)) - int(m.group(5)),
+                          int(m.group(4)) - int(m.group(6)), (int(m.group(7)), int(m.group(8))), int(m.group(9))))
+            check(f"the {who}'s view moved near, away and back",
+                  all(f"bot: PING view moved {p}" in log for p in ("near", "away", "back")))
+            scrolls = {r[0]: r[5] for r in d}
+            check(f"the {who}'s scroll changed with each move and came back home",
+                  len(scrolls) == 4 and len({scrolls["start"], scrolls["near"], scrolls["away"]}) == 3
+                  and scrolls["back"] == scrolls["start"], str(scrolls))
+            seen = [r for r in d if r[1]]
+            offs = {c: {(r[3], r[4]) for r in seen if r[2] == c} for c in ("red", "blue")}
+            rel[who] = offs
+            check(f"the {who} drew both flags in one place against the anchor, before and after the view moved",
+                  all(len(offs[c]) == 1 for c in offs) and any(r[0] == "start" for r in seen) and
+                  any(r[0] == "back" for r in seen), f"{offs}")
+            check(f"the {who}'s flags moved with the ground while in sight (drawn after the near move, elsewhere on screen)",
+                  any(r[0] == "near" for r in seen) and
+                  {(r[2], r[5]) for r in seen if r[0] == "near"}.isdisjoint({(r[2], r[5]) for r in seen if r[0] == "start"}),
+                  f"{len([r for r in seen if r[0] == 'near'])} near draws")
+            away = [r for r in d if r[0] == "away"]
+            check(f"the {who} drew no flag while its view was away", away and not any(r[1] for r in away),
+                  f"{len(away)} lines, {sum(r[1] for r in away)} drawn")
             check(f"the {who} drew them while they faded and not after 8 s",
-                  any(r[5] > 5000 for r in d) and all(r[5] < 8000 for r in d), f"ages {[r[5] for r in d]}")
+                  any(r[6] > 5000 for r in seen) and all(r[6] < 8000 for r in d), f"ages {[r[6] for r in d][:12]}")
             check(f"the {who} took its three screenshots", log.count("dots: window captured as") >= 3)
+        check("each flag sits in the same place against the anchor on both copies", rel["host"] == rel["joiner"],
+              f"host {rel['host']}, joiner {rel['joiner']}")
     elif scenario == "resync":
         check("host re-synced: quick-save then quick-load",
               "host: re-sync (bot: mid-mission re-sync): quick-save" in host and "quick-save written" in host)
