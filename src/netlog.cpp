@@ -975,6 +975,20 @@ bool PrivateScreensClosed() {
     return others;
 }
 
+// A load (a re-sync, the host's save, a quick-load) closes every screen: whatever they did is gone with the old
+// world. Without this the next frame took the load for the screens closing, measured the new world against the old
+// snapshot, and uploaded it for a second, third reload (shopresync; the owner's night, sessions 6 to 8).
+void DropPrivateScreens() {
+    if (g_private_open) Log("co-op: a load closed this player's private screens: nothing to send");
+    g_private_open = false;
+    g_private_speech = nullptr;
+    g_private_recruit = false;
+    g_talker_hold = false;  // the hold was on the old world
+    g_my_conv_light = g_other_conv_light = false;
+    g_suppress_pause = false;
+    g_suppressed = 0;
+}
+
 void WaitPopupTick(uint8_t* w) {
     if (!g_wait_popup_up) return;
     uintptr_t vt = *reinterpret_cast<uintptr_t*>(w);
@@ -1701,8 +1715,14 @@ void __fastcall ClientRecvHook(void* self, void* /*edx*/, const uint8_t* msg, in
             g_join_state = 'P';
             Notice("Co-op: in the host's game");
         }
+        g_world_closing = false;
         ClearNpcLocks();
         ClearHeldCommands();  // shop_sync.inc
+        // A drift seen in the old session (held off by a shop's lock) is gone with it: acted on in the new one, it was
+        // a second re-sync straight after the first (shopresync).
+        if (g_drift_reason[0]) Log("co-op: new session: the old session's drift report is dropped");
+        g_drift_reason[0] = 0;
+        g_drift_kinds = 0;
         if (g_coop_host) {
             Log("session %ld started (%s)", n, g_session_coop ? "co-op lobby" : "alone");
             // World map -> mission starts without a load, so no joiner could come along: re-sync by save.

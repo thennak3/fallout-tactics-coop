@@ -85,6 +85,9 @@ Checked by the automated tests in `test/`:
 - Shopping pauses nobody: the other players keep playing while one shops. While a shop is open, the shopper's
   character can't be ordered by the others, and the recruiter waits until the shop closes. Item moves by the others
   meanwhile (giving, equipping, taking, dropping) take effect when the shop closes, so the games stay the same.
+- A re-sync while a player is shopping: afterwards everyone can talk to the merchant and order that character again,
+  with no extra reloads. (In 0.10.3 and earlier the merchant and the shopper's character stayed refused, "a player
+  is trading", in every later session, even after going back to the menu.)
 - The selection dots, with 2 and 4 players.
 - Recruiting and dismissing squad members, without a reload (the game pauses for everyone while the recruit screen
   is up, since it changes the squad everyone plays).

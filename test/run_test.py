@@ -81,7 +81,8 @@ TESTS = {
     "talk_host": ("talk", "host", 4),  # bunker save: the host talks to an NPC, changes its game, ends: joiner gets it
     "talk_join": ("talk", "join", 4),  # the same from the joiner: its delta goes to every copy, no reload
     "trade_host": ("trade", "host", 4),  # bunker: both move; the host walks to the merchant, barters, trades; joiner gets it
-    "trade_join": ("trade", "join", 4),  # the same with the joiner trading
+    "trade_join": ("trade", "join", 4),
+    "shopresync": ("shopresync", "join", 4),  # bunker: the joiner's shop is open when a re-sync reloads everyone; the host then orders that character and talks to the merchant  # the same with the joiner trading
     "recruit_host": ("recruit", "host", 4),  # bunker: the host talks to the recruiter and recruits; the joiner gets the squad
     "recruit_join": ("recruit", "join", 4),  # the same with the joiner recruiting
     "recruitnew_host": ("recruitnew", "host", 4),  # bunker: the host recruits someone never recruited; no reload
@@ -230,7 +231,7 @@ def main():
     global SAVE
     if args.save:
         SAVE = args.save
-    elif scenario in ("talk", "talk2", "talk2same", "trade", "trade2", "recruit", "recruitnew", "browse", "exit"):
+    elif scenario in ("talk", "talk2", "talk2same", "trade", "trade2", "shopresync", "recruit", "recruitnew", "browse", "exit"):
         SAVE = "user/save/bunker.sav"
     elif scenario in ("quest", "shoptalk", "levelup"):
         SAVE = "user/save/QuestBarter.sav"
@@ -416,7 +417,7 @@ def main():
         fix_frame = int(fx.group(1)) if fx else None
         shared = [k for k in shared if k[0] >= 2 or (talk_frame is not None and k[1] < talk_frame)
                   or (fix_frame is not None and k[1] > fix_frame)]
-    if scenario in ("talk", "quest", "shoptalk", "levelup", "trade", "trade2", "recruit", "recruitnew", "browse"):
+    if scenario in ("talk", "quest", "shoptalk", "levelup", "trade", "trade2", "shopresync", "recruit", "recruitnew", "browse"):
         # Before the talk both copies match; from the talk the talker's game differs until the other copy applied the
         # talker's delta (no reload); from the frame after that, everything must match again.
         # (a level-up does not hold the others: its changes land there up to a second later, so those frames are skipped)
@@ -812,6 +813,27 @@ def main():
         g2 = [k for k in shared if k[0] == 2]
         check("at least 4 shared snapshot frames in generation 2, all identical",
               len(g2) >= 4 and all(s_host[k] == s_join[k] for k in g2), f"{len(g2)} generation-2 frames")
+    elif scenario == "shopresync":
+        check("the joiner's shop opened on the host's copy", "co-op: shop of NPC 96 open for another player" in host)
+        check("the host re-synced while the shop was open",
+              "bot: re-sync while the shop of squad member" in host and "re-sync (bot: re-sync while a shop is open)" in host)
+        h2 = host.split("session 2 started", 1)[1] if "session 2 started" in host else ""
+        j2 = join.split("session 2 started", 1)[1] if "session 2 started" in join else ""
+        check("the reloaded session reached the host's moves", "after the re-sync, moves the squad member" in h2
+              and "after the re-sync, talks to the merchant" in h2)
+        check("every copy dropped the open shop (the others at the new session, the shopper when the load closed it)",
+              "the shop state is cleared" in host and "shop: closed by a load: no deal sent" in join)
+        # Until the host's own shop opens (its talk to the merchant leads there; the joiner's refusals after are the
+        # trade test's own, and right)
+        cut = lambda log: log.split("co-op: shop of NPC 96 open for", 1)[0]
+        refused = [l for l in (cut(h2) + cut(j2)).splitlines() if "refused this player's" in l or "dropped player" in l]
+        check("nothing refused in the reloaded session (the character moved, the merchant talked)", not refused, refused[:2])
+        check("no second re-sync after the first (no upload of the closed shop, no stale drift report)",
+              "session 3 started" not in host and "a load closed this player's private screens" in join, "")
+        check("the host's talk to the merchant opened a conversation", "co-op: this player started a conversation" in h2)
+        g2 = [k for k in shared if k[0] >= 2]
+        check("at least 4 shared snapshot frames after the re-sync, all identical",
+              len(g2) >= 4 and all(s_host[k] == s_join[k] for k in g2), f"{len(g2)} frames")
     elif scenario == "savemenu":
         steps = ["opening the game menu", "pressing Save", "the save screen is up", "leaving the save screen",
                  "save screen closed", "closing the game menu", "game menu closed", "quick-saving"]

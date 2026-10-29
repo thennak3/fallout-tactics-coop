@@ -226,6 +226,13 @@ bool AnyLevelLock() {
     return false;
 }
 
+void ClearLevelLocks() {  // a new session: no character screen is open anywhere
+    if (AnyLevelLock() || g_level_mine_sent) Log("co-op: new session: the character screen locks are cleared");
+    for (LevelLock& l : g_level_locks) l = {};
+    g_level_mine_sent = false;
+    g_level_mine_won = false;
+}
+
 // The squad member a character screen shows: the first squad EntityID inside the window (test mode logs every one).
 uint16_t CharacterOfScreen(uint8_t* w) {
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);

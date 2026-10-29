@@ -393,11 +393,21 @@ void RestoreQuickSaveAfterCrash() {  // at start: a backup left behind means a r
     Log("co-op: restored QuickSave.sav from an unfinished re-sync%s", ok ? "" : " - FAILED");
 }
 
+void DropPrivateScreens();  // netlog.cpp
+// The mission is being torn down for a load (a joiner following the host, the host's re-sync, any load) until the
+// next session starts. A shop closed by the teardown measured its deal against a half-gone world and sent it, and the
+// others applied it in the new session (shopresync: the free lists apart from then on).
+bool g_world_closing = false;
+
 // Host: every load passes its save file through the save check; serve it as a new generation.
 char __fastcall LoadCheckHook(void* self, void* /*edx*/, void** file) {
     char name[260] = "";
     const wchar_t* w = file ? reinterpret_cast<const wchar_t*>(*file) : nullptr;
     if (w) WideCharToMultiByte(CP_ACP, 0, w, -1, name, sizeof(name), nullptr, nullptr);
+    if (g_coop_host || g_coop_join) {
+        g_world_closing = true;
+        DropPrivateScreens();
+    }
     if (g_coop_host && g_quicksave_guard && _stricmp(name, kQuickSaveName) == 0) {
         // Serve a copy: the player's own QuickSave.sav goes back in place once this session starts.
         if (CopyFileA(kQuickSavePath, kResyncPath, FALSE)) strcpy_s(name, kResyncName);
@@ -627,6 +637,7 @@ void JoinerFollowHost(uint8_t* window) {
     g_join_ignore_server = false;
     Log("join: following the host to generation %ld from %s (load \"%s\", close with 0x10)", g_loaded_gen,
         vt == kCampaignWindowVtable ? "the world map" : "the mission", kReceivedName);
+    g_world_closing = true;
     reinterpret_cast<void(__thiscall*)(void*, int)>((*reinterpret_cast<void***>(window))[close_slot / 4])(window, 0x10);
 }
 
@@ -716,6 +727,7 @@ void HostResyncStep() {
             Log("host: re-sync: quick-save written, pop-up gone after %d frames, quick-load", waited);
             g_resync_state = 3;
             waited = 0;
+            g_world_closing = true;
             reinterpret_cast<void(__fastcall*)(void*)>(kQuickLoad)(game_main);
         } else if (QuickSaveRetry(game_main, waited, "host"), ++waited > 1200) {
             Log("host: re-sync FAILED: after %d frames save written=%d, pop-up=%08x", waited,
@@ -727,6 +739,7 @@ void HostResyncStep() {
         // Still in the same mission long after quick-load was asked for: it was refused, try again.
         if (++waited > 100) {
             Log("host: re-sync: still in the mission 100 frames after quick-load, retrying");
+            g_world_closing = false;
             g_resync_state = 2;
             waited = 0;
         }
@@ -736,10 +749,12 @@ void HostResyncStep() {
         AssignFileToLoad(kUploadName);
         g_resync_state = 6;
         waited = 0;
+        g_world_closing = true;
         reinterpret_cast<void(__thiscall*)(void*, int)>((*reinterpret_cast<void***>(game_main))[0x38 / 4])(game_main, 0x10);
     } else if (g_resync_state == 6) {
         if (++waited > 100) {
             Log("host: re-sync: still in the mission 100 frames after loading the joiner's save, retrying");
+            g_world_closing = false;
             g_resync_state = 5;
         }
     }

@@ -1889,7 +1889,11 @@ int ConversationOpened(uint8_t* w) {
     return owner;
 }
 
-// A new session (a load, a re-sync) starts every conversation over: no NPC is busy.
+// A new session (a load, a re-sync) starts every conversation over: no NPC is busy, on this copy or at the host
+// (the host's locks outlived a desync reload and a trip to the menu, and kept refusing the merchant: owner).
+void ClearHostLocks();
+void ClearShopState();      // shop_sync.inc
+void ClearLevelLocks();     // recruit_sync.inc
 void ClearNpcLocks() {
     int n = 0;
     for (auto& l : g_npc_locks)
@@ -1897,7 +1901,22 @@ void ClearNpcLocks() {
             n++;
             l.npc = 0;
         }
+    g_claim_npc = 0;
+    g_claim_mine = false;
+    g_claim_tick = 0;
+    g_my_claim = 0;
+    g_my_claim_npc = 0;
+    g_local_talk_npc = 0;
+    g_last_other_npc = 0;
+    // A delta of ours that a load cut off never comes round: the next one (the host's drift correction) was taken for
+    // ours and skipped (shopresync: the free lists stayed apart until a second reload).
+    if (g_delta_mine) Log("co-op: new session: our delta that never came round is forgotten");
+    g_delta_mine = false;
+    g_rx_len = 0;
     if (n) Log("co-op: new session: %d NPC lock(s) cleared", n);
+    ClearHostLocks();
+    ClearShopState();
+    ClearLevelLocks();
 }
 
 bool HoldForShop(void* actor, void* edx, uint8_t* cmd);  // shop_sync.inc
@@ -1994,6 +2013,16 @@ bool RefuseLockedTalk(uint8_t* msg, int len) {
 // its talker's kSyncDone comes through; a talk from anyone else to that NPC is dropped from the message.
 struct HostLock { uint16_t npc; int sender; DWORD since; };
 HostLock g_host_locks[16];
+
+void ClearHostLocks() {
+    int n = 0;
+    for (auto& l : g_host_locks)
+        if (l.npc) {
+            n++;
+            l.npc = 0;
+        }
+    if (n) Log("host: new session: %d talk lock(s) cleared", n);
+}
 
 int HostFilterTalks(uint8_t* msg, int len, int sender) {
     if (len < 6 || *reinterpret_cast<uint32_t*>(msg) != 2) return len;

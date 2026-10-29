@@ -40,7 +40,10 @@ bool IsActor(uint8_t* world, int i) {
 // recruit: dismiss two, add one back (the list selects the last dismissed); recruitnew: add someone never recruited
 bool IsRecruitScenario() { return _stricmp(g_test.scenario, "recruit") == 0 || _stricmp(g_test.scenario, "recruitnew") == 0; }
 // trade: one player trades; trade2: then the other player trades with the same merchant and also sells an item
-bool IsTradeScenario() { return _stricmp(g_test.scenario, "trade") == 0 || _stricmp(g_test.scenario, "trade2") == 0; }
+bool IsTradeScenario() {
+    return _stricmp(g_test.scenario, "trade") == 0 || _stricmp(g_test.scenario, "trade2") == 0 ||
+           _stricmp(g_test.scenario, "shopresync") == 0;
+}
 DWORD g_bot_level_tick = 0;
 
 void DumpWindowTree(uint8_t* w, int depth);  // below
@@ -951,6 +954,11 @@ void BotTradeSpeechTick(uint8_t* w) {  // the open conversation's tick (no game 
     static int ticks = 0;
     if (++ticks == 10) {
         g_bot_done_step[1] = true;
+        if (_stricmp(g_test.scenario, "shopresync") == 0 && g_coop_host) {  // after the re-sync: talking is the test
+            Log("bot: the host's conversation with the merchant is up: closing it");
+            g_end_game_mode = true;
+            return;
+        }
         g_bot_barter_speech = w;
     }
 }
@@ -1048,7 +1056,9 @@ void BotTradeGameMainTick(uint8_t* w) {  // the mission screen's tick, after its
             g_bot_deal_offered = false;
             BotDealPress(w, world);
         }
-        if (barter_up && GetTickCount() - barter_up >= 2000) {
+        // shopresync: the shop stays up until the host's re-sync reloads everyone
+        DWORD barter_hold = _stricmp(g_test.scenario, "shopresync") == 0 ? 60000 : 2000;
+        if (barter_up && GetTickCount() - barter_up >= barter_hold) {
             barter_up = 0;
             Log("bot: leaving the barter screen");
             g_end_game_mode = true;
@@ -2319,7 +2329,36 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             BotTalk(client, world, 0, frame);
             g_bot_talker = keep;
         }
-        int end_at = _stricmp(s, "trade2") == 0 ? talk_at + 750 : talk_at + 450;
+        // shopresync: a re-sync while the other player's shop is open (the owner's night: the shop never closed, and
+        // in every later session the merchant and the shopper's character stayed refused). The host forces it 3 s after
+        // the shop opened; in the reloaded session the host moves the shopper's character, then talks to the merchant.
+        bool shopresync = _stricmp(s, "shopresync") == 0;
+        static uint16_t resync_buyer = 0;
+        static DWORD shop_seen = 0;
+        if (shopresync && g_coop_host && g_snap_tag == 1 && ShopOpenForOther(&shop_buyer)) {
+            if (!shop_seen) shop_seen = GetTickCount();
+            if (GetTickCount() - shop_seen > 3000 && Once(12)) {
+                resync_buyer = shop_buyer;
+                Log("bot: re-sync while the shop of squad member %u is open", shop_buyer);
+                RequestResync("bot: re-sync while a shop is open");
+            }
+        }
+        if (shopresync && g_coop_host && g_snap_tag >= 2 && resync_buyer) {
+            uint16_t squad[16];
+            int n = GetSquad(world, squad, 16);
+            if (rel_s >= 60 && Once(13))
+                for (int i = 0; i < n; i++)
+                    if (squad[i] == resync_buyer) {
+                        Log("bot: after the re-sync, moves the squad member %u that was trading", resync_buyer);
+                        BotMoveMember(client, world, i, 3);
+                    }
+            if (rel_s >= 120 && Once(14)) {
+                g_bot_talker = resync_buyer;
+                Log("bot: after the re-sync, talks to the merchant");
+                BotTalk(client, world, kMerchant, frame);
+            }
+        }
+        int end_at = _stricmp(s, "trade2") == 0 ? talk_at + 750 : shopresync ? talk_at + 1500 : talk_at + 450;
         if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= end_at)) BotFinish();  // no reload: session 1 goes on
     } else if (_stricmp(s, "turnbased") == 0 || _stricmp(s, "tbauto") == 0) {
         static int done_at = -1;

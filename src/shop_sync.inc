@@ -267,6 +267,12 @@ void ExecuteShopOpen(const uint8_t* r) {
 void __fastcall QmDtorHook(uint8_t* self, void* /*edx*/) {
     auto original = reinterpret_cast<void(__thiscall*)(void*)>(g_qm_dtor_trampoline);
     bool closing = g_shop.open && g_shop.mine;
+    extern bool g_world_closing;
+    if (closing && g_world_closing) {  // a load closed the shop: the deal goes with the old world, nothing is sent
+        Log("co-op: shop: closed by a load: no deal sent");
+        g_shop = {};
+        closing = false;
+    }
     if (closing) {  // before the destructor undoes anything: the deal, measured from the shop's opening
         // The destructor's first step, 0x4569a0, hands back what is still on the offer tables (out of each offer
         // inventory, vt+0x508, into its owner's, vt+0x504; a stack that merges is destroyed). Done here first, so the
@@ -493,6 +499,17 @@ bool HoldForShop(void* actor, void* edx, uint8_t* cmd) {  // ActorActHook: true 
 void ClearHeldCommands() {  // a new session
     g_shop_hold = false;
     g_nheld = 0;
+}
+
+// A new session: no shop is open anywhere. A re-sync while a shop was open left g_shop.open set, and every later
+// Barter press said someone was already trading (owner).
+void ClearShopState() {
+    if (g_shop.open || g_shop_requested) Log("co-op: new session: the shop state is cleared");
+    g_shop = {};
+    g_shop_requested = false;
+    g_shop_close_waits = false;
+    g_shop_speech = nullptr;
+    g_shop_button = nullptr;
 }
 
 void RunHeldCommands() {  // frame hook, after RunDeferredCreates: every copy at the same frame
