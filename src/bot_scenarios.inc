@@ -47,6 +47,107 @@ void DumpWindowTree(uint8_t* w, int depth);  // below
 
 bool g_bot_level_request = false;
 bool g_bot_inv_request = false;  // invscreen: press INV from the mission screen's tick
+bool g_bot_menu_request = false;  // savemenu: open the Escape menu and its save screen from the mission screen's tick
+bool g_bot_menu_done = false;
+
+// savemenu: the host does what a player does to save: opens the Escape menu (SetMode 2) and stays in it 3 s, presses its
+// Save button (0x482180), sits in the save screen for [test] hold seconds (9 if 0), leaves it, stays in the menu 3 s
+// more, closes it, and quick-saves (as the quick-save key does), while the joiner keeps ordering its member. Presses
+// come from the application's input pump (save_sync.inc), as clicks do: Save pressed from a window tick, inside the
+// world's step, hung the save screen's loop on a lock (2026-10-28). In that loop no window tick of ours runs (as for
+// WPickPerk, recruit_sync.inc), so the pump ends it: Cancel's result 0x10 through EndModal (vtable +0x34).
+extern uint8_t* g_saveload_window;  // save_sync.inc
+extern DWORD g_saveload_opened;
+uint8_t* g_bot_press_save = nullptr;  // the game menu whose Save the pump presses
+bool g_bot_save_closed = false;
+bool g_bot_quick_save = false;
+DWORD g_bot_clicks_from = 0;  // joiner: orders its member from the pump every 2 s from here (the host is in its menu)
+void BotMoveMember(uint8_t* client, uint8_t* world, int member, unsigned variant);
+
+// With its window in the background the save screen's loop sleeps until a window message comes: wake it while it is up.
+DWORD WINAPI SaveScreenWaker(LPVOID) {
+    while (g_saveload_window) {
+        if (g_pump_hwnd) PostMessageA(g_pump_hwnd, WM_NULL, 0, 0);
+        Sleep(250);
+    }
+    return 0;
+}
+
+void BotPumpTick() {  // save_sync.inc's input-pump hook, test mode
+    if (_stricmp(g_test.scenario, "savemenu") != 0) return;
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    if (!world) return;
+    int frame = *reinterpret_cast<int*>(world + kWorldFrame);
+    DWORD now = GetTickCount();
+    static DWORD last_click = 0;
+    static unsigned clicks = 0;
+    if (g_bot_clicks_from && now - g_bot_clicks_from < 22000 && now - last_click > 2000 && g_client_ptr) {
+        last_click = now;
+        Log("bot: SAVEMENU the joiner orders its member (click %u) at frame %d", ++clicks, frame);
+        BotMoveMember(g_client_ptr, world, g_test.index, 1 + clicks);
+    }
+    static uint8_t* screen = nullptr;
+    if (g_saveload_window && g_saveload_window != screen) {
+        screen = g_saveload_window;
+        Log("bot: SAVEMENU the save screen is up at frame %d", frame);
+        CloseHandle(CreateThread(nullptr, 0, SaveScreenWaker, nullptr, 0, nullptr));
+    }
+    if (screen && g_saveload_window &&
+        now - g_saveload_opened > static_cast<DWORD>(g_test.hold > 0 ? g_test.hold : 9) * 1000) {
+        uint8_t* w = g_saveload_window;
+        Log("bot: SAVEMENU leaving the save screen at frame %d (pause counter %d)", frame, world[0x2db]);
+        reinterpret_cast<void(__thiscall*)(void*, int)>((*reinterpret_cast<void***>(w))[0x34 / 4])(w, 0x10);
+        return;
+    }
+    if (screen && !g_saveload_window && !g_bot_save_closed) {
+        g_bot_save_closed = true;
+        Log("bot: SAVEMENU save screen closed at frame %d (pause counter %d)", frame, world[0x2db]);
+    }
+    if (uint8_t* menu = g_bot_press_save) {
+        g_bot_press_save = nullptr;
+        Log("bot: SAVEMENU pressing Save at frame %d (pause counter %d)", frame, world[0x2db]);
+        reinterpret_cast<void(__thiscall*)(void*, int)>(0x482180)(menu, 0);  // as the button: in co-op it waits for a hold
+    }
+    if (g_bot_quick_save) {
+        g_bot_quick_save = false;
+        uint8_t* gm = *reinterpret_cast<uint8_t**>(kGameMainPtr);
+        Log("bot: SAVEMENU quick-saving at frame %d", frame);
+        if (gm) reinterpret_cast<void(__fastcall*)(void*)>(kQuickSave)(gm);  // as the key: in co-op it waits for a hold
+    }
+}
+
+void BotSaveMenuTick(uint8_t* w) {
+    static int step = 0;  // 1 menu asked for, 2 in the menu, 3 Save pressed, 4 menu closing
+    static DWORD at = 0;
+    uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    if (!world) return;
+    int frame = *reinterpret_cast<int*>(world + kWorldFrame);
+    bool on_main = *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable;
+    bool on_menu = strstr(RttiName(w), "WGameMenu@@") != nullptr;
+    if (step == 0 && g_bot_menu_request && on_main) {
+        step = 1;
+        Log("bot: SAVEMENU opening the game menu at frame %d (pause counter %d)", frame, world[0x2db]);
+        reinterpret_cast<void(__thiscall*)(void*, int)>(kGameMainSetMode)(w, 2);
+    } else if (step == 1 && on_menu) {
+        step = 2;
+        at = GetTickCount();
+    } else if (step == 2 && on_menu && GetTickCount() - at > 3000) {
+        step = 3;
+        at = 0;
+        g_bot_press_save = w;  // BotPumpTick presses it
+        Log("bot: SAVEMENU Save to be pressed from the pump (frame %d)", frame);
+    } else if (step == 3 && g_bot_save_closed && on_main && !at) {
+        at = GetTickCount();  // back in the menu
+    } else if (step == 3 && at && on_main && GetTickCount() - at > 3000) {
+        step = 4;
+        Log("bot: SAVEMENU closing the game menu at frame %d (pause counter %d)", frame, world[0x2db]);
+        g_end_game_mode = true;  // SetMode(0), from the mission screen's tick (PrivateScreenTick)
+    } else if (step == 4 && on_main && !g_bot_menu_done && *reinterpret_cast<int*>(w + 0x156) == 0) {
+        g_bot_menu_done = true;
+        Log("bot: SAVEMENU game menu closed at frame %d (pause counter %d)", frame, world[0x2db]);
+        g_bot_quick_save = true;
+    }
+}
 DWORD g_bot_inv_tick = 0;
 DWORD g_bot_inv_hold_ms = 0;  // chaos: how long the INV screen stays up (0: [test] hold seconds)
 
@@ -1241,6 +1342,7 @@ void __fastcall WindowTickHook(uint8_t* w) {
     if (g_test.enabled && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable &&
         (_stricmp(g_test.scenario, "turnbased") == 0 || _stricmp(g_test.scenario, "tbauto") == 0))
         BotTurnBasedTick(w);
+    if (g_test.enabled && _stricmp(g_test.scenario, "savemenu") == 0) BotSaveMenuTick(w);
     if (g_test.enabled && (g_bot_inv_request || g_bot_inv_tick) && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
         if (g_bot_inv_request) {  // the game bar's INV button: handler 0x47fab0 (owner +0x10e, the WGameBar)
             g_bot_inv_request = false;
@@ -1871,6 +1973,13 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
     } else if (_stricmp(s, "move") == 0) {
         if (rel >= 30 && Once(0) && i_act) BotMoveMember(client, world, 0, 0);
         if (rel >= 410) BotFinish();
+    } else if (_stricmp(s, "savemenu") == 0) {
+        // Both copies order a member (they walk), then the host sits in the Escape menu and its save screen
+        // (BotSaveMenuTick) while the joiner keeps clicking orders for its member, on wall-clock time from its pump.
+        if (rel >= 30 && Once(0)) BotMoveMember(client, world, g_coop_host ? 0 : g_test.index, 0);
+        if (rel >= 40 && g_coop_host && Once(1)) g_bot_menu_request = true;
+        if (rel >= 40 && g_coop_join && Once(1)) g_bot_clicks_from = GetTickCount();
+        if (rel >= 450 && (g_coop_join || g_bot_menu_done)) BotFinish();
     } else if (_stricmp(s, "ping") == 0) {
         if (BotMissionPings(rel)) BotFinish();  // dots.inc
     } else if (_stricmp(s, "simul") == 0) {

@@ -40,7 +40,7 @@
 // a talk to a locked NPC from anyone else (two players clicking at the same moment).
 const uint8_t kCoopCmd = 0x30;
 enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6, kRecruitOpen = 7, kLevelOpen = 8,
-       kLevelClose = 9, kFixHold = 10, kGameSettings = 11 };  // 11: settings_sync.inc  // 10: drift.inc (every copy holds for the host's correction)  // 8, 9: recruit_sync.inc (the level-up lock)
+       kLevelClose = 9, kFixHold = 10, kGameSettings = 11, kSaveHold = 12, kSaveDone = 13 };  // 12, 13: save_sync.inc  // 11: settings_sync.inc  // 10: drift.inc (every copy holds for the host's correction)  // 8, 9: recruit_sync.inc (the level-up lock)
 void HandleLevelRecord(const uint8_t* r);  // recruit_sync.inc  // 5, 6: shop_sync.inc; 7: recruit_sync.inc
 bool g_recruit_synced = false;  // a recruit screen is up and every copy made its candidates (recruit_sync.inc)
 void HandleRecruitOpen(const uint8_t* r);  // recruit_sync.inc
@@ -1699,10 +1699,16 @@ void CoopCommandAtFrame(const uint8_t* r);                                      
 
 void ReleaseFixHold(const char* why);  // drift.inc
 
+void SaveDoneArrived(const uint8_t* r);  // save_sync.inc
+
 void HandleCoopCommand(const uint8_t* r) {
     uint8_t kind = r[3], n = r[4];
     uint16_t npc;
     memcpy(&npc, r + 5, 2);
+    if (kind == kSaveDone) {
+        SaveDoneArrived(r);
+        return;
+    }
     if (kind == kTalkClaim) {
         uint32_t claim;
         memcpy(&claim, r + 7, 4);

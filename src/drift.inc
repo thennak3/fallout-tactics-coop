@@ -240,13 +240,14 @@ const uintptr_t kStepGate = 0x635ce0;                     // char __thiscall(Cli
 const uintptr_t kStepGateCalls[] = {0x4fc060, 0x4fc0c5};  // before the time is added, and in the step loop
 const DWORD kFixHoldMaxMs = 8000;
 bool g_fix_hold = false;
+bool g_save_hold = false;  // save_sync.inc: every copy holds while one saves
 bool g_fix_sent = false;
 uint8_t g_fix_kinds = 0;
 int g_fix_frame = 0;
 DWORD g_fix_since = 0;
 
 char __fastcall StepGateHook(void* client, void* edx) {
-    if (g_fix_hold) return 0;
+    if (g_fix_hold || g_save_hold) return 0;
     return reinterpret_cast<char(__thiscall*)(void*)>(kStepGate)(client);
 }
 

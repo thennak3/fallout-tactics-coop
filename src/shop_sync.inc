@@ -333,12 +333,17 @@ bool TakeWorldFix(const uint8_t** data, int* len);  // drift.inc
 
 // ActorActHook: a co-op command at its frame, on every copy.
 void FixHoldAtFrame(const uint8_t* r);  // drift.inc
+void SaveHoldAtFrame(const uint8_t* r);  // save_sync.inc
 
 void CoopCommandAtFrame(const uint8_t* r) {
     uint8_t kind = r[3];
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     if (kind == kFixHold) {
         FixHoldAtFrame(r);
+        return;
+    }
+    if (kind == kSaveHold) {
+        SaveHoldAtFrame(r);
         return;
     }
     if (kind == kGameSettings) {

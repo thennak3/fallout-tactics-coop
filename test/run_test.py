@@ -53,7 +53,8 @@ TESTS = {
     "fetch_save": ("move", "host", 7),  # joiner loads a different save; only the transfer can sync it
     "encounter": ("encounter", "host", 5),  # mission -> world map -> random encounter (mode 2); host re-syncs, joiner follows
     "worldmap": ("worldmap", "host", 5),
-    "mission_ping": ("ping", "host", 4),  # the host, then the joiner, middle-click the mission view: both flags on both copies, fading  # on the world map the host travels and the joiner watches; its own travel is refused
+    "mission_ping": ("ping", "host", 4),
+    "savemenu": ("savemenu", "host", 6),  # both walk; the host sits in the Escape menu 3 s, its save screen 9 s, the menu 3 s  # the host, then the joiner, middle-click the mission view: both flags on both copies, fading  # on the world map the host travels and the joiner watches; its own travel is refused
     "transition": ("transition", "host", 5),  # mission -> world map -> mission; host re-syncs, joiner follows
     "resync": ("resync", "host", 7),  # 1 snapshot in session 1 + 6 in session 2; mid-mission quick-save + quick-load; joiner follows into session 2
     "drift_host": ("drift", "host", 4),  # the joiner moves an NPC on its copy only; the host notices and corrects it, no reload
@@ -101,6 +102,8 @@ GROW_TABLE = False  # --grow-table: talks: the talker's entity table grows while
 INV_CHAOS = False  # --inv-chaos: trades: the copy that doesn't trade gives and equips at random meanwhile
 MENU_CANCEL = False  # --menu-cancel: the host cancels the Load Game screen Start Co-op opens (the call returns to the menu)
 SHOP_NO_PAUSE = True  # a shop pauses nobody (the default); --shop-pause: the old held conversation
+MENU_PAUSE = False  # --menu-pause: the old way, the Escape menu and save screen pause their own copy only
+SAVE_ALONE = False  # --save-alone: the old way, a save is written on the saver's copy only
 DROPIN_DELAY_S = 10  # dropin: start the joiner this long after the host, so the host is already playing
 
 
@@ -116,6 +119,10 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
         f.write(f"[coop]\nmode={'off' if menu else mode}\nhost={HOST_IP}\nshare_squad={1 if share_squad else 0}\n")
         f.write(f"fetch_save={1 if fetch else 0}\nfollow={1 if follow else 0}\n")
         f.write(f"shop_no_pause={1 if SHOP_NO_PAUSE else 0}\n")
+        if MENU_PAUSE:
+            f.write("menu_pause=1\n")
+        if SAVE_ALONE:
+            f.write("save_in_step=0\n")
         if FORCE_FILE_SERVER:  # trade with 3-4 players: the delta then goes through the host's file server
             f.write("lockstep_chunks=10\n")
         f.write(f"[test]\nenabled=1\nsave={save}\nscenario={scenario}\nactor={actor}\njoiners={joiners}\n")
@@ -197,18 +204,24 @@ def main():
     ap.add_argument("--chaos-no-select", action="store_true", help="chaos: the bots never change their selection")
     ap.add_argument("--inline-delta", action="store_true", help="3-4 player trades: send the deal through lockstep, not the file server")
     ap.add_argument("--shop-pause", action="store_true", help="the old way: a shop holds every copy while it is open")
+    ap.add_argument("--save-alone", action="store_true",
+                    help="mutation: a save is written on the saver's copy only, no hold (0.10.2 and earlier)")
+    ap.add_argument("--menu-pause", action="store_true",
+                    help="mutation: the Escape menu and save screen pause their own copy only (0.10.2 and earlier)")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
     ap.add_argument("--grow-table", action="store_true", help="talks: the talker's entity table grows mid-conversation; no reload")
     ap.add_argument("--inv-chaos", action="store_true", help="trades: the other copy gives, equips and unequips at random meanwhile")
     ap.add_argument("--menu-cancel", action="store_true", help="menu tests: the host opens Load Game from Start Co-op, cancels it, then loads")
     ap.add_argument("--save", default=None, help="save both copies start from (default New Save Game.sav)")
     args = ap.parse_args()
-    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE, ENTITY_LOG, CHAOS_NO_SELECT, MENU_CANCEL, INV_CHAOS, GROW_TABLE
+    global HOST_IP, FORCE_FILE_SERVER, SHOP_NO_PAUSE, MENU_PAUSE, SAVE_ALONE, ENTITY_LOG, CHAOS_NO_SELECT, MENU_CANCEL, INV_CHAOS, GROW_TABLE
     MENU_CANCEL = args.menu_cancel
     INV_CHAOS = args.inv_chaos
     GROW_TABLE = args.grow_table
     HOST_IP = args.host_ip
     SHOP_NO_PAUSE = not args.shop_pause
+    MENU_PAUSE = args.menu_pause
+    SAVE_ALONE = args.save_alone
     ENTITY_LOG = args.entity_log
     CHAOS_NO_SELECT = args.chaos_no_select
     extras = EXTRA_JOIN_DIRS[:args.joiners - 1]
@@ -799,6 +812,29 @@ def main():
         g2 = [k for k in shared if k[0] == 2]
         check("at least 4 shared snapshot frames in generation 2, all identical",
               len(g2) >= 4 and all(s_host[k] == s_join[k] for k in g2), f"{len(g2)} generation-2 frames")
+    elif scenario == "savemenu":
+        steps = ["opening the game menu", "pressing Save", "the save screen is up", "leaving the save screen",
+                 "save screen closed", "closing the game menu", "game menu closed", "quick-saving"]
+        for st in steps:
+            check(f"the host's bot: {st}", f"bot: SAVEMENU {st}" in host)
+        fr = lambda st: int((re.search(rf"bot: SAVEMENU {st}.*?at frame (\d+)", host) or [0, -1])[1])
+        if not MENU_PAUSE:
+            check("the world ran on while the host sat in the game menu", fr("pressing Save") > fr("opening the game menu") + 20
+                  and fr("closing the game menu") > fr("save screen closed") + 20,
+                  f"frames {fr('opening the game menu')} -> {fr('pressing Save')}, {fr('save screen closed')} -> "
+                  f"{fr('closing the game menu')}")
+            check("the menus paused nothing (their pauses not passed on)",
+                  "the game menu's pause is not passed on" in host and "pause counter 0)" in host)
+        if not SAVE_ALONE:
+            holds = re.findall(r"co-op: save: every copy holds after frame (\d+) \((this|another) copy saves: ([a-z -]+)\)", host)
+            jholds = re.findall(r"co-op: save: every copy holds after frame (\d+)", join)
+            check("both saves held every copy at the same frame (the save screen, then the quick-save)",
+                  [h[0] for h in holds] == jholds and len(holds) == 2 and all(h[1] == "this" for h in holds),
+                  f"host {holds}, joiner {jholds}")
+            check("the joiner wrote nothing for the cancelled save screen, its own quick-save for the quick-save",
+                  "going on (the saver did not save" in join and "going on (wrote the same save as the saver" in join)
+            check("the host's quick-save was written, nothing waited or saved alone",
+                  "co-op: save: ours is done (saved)" in host and "saving alone" not in host + join)
     elif scenario == "ping":
         for c, who, log in (("red", "host", host), ("blue", "joiner", join)):
             check(f"the {who} middle-clicked its view", "bot: PING this copy middle-clicks its view" in log)

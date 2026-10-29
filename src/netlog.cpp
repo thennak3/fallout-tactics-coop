@@ -639,6 +639,19 @@ bool g_private_recruit = false;         // the recruit screen was among them (pr
 // keeps running (the conversation's own pause, World+0x2db via 0x4fc800, is swallowed on that copy) and no other copy
 // holds.
 bool g_shop_no_pause = false;
+// The Escape menu (WGameMenu, constructor 0x4817b0, destructor 0x4820f0) and the save screen (WSaveLoad, 0x4bcfa0 /
+// 0x4bdc10) raise the pause counter on their own copy only, as in single player. Its world stopped and, with its
+// ticks, every other copy's (savemenu: host and joiner both at frame 1995 for the 15 s the host sat in the menu; no
+// drift came of it). In co-op they pause nothing: the world runs on under the menu on every copy, as it does under a
+// shop (owner: no global pauses for routine actions). [coop] menu_pause=1 keeps the old pause (mutation test). The
+// drift after a save came from the write itself (save_sync.inc).
+bool g_menu_pause = false;
+int g_menu_pauses_swallowed = 0;  // menu pauses not passed on, so their unpauses are not passed on either
+
+bool MenuPauseCaller(uintptr_t from) {
+    return (from >= 0x4817b0 && from < 0x4820eb) || (from >= 0x4820f0 && from < 0x482165) ||
+           (from >= 0x4bcfa0 && from < 0x4bdc0d) || (from >= 0x4bdc10 && from < 0x4bdda4);
+}
 // A conversation with a quartermaster who is not a recruiter (shop_no_pause): nobody waits. Kept apart for this
 // player's own conversation and the last other player's, which can overlap (one shops while another talks).
 bool g_my_conv_light = false;
@@ -648,6 +661,18 @@ int g_suppressed = 0;                   // their balance: +1 per pause swallowed
 uint8_t* g_pause_trampoline = nullptr;  // the game's pause-counter change, 0x4fc800 (__thiscall(World*, bool), ret 4)
 
 void __fastcall PauseHook(void* world, void* /*edx*/, int on) {
+    if (MenuPauseCaller(reinterpret_cast<uintptr_t>(_ReturnAddress()))) {
+        bool coop = g_coop_join || (g_coop_host && LiveJoiners() > 0);
+        if ((on & 0xff) && coop && !g_menu_pause) {
+            g_menu_pauses_swallowed++;
+            Log("co-op: the game menu's pause is not passed on: the world runs on under it (%d)", g_menu_pauses_swallowed);
+            return;
+        }
+        if (!(on & 0xff) && g_menu_pauses_swallowed > 0) {
+            g_menu_pauses_swallowed--;
+            return;
+        }
+    }
     if (g_suppress_pause) {
         g_suppressed += (on & 0xff) ? 1 : -1;
         Log("co-op: swallowed the game's %s (balance %d)", (on & 0xff) ? "pause" : "resume", g_suppressed);
@@ -1086,6 +1111,7 @@ DWORD g_main_thread_id = 0;
 #include "dots.inc"
 #include "drift.inc"
 #include "recruit_sync.inc"
+#include "save_sync.inc"
 
 
 // On a hang, log where the game's main thread is: EIP and BOS.exe return addresses on its stack.
@@ -1874,6 +1900,7 @@ void Init() {
     InstallDots();
     InstallRecruitHooks();
     InstallLevelUpHooks();
+    InstallSaveSyncHooks();
     Log("co-op: joiner load guard %s, %s",
         PatchSlot(kGameMainVtable + 0x38, 0x6c6260, (void*)&GameMainCloseHook, &g_gamemain_close) ? "ok" : "FAILED",
         PatchSlot(kCampaignWindowVtable + 0x34, 0x6c61f0, (void*)&CampaignCloseHook, &g_campaign_close) ? "ok" : "FAILED");
@@ -1884,6 +1911,7 @@ void Init() {
     g_lockstep_chunks = GetPrivateProfileIntA("coop", "lockstep_chunks", 300, ".\\ftcoop.ini");
     g_recreate_recruits = GetPrivateProfileIntA("coop", "recreate_recruits", 0, ".\\ftcoop.ini");
     g_shop_no_pause = GetPrivateProfileIntA("coop", "shop_no_pause", 1, ".\\ftcoop.ini") != 0;
+    g_menu_pause = GetPrivateProfileIntA("coop", "menu_pause", 0, ".\\ftcoop.ini") != 0;
     {
         static const uint8_t kPausePrologue[] = {0x8a, 0x44, 0x24, 0x04, 0x84, 0xc0};  // mov al, [esp+4]; test al, al
         g_pause_trampoline = HookWithTrampoline(0x4fc800, kPausePrologue, sizeof(kPausePrologue), (void*)&PauseHook);

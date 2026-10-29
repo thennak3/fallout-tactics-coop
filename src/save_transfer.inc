@@ -362,6 +362,8 @@ DWORD WINAPI FileServerThread(LPVOID) {
     }
 }
 
+void OurQuickSave(void* game_main);  // save_sync.inc: the game's quick-save, never turned into a co-op request
+
 bool g_quicksave_guard = false;  // host: a re-sync is using the quick-save slot; the owner's file is set aside
 bool g_quicksave_had = false;    // the owner had a QuickSave.sav before the re-sync
 
@@ -666,7 +668,7 @@ void QuickSaveRetry(uint8_t* game_main, int waited, const char* who) {
                 str == *reinterpret_cast<void**>(0x8bc71c) ? "empty" : "set", *reinterpret_cast<uint16_t*>(world + 0x513));
         }
     }
-    reinterpret_cast<void(__fastcall*)(void*)>(kQuickSave)(game_main);
+    OurQuickSave(game_main);  // save_sync.inc: never a request
 }
 
 // Every copy runs its own Server, also a joiner (its single-player lobby's, idle once it joined the host), and a save
@@ -698,7 +700,7 @@ void HostResyncStep() {
         GuardQuickSave();
         GetSystemTimeAsFileTime(&g_resync_mark);
         Log("host: re-sync (%s): quick-save", g_resync_reason);
-        reinterpret_cast<void(__fastcall*)(void*)>(kQuickSave)(game_main);
+        OurQuickSave(game_main);  // save_sync.inc: never a request
         g_resync_state = 2;
         waited = 0;
     } else if (g_resync_state == 2) {
@@ -778,7 +780,7 @@ void JoinerPushStep() {
         GetSystemTimeAsFileTime(&g_resync_mark);
         Log("join: quick-save for the host");
         LocalServerTicksToFrame();
-        reinterpret_cast<void(__fastcall*)(void*)>(kQuickSave)(game_main);
+        OurQuickSave(game_main);  // save_sync.inc: never a request
         g_push_state = 2;
         waited = 0;
         return;

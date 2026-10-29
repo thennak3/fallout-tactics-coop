@@ -111,6 +111,12 @@ Checked by the automated tests in `test/`:
 - Equipping and swapping weapons and armour between squad members. If hands or armour ever differ between the
   games, the host's drift check puts them right without a reload.
 - Leaving a co-op session to the main menu (it crashed in 0.9.2 and earlier).
+- Saving during a co-op mission, by quick-save or from the game menu's Save. Every player's game holds for a
+  moment while the save is written, and writes the same save in step, so nobody drifts afterwards (in 0.10.2 and
+  earlier a save was usually followed by a drift and a save-and-reload). A save screen opened another way, such as
+  by a keyboard shortcut, still saves alone; any drift after it is corrected as before.
+- The game menu (Escape) no longer pauses anyone's game in co-op: the game carries on behind it for everyone, as it
+  does in a shop. The save screen itself still stops everyone while it is open, as before.
 
 ## Known issues
 
