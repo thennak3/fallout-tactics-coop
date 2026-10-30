@@ -90,6 +90,13 @@ Checked by the automated tests in `test/`:
   is trading", in every later session, even after going back to the menu.)
 - A co-op host playing alone, before anyone joins: after a conversation or a shop the squad moves again (in 0.10.4
   and earlier, the host's game stayed paused after it closed and nothing could move).
+- Shops without drifts afterwards, with 2 and 3 players, also when a shop stays open a long time and others move
+  items meanwhile: the drift check waits for the shop, and every copy has the host's quartermaster stock from the
+  start of every session (in 0.10.5 and earlier, a joiner could have none, and nearly every shop ended in a
+  save-and-reload). A save-and-reload asked for during a shop waits until it closes.
+- No drift after loads between copies that have been running for a long time, and one correction (no reload) when
+  several joiners report the same drift at once (in 0.10.5 and earlier, everyone could wait 10 s and then reload).
+- Traders who only barter pause nobody, as the quartermaster (new in 0.10.6, not yet covered by a test).
 - The selection dots, with 2 and 4 players.
 - Recruiting and dismissing squad members, without a reload (the game pauses for everyone while the recruit screen
   is up, since it changes the squad everyone plays).
@@ -130,6 +137,7 @@ Checked by the automated tests in `test/`:
 - While one player talks to anyone other than a merchant, or uses the recruiter, the other players' games pause until
   the conversation closes. Shops don't pause anyone (for the old behaviour, put the lines `[coop]` and
   `shop_no_pause=0` in a file `ftcoop.ini` next to `BOS.exe`, on every player's PC).
+- A trader who also gambles (such as the mechanic) still pauses everyone while you talk to them.
 - A character who joins the squad through a story conversation (not the recruiter) still means a save and reload
   for everyone.
 - Played on two PCs on one home network; not tested over the internet yet.
@@ -149,9 +157,13 @@ needed to play.
 ```
 python -I test/run_test.py trade_host                  # one test
 python -I test/run_test.py trade_host --inv-chaos      # with the other player moving items meanwhile
+python -I test/run_test.py trade_host --empty-stock --hold-frames 10   # a joiner without the stock, a 10 s shop
 python -I test/run_test.py chaos --save user/save/containers.sav --hold-frames 2000
 python -I test/run_suite.py                            # every test (slow)
 ```
+
+`test\sim\run_sim.bat` runs the drift check's decisions (`src/drift_judge.h`) against simulated copies, without the
+game, in under a second.
 
 The tests load saves from the host copy's `core/user/save`: `New Save Game.sav` and `QuickSave.sav` (two different
 mission saves), `bunker.sav` (made in the bunker, with the merchant and the recruiter nearby) for the bunker tests,
