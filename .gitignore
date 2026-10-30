@@ -11,3 +11,5 @@ __pycache__/
 # Never commit game files, saves or logs
 *.sav
 *.log
+test/sim/*.exe
+test/sim/*.obj

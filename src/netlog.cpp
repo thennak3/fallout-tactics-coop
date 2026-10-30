@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include "drift_judge.h"  // the drift check's decisions (drift.inc)
 
 namespace {
 
@@ -1734,9 +1735,8 @@ void __fastcall ClientRecvHook(void* self, void* /*edx*/, const uint8_t* msg, in
         ClearHeldCommands();  // shop_sync.inc
         // A drift seen in the old session (held off by a shop's lock) is gone with it: acted on in the new one, it was
         // a second re-sync straight after the first (shopresync).
-        if (g_drift_reason[0]) Log("co-op: new session: the old session's drift report is dropped");
-        g_drift_reason[0] = 0;
-        g_drift_kinds = 0;
+        if (g_judge.reason) Log("co-op: new session: the old session's drift report is dropped");
+        g_judge.NewSession();
         if (g_coop_host) {
             Log("session %ld started (%s)", n, g_session_coop ? "co-op lobby" : "alone");
             // World map -> mission starts without a load, so no joiner could come along: re-sync by save.

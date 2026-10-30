@@ -123,8 +123,8 @@ void ReleaseSaveHold(const char* why) {
     if (!g_save_hold) return;
     g_save_hold = false;
     g_save_mine = false;
-    g_drift_fix_frame = g_save_hold_frame + 1;  // as after a correction: the hashes from before it are not compared
-    g_drift_fix_gen = g_coop_host ? static_cast<long>(g_serve_gen) : g_loaded_gen;
+    // as after a correction: the hashes from before it are not compared
+    g_judge.CorrectionDone(g_coop_host ? static_cast<long>(g_serve_gen) : g_loaded_gen, g_save_hold_frame);
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     if (world) *reinterpret_cast<float*>(world + 0x2e7) = *reinterpret_cast<float*>(world + 0x2f7);  // no frames owed
     Log("co-op: save: going on (%s, held %lu ms)", why, GetTickCount() - g_save_hold_since);
