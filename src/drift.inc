@@ -24,6 +24,7 @@ struct DriftRec {
     uint32_t used;   // which slots hold an entity, and their seq numbers: two copies that differ here made other things
     uint32_t inv;    // every inventory (actors and containers)
     uint32_t attr;   // every character's attributes (stats, skills, perks)
+    bool shop;       // host: a shop was open (ShopBusy): this frame is not compared
 };
 DriftRec g_drift_ring[kDriftRing] = {};
 int g_drift_next = 0;
@@ -37,6 +38,7 @@ long g_drift_fix_gen = -1;   // the frame count: kept across loads, one correcti
 DWORD g_drift_last_resync = 0;
 const DWORD kLockBlocksResyncMs = 120000;  // an NPC lock this old holds up no re-sync (a held host still does)
 void StartWorldFix(uint8_t* world, uint8_t kinds);
+bool g_fix_hold = false;  // every copy holds for a correction (kFixHold, below)
 
 // HP too (owner, 2026-10-23: "sounds like we need a regular use this ID or seed sync as well"): a hit that landed on
 // one copy only (actor 683, frame 3742) left its HP 2 apart, it died at frame 3856 on one copy only, and its death's
@@ -104,7 +106,7 @@ void DriftFrame(uint8_t* world) {
     if (frame == last || frame % kDriftEvery) return;
     last = frame;
     DriftRec r = {g_coop_host ? static_cast<long>(g_serve_gen) : g_loaded_gen, frame, PosHash(world), TableHash(world),
-                  UsedHash(world), InvHash(world), AttrHash(world)};
+                  UsedHash(world), InvHash(world), AttrHash(world), ShopBusy()};
     AcquireSRWLockExclusive(&g_drift_lock);
     g_drift_ring[g_drift_next] = r;
     g_drift_next = (g_drift_next + 1) % kDriftRing;
@@ -172,10 +174,19 @@ void DriftFromJoiner(unsigned id, const char* name, const char* p) {
         ReleaseSRWLockShared(&g_drift_lock);
         if (!mine) continue;  // not ours yet (or long gone): compared on a later poll
         s->last_frame = frame;
+        // While a shop is open the shopper's game has what the others get at its close (the stock, the offers): every
+        // check differed, and the report made at the close reloaded everyone before the deal could be compared (the
+        // owner's night, 0.10.5: a reload after nearly every shop). The checks after the close count.
+        if (m.shop) {
+            s->misses = 0;
+            s->kinds = 0;
+            continue;
+        }
         uint8_t k = (m.pos != j.pos ? kDriftPos : 0) | (m.table != j.table ? kDriftTable : 0) |
                     (m.used != j.used ? kDriftEntities : 0) | (m.inv != j.inv ? kDriftInv : 0) |
                     (m.attr != j.attr ? kDriftAttr : 0);
         if (!k) {
+            if (g_test.enabled) Log("co-op: drift: test: %s's game matches ours at frame %d", name, frame);
             s->misses = 0;
             s->kinds = 0;
             s->same++;
@@ -203,7 +214,7 @@ void DriftFromJoiner(unsigned id, const char* name, const char* p) {
 // Host, main thread, every client tick: put a drifted joiner right when nobody is busy.
 void DriftCheckHost() {
     extern bool g_private_open;
-    if (!g_drift_reason[0] || g_private_open || g_resync_state != 0) return;
+    if (!g_drift_reason[0] || g_private_open || g_resync_state != 0 || ShopBusy() || g_fix_hold) return;
     for (const NpcLock& l : g_npc_locks)  // someone's conversation or shop is (about to be) open; a lock left over
         if (l.npc && GetTickCount() - l.since < kLockBlocksResyncMs) return;  // from a lost talk no longer blocks it
     DWORD now = GetTickCount();
@@ -239,7 +250,6 @@ void DriftCheckHost() {
 const uintptr_t kStepGate = 0x635ce0;                     // char __thiscall(Client*): may the world step a frame
 const uintptr_t kStepGateCalls[] = {0x4fc060, 0x4fc0c5};  // before the time is added, and in the step loop
 const DWORD kFixHoldMaxMs = 8000;
-bool g_fix_hold = false;
 bool g_save_hold = false;  // save_sync.inc: every copy holds while one saves
 bool g_fix_sent = false;
 uint8_t g_fix_kinds = 0;
@@ -259,8 +269,14 @@ void StartWorldFix(uint8_t* world, uint8_t kinds) {
     SendCoopRecords(rec, 1);
     char what[96];
     KindsText(kinds, what, sizeof(what));
-    Log("co-op: drift: asking every copy to hold for a correction (%s) at frame %d", what,
-        *reinterpret_cast<int*>(world + kWorldFrame));
+    int frame = *reinterpret_cast<int*>(world + kWorldFrame);
+    Log("co-op: drift: asking every copy to hold for a correction (%s) at frame %d", what, frame);
+    // The correction puts every copy right: another joiner's report from before it, often on its way already, is no
+    // new drift. Taken as one, it came within the 10 s after a correction and reloaded everyone (the owner's night,
+    // after every mission load with 3 players). The hold's own frame replaces this when it is over.
+    g_drift_fix_gen = static_cast<long>(g_serve_gen);
+    g_drift_fix_frame = frame + 2 * kDriftEvery;
+    g_drift_reason[0] = 0;
 }
 
 void FixHoldAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, the same frame on every copy

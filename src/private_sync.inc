@@ -40,7 +40,7 @@
 // a talk to a locked NPC from anyone else (two players clicking at the same moment).
 const uint8_t kCoopCmd = 0x30;
 enum { kSyncChunk = 1, kSyncDone = 3, kTalkClaim = 4, kShopOpen = 5, kShopClose = 6, kRecruitOpen = 7, kLevelOpen = 8,
-       kLevelClose = 9, kFixHold = 10, kGameSettings = 11, kSaveHold = 12, kSaveDone = 13 };  // 12, 13: save_sync.inc  // 11: settings_sync.inc  // 10: drift.inc (every copy holds for the host's correction)  // 8, 9: recruit_sync.inc (the level-up lock)
+       kLevelClose = 9, kFixHold = 10, kGameSettings = 11, kSaveHold = 12, kSaveDone = 13, kSerialSync = 14, kStockSync = 15 };  // 14, 15: settings_sync.inc  // 12, 13: save_sync.inc  // 11: settings_sync.inc  // 10: drift.inc (every copy holds for the host's correction)  // 8, 9: recruit_sync.inc (the level-up lock)
 void HandleLevelRecord(const uint8_t* r);  // recruit_sync.inc  // 5, 6: shop_sync.inc; 7: recruit_sync.inc
 bool g_recruit_synced = false;  // a recruit screen is up and every copy made its candidates (recruit_sync.inc)
 void HandleRecruitOpen(const uint8_t* r);  // recruit_sync.inc
@@ -1956,7 +1956,12 @@ void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
         uint8_t* who = world && npc < EntityCount(world) ? EntityById(world, npc) : nullptr;
         bool recruiter = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f0 / 4])(who);
         bool quartermaster = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f4 / 4])(who);
-        bool light = g_shop_no_pause && quartermaster && !recruiter;
+        // Anyone who only barters (CanBarterWith, 254) shops as the quartermaster does: the shop's deal carries what
+        // changed. Not someone who also gambles (CanGambleWith, 256): a light conversation sends only its variables, so
+        // a gamble's items would stay on the talker's copy (the owner's mechanic paused everyone, 0.10.5).
+        bool barters = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f8 / 4])(who);
+        bool gambles = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x400 / 4])(who);
+        bool light = g_shop_no_pause && !recruiter && (quartermaster || (barters && !gambles));
         if (mine) {
             g_my_conv_light = light;
             g_diff_mode = light ? 1 : 0;
@@ -1967,7 +1972,8 @@ void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
         } else {
             g_other_conv_light = light;
         }
-        Log("co-op: NPC %u is %s: %s", npc, recruiter ? "a recruiter" : quartermaster ? "a quartermaster" : "someone else",
+        Log("co-op: NPC %u is %s: %s", npc, recruiter ? "a recruiter" : quartermaster ? "a quartermaster"
+                                          : barters ? (gambles ? "a trader who gambles" : "a trader") : "someone else",
             light ? "nobody waits" : "everyone waits while the conversation is up");
         if (!mine) g_last_other_npc = npc;
     }

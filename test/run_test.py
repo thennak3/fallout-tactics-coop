@@ -102,6 +102,10 @@ HOST_IP = "127.0.0.1"  # --host-ip: the address joiners connect to (this PC's LA
 FORCE_FILE_SERVER = False  # set in main: trades with more than one joiner use the file-server path
 ENTITY_LOG = False  # --entity-log: every entity made or destroyed, with the code that did it
 CHAOS_NO_SELECT = False  # --chaos-no-select: the chaos bots never change their selection
+NO_SERIAL_SYNC = False  # --no-serial-sync: mutation, the host sends no entity serial at session start (0.10.5)
+RESYNC_IN_SHOP = False  # --resync-in-shop: trades: the host asks for a re-sync 3 s into its own shop
+EMPTY_STOCK = False  # --empty-stock: every joiner's quartermaster stock emptied at each session start
+SERIAL_SKEW = 0  # --serial-skew N: every joiner's entity serial counter N ahead at each session start
 GROW_TABLE = False  # --grow-table: talks: the talker's entity table grows while its conversation is open
 INV_CHAOS = False  # --inv-chaos: trades: the copy that doesn't trade gives and equips at random meanwhile
 MENU_CANCEL = False  # --menu-cancel: the host cancels the Load Game screen Start Co-op opens (the call returns to the menu)
@@ -140,6 +144,14 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
             f.write("inv_chaos=1\n")
         if GROW_TABLE:
             f.write("grow_table=1\n")
+        if NO_SERIAL_SYNC and mode == "host":
+            f.write("no_serial_sync=1\n")
+        if RESYNC_IN_SHOP and mode == "host":
+            f.write("resync_in_shop=1\n")
+        if EMPTY_STOCK and mode == "join":
+            f.write("empty_stock=1\n")
+        if SERIAL_SKEW and mode == "join":
+            f.write(f"serial_skew={SERIAL_SKEW * index}\n")
         if MENU_CANCEL and menu and mode == "host":
             f.write("menu_cancel=1\n")
         if CHAOS_NO_SELECT:
@@ -213,6 +225,10 @@ def main():
     ap.add_argument("--menu-pause", action="store_true",
                     help="mutation: the Escape menu and save screen pause their own copy only (0.10.2 and earlier)")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
+    ap.add_argument("--no-serial-sync", action="store_true", help="mutation: the host sends no entity serial at session start")
+    ap.add_argument("--resync-in-shop", action="store_true", help="trades: the host asks for a re-sync 3 s into its own shop")
+    ap.add_argument("--empty-stock", action="store_true", help="joiners' quartermaster stock emptied at each session start")
+    ap.add_argument("--serial-skew", type=int, default=0, help="joiners' entity serial counters this far ahead at each session start")
     ap.add_argument("--grow-table", action="store_true", help="talks: the talker's entity table grows mid-conversation; no reload")
     ap.add_argument("--inv-chaos", action="store_true", help="trades: the other copy gives, equips and unequips at random meanwhile")
     ap.add_argument("--menu-cancel", action="store_true", help="menu tests: the host opens Load Game from Start Co-op, cancels it, then loads")
@@ -222,6 +238,11 @@ def main():
     MENU_CANCEL = args.menu_cancel
     INV_CHAOS = args.inv_chaos
     GROW_TABLE = args.grow_table
+    global SERIAL_SKEW, EMPTY_STOCK, NO_SERIAL_SYNC, RESYNC_IN_SHOP
+    NO_SERIAL_SYNC = args.no_serial_sync
+    RESYNC_IN_SHOP = args.resync_in_shop
+    EMPTY_STOCK = args.empty_stock
+    SERIAL_SKEW = args.serial_skew
     HOST_IP = args.host_ip
     SHOP_NO_PAUSE = not args.shop_pause
     MENU_PAUSE = args.menu_pause
@@ -245,6 +266,8 @@ def main():
     checks = []
 
     def check(name, ok, detail=""):
+        if RESYNC_IN_SHOP and name.startswith("no reload"):  # the test's own re-sync, asked for on purpose
+            name, ok, detail = name + " (not checked: --resync-in-shop reloads on purpose)", True, ""
         checks.append((name, ok, detail))
 
     # Preconditions: same mod build and same save in both copies.
@@ -1163,6 +1186,34 @@ def main():
         for who, log in [("host", host), ("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
             hits = re.findall(r"co-op: drift: (?!.*'s game matches ours).*|host: re-sync \(.*|join: following the host to generation \d+.*", log)
             check(f"{who}: never drifted (no drift report, correction or re-sync)", not hits, hits[0][:120] if hits else "")
+    if scenario in ("trade", "browse") and args.hold_frames > 0:
+        # A shop open for --hold-frames seconds, then 400 frames of play: the owner's night (0.10.5), a reload after
+        # nearly every shop. Every check after the close matches, and none counted while the shop was up.
+        m = re.search(r"co-op: shop closed at frame (\d+)", host)
+        closed = int(m.group(1)) if m else None
+        after = [int(f) for f in re.findall(r"co-op: drift: test: .*'s game matches ours at frame (\d+)", host)
+                 if closed is not None and int(f) > closed]
+        differs = re.findall(r"co-op: drift: .*differs from ours at frame (\d+).*", host)
+        check("the shop stayed open for --hold-frames seconds and closed", closed is not None, m.group(0) if m else "")
+        check("at least 12 drift checks after the close, every one matching, for every joiner",
+              len(after) >= 12 * (1 + len(extra_logs)), f"{len(after)} matching checks after frame {closed}")
+        check("no drift reported at all (during the shop or after it)", not differs, differs[:3])
+        check("no re-sync", RESYNC_IN_SHOP or "host: re-sync (" not in host, re.findall(r"host: re-sync \(.*", host)[:1])
+    if RESYNC_IN_SHOP:
+        # The save waits for the shop: asked for during it, written only once it closed, and every copy has the same
+        # quartermaster stock in the reloaded session.
+        ask = host.find("bot: re-sync asked for during the host's own shop")
+        wait = host.find("host: re-sync (bot: re-sync during the host's shop): waiting for the shop to close")
+        closed = host.find("co-op: shop closed at frame")
+        saved = host.find("host: re-sync (bot: re-sync during the host's shop): quick-save")
+        check("the re-sync was asked for during the shop and waited for it", 0 <= ask < wait, f"asked {ask}, waited {wait}")
+        check("the quick-save came after the shop closed", 0 <= closed < saved, f"closed {closed}, saved {saved}")
+        def stock(log):
+            return re.findall(r"quartermaster stock (?:at the session start|is the host's|now the host's): (.*)", log)
+        hs = stock(host)
+        check("session 2: every copy has the host's quartermaster stock, and it is not empty",
+              len(hs) >= 2 and " 0 items" not in hs[-1] and all(stock(l)[-1:] == hs[-1:] for l in [join] + list(extra_logs)),
+              f"host {hs[-1:]}, joiner {stock(join)[-1:]}")
     if extra_logs:  # selection dots with 3-4 players: a colour each, and every copy shows every player
         colours = ["red", "blue", "yellow", "green"][:2 + len(extra_logs)]
         given = re.findall(r"host: .*'s colour is (\w+)", host)

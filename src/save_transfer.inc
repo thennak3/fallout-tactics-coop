@@ -702,12 +702,30 @@ void LocalServerTicksToFrame() {
     *reinterpret_cast<int*>(server + 0x99) = frame + 5;
 }
 
+bool ShopBusy();  // shop_sync.inc
+const DWORD kResyncShopWaitMs = 120000;
+bool g_resync_now = false;  // test (shopresync): this re-sync goes ahead with a shop open, as one after the wait does
+
 void HostResyncStep() {
     if (!g_coop_host || g_resync_state == 0) return;
     uint8_t* game_main = *reinterpret_cast<uint8_t**>(kGameMainPtr);
     if (!game_main || *reinterpret_cast<uintptr_t*>(game_main) != kGameMainVtable) return;
     static int waited = 0;
+    static DWORD shop_wait = 0;
+    if (g_resync_state == 1 && ShopBusy() && !g_resync_now) {
+        // The save waits for the shop to close: saved meanwhile, the merchant's own inventory is put aside for the
+        // shop's stock (the owner's night: a re-sync quick-saved while the host's shop closed, and the merchant had
+        // nothing left after). A player's shop may stay open for a long time, so not for ever.
+        if (!shop_wait) {
+            shop_wait = GetTickCount();
+            Log("host: re-sync (%s): waiting for the shop to close", g_resync_reason);
+        }
+        if (GetTickCount() - shop_wait < kResyncShopWaitMs) return;
+        Log("host: re-sync: the shop is still open after %lu s: saving anyway", kResyncShopWaitMs / 1000);
+    }
     if (g_resync_state == 1) {
+        shop_wait = 0;
+        g_resync_now = false;
         GuardQuickSave();
         GetSystemTimeAsFileTime(&g_resync_mark);
         Log("host: re-sync (%s): quick-save", g_resync_reason);

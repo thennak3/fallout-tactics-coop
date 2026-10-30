@@ -4,7 +4,7 @@
 // snapshot frames the two copies share, so enemy AI, NPCs and combat results are part of the check.
 int g_bot_t0 = -1;
 int g_bot_last_snap = -1;
-bool g_bot_done_step[16] = {};
+bool g_bot_done_step[32] = {};
 const uintptr_t kActorVtable = 0x80c1d0;
 const float kMoveMin = 10.0f, kMoveMax = 40.0f;
 
@@ -1057,7 +1057,9 @@ void BotTradeGameMainTick(uint8_t* w) {  // the mission screen's tick, after its
             BotDealPress(w, world);
         }
         // shopresync: the shop stays up until the host's re-sync reloads everyone
-        DWORD barter_hold = _stricmp(g_test.scenario, "shopresync") == 0 ? 60000 : 2000;
+        // [test] hold, trades and browsing: seconds the shop stays up (the owner's shops: 5 to 30 s, drift checks meanwhile)
+        DWORD barter_hold = _stricmp(g_test.scenario, "shopresync") == 0 ? 60000
+                            : g_test.hold > 0 ? static_cast<DWORD>(g_test.hold) * 1000 : 2000;
         if (barter_up && GetTickCount() - barter_up >= barter_hold) {
             barter_up = 0;
             Log("bot: leaving the barter screen");
@@ -1242,6 +1244,7 @@ void FixHoldTick();       // drift.inc
 void LevelScreenClosed();  // recruit_sync.inc
 bool AnyLevelLock();
 bool PrivateScreensClosed(bool* alone);  // netlog.cpp
+bool MyShopOpen();  // shop_sync.inc
 void ReleaseTalkerHold();     // netlog.cpp
 extern uint8_t* g_private_speech;
 extern bool g_end_game_mode;
@@ -1882,6 +1885,13 @@ void BotFinish() {
 
 // A host alone (test joiners=0): once its conversation or shop has closed, its squad must still move. In 0.10.4 its
 // world stayed held after the screens closed and no frame ran again (the owner, alone in the bunker).
+// [test] hold on a trade or browse: the shop's seconds in frames (the world runs meanwhile), and 400 frames more
+// after it closed, for 16 drift checks.
+int ShopHoldFrames() {
+    if (g_test.hold <= 0 || _stricmp(g_test.scenario, "shopresync") == 0) return 0;
+    return g_test.hold * 30 + 400;
+}
+
 void BotSoloAfterClose(uint8_t* client, uint8_t* world, int rel_s) {
     static int closed_at = -1;
     static uint16_t walker = 0;
@@ -2246,7 +2256,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
                 BotTalk(client, world, kMerchant, frame);
             }
         }
-        if (rel_s >= talk_at + 500) BotFinish();
+        if (rel_s >= talk_at + 500 + ShopHoldFrames()) BotFinish();
     } else if (_stricmp(s, "levelup") == 0) {
         // QuestBarter.sav: a squad member can level up; the bar shows a "Level" effect button (WEffectButton, handler
         // 0x479e60 __fastcall(WGameMain*, edx, button): by the button's effect name, "objectiveComplete" opens the Pipboy
@@ -2359,11 +2369,24 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         bool shopresync = _stricmp(s, "shopresync") == 0;
         static uint16_t resync_buyer = 0;
         static DWORD shop_seen = 0;
+        // [test] resync_in_shop: the host's own shop, 3 s in, a re-sync is asked for (a joiner arriving, a drift); the
+        // save must wait for the shop to close (the owner's night: a re-sync saved during a shop's close, and the
+        // quartermaster had nothing left after).
+        static DWORD own_shop_seen = 0;
+        if (g_test.resync_in_shop && g_coop_host && g_snap_tag == 1 && MyShopOpen()) {
+            if (!own_shop_seen) own_shop_seen = GetTickCount();
+            if (GetTickCount() - own_shop_seen > 3000 && Once(16)) {
+                Log("bot: re-sync asked for during the host's own shop");
+                RequestResync("bot: re-sync during the host's shop");
+            }
+        }
         if (shopresync && g_coop_host && g_snap_tag == 1 && ShopOpenForOther(&shop_buyer)) {
             if (!shop_seen) shop_seen = GetTickCount();
             if (GetTickCount() - shop_seen > 3000 && Once(12)) {
                 resync_buyer = shop_buyer;
                 Log("bot: re-sync while the shop of squad member %u is open", shop_buyer);
+                extern bool g_resync_now;
+                g_resync_now = true;
                 RequestResync("bot: re-sync while a shop is open");
             }
         }
@@ -2383,7 +2406,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
             }
         }
         BotSoloAfterClose(client, world, rel_s);
-        int end_at = _stricmp(s, "trade2") == 0 ? talk_at + 750 : shopresync ? talk_at + 1500 : talk_at + 450;
+        int end_at = (_stricmp(s, "trade2") == 0 ? talk_at + 750 : shopresync ? talk_at + 1500 : talk_at + 450) + ShopHoldFrames();
         if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= end_at)) BotFinish();  // no reload: session 1 goes on
     } else if (_stricmp(s, "turnbased") == 0 || _stricmp(s, "tbauto") == 0) {
         static int done_at = -1;

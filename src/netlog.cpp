@@ -127,6 +127,10 @@ struct TestConfig {
     bool menu_cancel;  // after Start Co-op: open the Load Game screen as a person would, cancel it, then load as usual
     bool inv_chaos;    // trade scenarios: the copy that doesn't trade gives and equips at random meanwhile
     bool grow_table;   // talk scenarios: the talker's entity table grows while its conversation is open
+    int serial_skew;   // a joiner: its entity serial counter this far ahead at every session start (a long-run copy)
+    bool empty_stock;  // a joiner: the quartermasters' stock list emptied at every session start
+    bool no_serial_sync;  // mutation, host: the entity serial is not sent at session start (0.10.5)
+    bool resync_in_shop;  // host, trades: a re-sync asked for 3 s into its own shop (it must wait for the close)
 };
 TestConfig g_test = {};
 bool g_test_load_started = false;
@@ -744,7 +748,9 @@ void NoteMyUses(const uint8_t* msg, int len) {
         const uint8_t* r = msg + 6 + i * 27;
         uint16_t actor;
         memcpy(&actor, r + 1, 2);
-        if (r[0] == 0x04) {
+        // 0x21 opens the same screen for a character in a vehicle (the owner's driver: every try at their inventory
+        // was taken for another player's search and closed, 0.10.5).
+        if (r[0] == 0x04 || r[0] == 0x21) {
             g_my_use_tick = GetTickCount();
             g_my_use_actor = actor;
         } else if ((r[0] == 0x00 || r[0] == 0x02 || r[0] == 0x11 || r[0] == 0x17) && actor == g_my_use_actor) {
@@ -1718,6 +1724,12 @@ void __fastcall ClientRecvHook(void* self, void* /*edx*/, const uint8_t* msg, in
             Notice("Co-op: in the host's game");
         }
         g_world_closing = false;
+        if (g_coop_join && g_test.enabled && g_test.empty_stock) EmptyStockForTest();  // shop_sync.inc
+        LogStockSummary("at the session start");
+        if (g_coop_join && g_test.enabled && g_test.serial_skew) {
+            *reinterpret_cast<uint32_t*>(0x8be148) += g_test.serial_skew;  // kEntitySerial (private_sync.inc)
+            Log("bot: entity serial put %d ahead, as on a copy that ran other sessions", g_test.serial_skew);
+        }
         ClearNpcLocks();
         ClearHeldCommands();  // shop_sync.inc
         // A drift seen in the old session (held off by a shop's lock) is gone with it: acted on in the new one, it was
@@ -1983,6 +1995,10 @@ void Init() {
         g_test.menu_cancel = GetPrivateProfileIntA("test", "menu_cancel", 0, ".\\ftcoop.ini") != 0;
         g_test.inv_chaos = GetPrivateProfileIntA("test", "inv_chaos", 0, ".\\ftcoop.ini") != 0;
         g_test.grow_table = GetPrivateProfileIntA("test", "grow_table", 0, ".\\ftcoop.ini") != 0;
+        g_test.serial_skew = GetPrivateProfileIntA("test", "serial_skew", 0, ".\\ftcoop.ini");
+        g_test.empty_stock = GetPrivateProfileIntA("test", "empty_stock", 0, ".\\ftcoop.ini") != 0;
+        g_test.no_serial_sync = GetPrivateProfileIntA("test", "no_serial_sync", 0, ".\\ftcoop.ini") != 0;
+        g_test.resync_in_shop = GetPrivateProfileIntA("test", "resync_in_shop", 0, ".\\ftcoop.ini") != 0;
         Log("bot: TEST MODE save=\"%s\" actor=%s joiners=%d timeout=%ds scenario=%s menu=%s", g_test.save, g_test.actor,
             g_test.joiners, g_test.timeout_s, g_test.scenario, g_test.menu[0] ? g_test.menu : "-");
         CreateThread(nullptr, 0, TestWatchdog, nullptr, 0, nullptr);

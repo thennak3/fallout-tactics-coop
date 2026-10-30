@@ -87,6 +87,38 @@ void LogShopState(uint8_t* world, const char* when) {  // test mode
     }
 }
 
+// The quartermasters' stock (the campaign's list, +0x151 templates, +0x161 counts): what a shop of theirs is made
+// from on every copy. One line at each session start, so the copies' logs say whether they had the same.
+void LogStockSummary(const char* when) {
+    uint8_t* campaign = *reinterpret_cast<uint8_t**>(0x8bdd2c);
+    if (!campaign) return;
+    wchar_t** tb = *reinterpret_cast<wchar_t***>(campaign + 0x151);
+    wchar_t** te = *reinterpret_cast<wchar_t***>(campaign + 0x155);
+    int* cnt = *reinterpret_cast<int**>(campaign + 0x161);
+    int kinds = 0, items = 0;
+    uint32_t h = 2166136261u;
+    for (int i = 0; tb && tb + i < te; i++) {
+        int c = cnt ? cnt[i] : 0;
+        if (c <= 0) continue;
+        kinds++;
+        items += c;
+        if (tb[i]) h = Fnv(h, tb[i], wcslen(tb[i]) * sizeof(wchar_t));
+        h = Fnv(h, &c, sizeof(c));
+    }
+    Log("co-op: quartermaster stock %s: %d kinds, %d items, hash %08x", when, kinds, items, h);
+}
+
+// Test harness: a joiner's quartermaster stock emptied at the session start (counts 0), as a copy that never got the
+// host's list (the owner's night, 0.10.5: every quartermaster shop of the host's was made with 0 items on a joiner).
+void EmptyStockForTest() {
+    uint8_t* campaign = *reinterpret_cast<uint8_t**>(0x8bdd2c);
+    if (!campaign) return;
+    int* cb = *reinterpret_cast<int**>(campaign + 0x161);
+    int* ce = *reinterpret_cast<int**>(campaign + 0x165);
+    for (int* c = cb; c && c < ce; c++) *c = 0;
+    Log("bot: the quartermaster stock emptied here (test)");
+}
+
 void LogCampaignStock(const char* when) {  // test mode: the campaign's stock list, templates and counts
     if (!g_test.enabled) return;
     uint8_t* campaign = *reinterpret_cast<uint8_t**>(0x8bdd2c);
@@ -356,6 +388,14 @@ void CoopCommandAtFrame(const uint8_t* r) {
         SettingsAtFrame(r);
         return;
     }
+    if (kind == kSerialSync) {
+        SerialAtFrame(r);
+        return;
+    }
+    if (kind == kStockSync) {
+        StockAtFrame(r);
+        return;
+    }
     if (kind == kShopOpen) {
         ExecuteShopOpen(r);
         return;
@@ -476,6 +516,12 @@ struct HeldCommand {
 HeldCommand g_held[64];
 int g_nheld = 0;
 bool g_shop_hold = false;  // from a shop's open frame until its held commands ran
+
+// A shop is open on this copy (ours, or another player's made without a window), or its close hasn't gone round yet.
+// The merchant's own inventory is put aside meanwhile (g_shop.orig_inventory), and the shopper's game has the shop's
+// changes the others get only at the close.
+bool ShopBusy() { return g_shop.open || g_shop_close_waits || g_shop_hold; }
+bool MyShopOpen() { return g_shop.open && g_shop.mine; }
 
 bool MakesOrDestroysEntities(uint8_t c) {  // use, drop, equip, unequip, give, take one stack, take all
     return c == 0x04 || c == 0x05 || c == 0x06 || c == 0x07 || c == 0x13 || c == 0x14 || c == 0x15;

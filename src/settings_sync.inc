@@ -111,12 +111,122 @@ void SettingsAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, every copy, the
     LogSettings("the host's, from this frame", s);
 }
 
+// The entity serial counter 0x8be148: every entity made takes the next number (0x5ea6d0 and five others stamp it into
+// the new entity), and a save does not keep it, so each copy goes on from its own count after a load. Copies that had
+// run different sessions before (the owner's night: joiners that came and went) then differed in it from the first
+// frame, and every load was followed by a drift check failing on the free list's hash and a correction, or, with two
+// joiners reporting it, a reload. At the start of every session every copy takes one number at the same frame: the
+// host's own, well past anything any copy has handed out yet.
+const uint32_t kSerialMargin = 0x100000;
+
+void SendSerial() {
+    if (g_test.enabled && g_test.no_serial_sync) return;  // mutation: each copy keeps its own count (0.10.5)
+    uint8_t rec[1][27];
+    CoopRecord(rec[0], kSerialSync, 0);
+    uint32_t v = *reinterpret_cast<uint32_t*>(kEntitySerial) + kSerialMargin;
+    memcpy(rec[0] + 7, &v, 4);
+    SendCoopRecords(rec, 1);
+}
+
+void SerialAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, every copy, the same frame
+    uint32_t v;
+    memcpy(&v, r + 7, 4);
+    uint32_t* serial = reinterpret_cast<uint32_t*>(kEntitySerial);
+    Log("co-op: entity serial %u -> %u (the host's, every copy at this frame)", *serial, v);
+    *serial = v;
+}
+
+// The quartermasters' stock (the campaign's list: +0x151 template names, +0x161 counts) is what a quartermaster's shop
+// is made from, on every copy (0x454330, HeadlessShopOpen). The copies' lists parted (the owner's night, 0.10.5: a
+// joiner made every one of the host's quartermaster shops with 0 items, its free list and inventories went their own
+// way from there, and on its screen the quartermaster had nothing to sell), so at the start of every session the
+// host sends its list and every copy puts it in at the same frame: "name<TAB>count<LF>..." in kStockSync records of
+// 20 bytes each ([4] index, [5] count of records).
+const int kStockChunk = 20;
+void LogStockSummary(const char* when);  // shop_sync.inc
+
+int StockText(char* out, int cap) {
+    uint8_t* campaign = *reinterpret_cast<uint8_t**>(0x8bdd2c);
+    if (!campaign) return -1;
+    wchar_t** tb = *reinterpret_cast<wchar_t***>(campaign + 0x151);
+    wchar_t** te = *reinterpret_cast<wchar_t***>(campaign + 0x155);
+    int* cnt = *reinterpret_cast<int**>(campaign + 0x161);
+    int n = 0;
+    for (int i = 0; tb && tb + i < te; i++) {
+        char name[260] = "";
+        WideCharToMultiByte(CP_ACP, 0, tb[i] ? tb[i] : L"", -1, name, sizeof(name), nullptr, nullptr);
+        int w = sprintf_s(out + n, cap - n, "%s\t%d\n", name, cnt ? cnt[i] : 0);
+        if (w < 0 || n + w >= cap - 1) return -1;
+        n += w;
+    }
+    return n;
+}
+
+void SendStock() {
+    static char text[255 * kStockChunk + 1];
+    int n = StockText(text, sizeof(text));
+    if (n < 0) {
+        Log("co-op: the quartermaster stock list is too long to send (more than %d bytes)", 255 * kStockChunk);
+        return;
+    }
+    int chunks = n / kStockChunk + 1;  // the last one ends with the text's 0
+    static uint8_t recs[255][27];
+    for (int i = 0; i < chunks; i++) {
+        CoopRecord(recs[i], kStockSync, static_cast<uint8_t>(i));
+        recs[i][5] = static_cast<uint8_t>(chunks);
+        int len = min(kStockChunk, n + 1 - i * kStockChunk);
+        memcpy(recs[i] + 7, text + i * kStockChunk, len);
+    }
+    SendCoopRecords(recs, chunks);
+}
+
+void StockAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, every copy, the same frame
+    static char text[255 * kStockChunk + 1];
+    static int got = 0;
+    int i = r[4], chunks = r[5];
+    if (i == 0) got = 0;
+    if (i != got || chunks == 0) return;  // a record lost or out of order: this session keeps its own list
+    memcpy(text + i * kStockChunk, r + 7, kStockChunk);
+    if (++got < chunks) return;
+    text[chunks * kStockChunk] = 0;
+    static char mine[255 * kStockChunk + 1];
+    if (StockText(mine, sizeof(mine)) >= 0 && strcmp(mine, text) == 0) {
+        LogStockSummary("is the host's");
+        return;
+    }
+    uint8_t* campaign = *reinterpret_cast<uint8_t**>(0x8bdd2c);
+    if (!campaign) return;
+    LogStockSummary("before the host's list");
+    // Emptied as the shop's close empties it (0x454f40), then the host's entries added in its order (0x6a6550 adds a
+    // count to the entry of that name, or a new entry at the end), so the list is the host's to the order.
+    reinterpret_cast<void(__thiscall*)(void*, void*, void*)>(0x403010)(
+        campaign + 0x14d, *reinterpret_cast<void**>(campaign + 0x151), *reinterpret_cast<void**>(campaign + 0x155));
+    reinterpret_cast<void(__thiscall*)(void*, void*, void*)>(0x458760)(
+        campaign + 0x15d, *reinterpret_cast<void**>(campaign + 0x161), *reinterpret_cast<void**>(campaign + 0x165));
+    for (char* line = text; *line;) {
+        char* tab = strchr(line, '\t');
+        char* end = strchr(line, '\n');
+        if (!tab || !end || tab > end) break;
+        *tab = 0;
+        void* name = nullptr;  // the game's string, made from the name (0x6c8bf0: thiscall(str*, const char*, max))
+        reinterpret_cast<void(__thiscall*)(void**, const char*, int)>(0x6c8bf0)(&name, line, 0x7fffffff);
+        // kept: the list holds its own reference; one string per entry per session is all this leaks
+        reinterpret_cast<void(__thiscall*)(void*, void**, int)>(0x6a6550)(campaign, &name, atoi(tab + 1));
+        line = end + 1;
+    }
+    LogStockSummary("now the host's");
+}
+
 void SettingsFrame(uint8_t* world) {  // FrameTickHook, before the world step
     static LONG session = -1;
     if (g_coop_host) {
         GameSettings mine = ReadSettings(world);
         bool changed = g_have_settings && !SameSettings(mine, g_settings) && !(g_settings_pending && SameSettings(mine, g_settings_sent));
         if (session != g_sessions_started || (!g_have_settings && !g_settings_pending) || changed) {
+            if (session != g_sessions_started) {
+                SendSerial();
+                SendStock();
+            }
             session = g_sessions_started;
             if (!g_settings_pending || !SameSettings(mine, g_settings_sent)) SendSettings(mine);
         }
