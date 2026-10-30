@@ -132,6 +132,8 @@ struct TestConfig {
     bool empty_stock;  // a joiner: the quartermasters' stock list emptied at every session start
     bool no_serial_sync;  // mutation, host: the entity serial is not sent at session start (0.10.5)
     bool resync_in_shop;  // host, trades: a re-sync asked for 3 s into its own shop (it must wait for the close)
+    int merchant;         // trades: the trader's NPC id (0: the quartermaster, 96)
+    bool gamble;          // trades: Gamble instead of Barter, and the screen's Gamble button instead of Offer
 };
 TestConfig g_test = {};
 bool g_test_load_started = false;
@@ -1952,6 +1954,9 @@ void Init() {
         Log("co-op: pause-counter hook %s", g_pause_trampoline ? "ok" : "FAILED");
         static const uint8_t kBarterPrologue[] = {0x66, 0x8b, 0x81, 0x00, 0x01, 0x00, 0x00};  // mov ax, [ecx+0x100]
         g_barter_trampoline = HookWithTrampoline(0x4d0000, kBarterPrologue, sizeof(kBarterPrologue), (void*)&BarterButtonHook);
+        static const uint8_t kGamblePrologue[] = {0x56, 0x8b, 0xf1, 0x6a, 0x07};  // push esi; mov esi, ecx; push 7
+        g_gamble_trampoline = HookWithTrampoline(0x4d0090, kGamblePrologue, sizeof(kGamblePrologue), (void*)&GambleButtonHook);
+        Log("co-op: gamble hook %s", g_gamble_trampoline ? "ok" : "FAILED");
         static const uint8_t kQmDtorPrologue[] = {0x6a, 0xff, 0x68, 0x90, 0xfd, 0x7b, 0x00};  // push -1; push 0x7bfd90
         g_qm_dtor_trampoline = HookWithTrampoline(0x454f40, kQmDtorPrologue, sizeof(kQmDtorPrologue), (void*)&QmDtorHook);
         Log("co-op: barter hook %s, shop close hook %s", g_barter_trampoline ? "ok" : "FAILED",
@@ -1999,6 +2004,8 @@ void Init() {
         g_test.empty_stock = GetPrivateProfileIntA("test", "empty_stock", 0, ".\\ftcoop.ini") != 0;
         g_test.no_serial_sync = GetPrivateProfileIntA("test", "no_serial_sync", 0, ".\\ftcoop.ini") != 0;
         g_test.resync_in_shop = GetPrivateProfileIntA("test", "resync_in_shop", 0, ".\\ftcoop.ini") != 0;
+        g_test.merchant = GetPrivateProfileIntA("test", "merchant", 0, ".\\ftcoop.ini");
+        g_test.gamble = GetPrivateProfileIntA("test", "gamble", 0, ".\\ftcoop.ini") != 0;
         Log("bot: TEST MODE save=\"%s\" actor=%s joiners=%d timeout=%ds scenario=%s menu=%s", g_test.save, g_test.actor,
             g_test.joiners, g_test.timeout_s, g_test.scenario, g_test.menu[0] ? g_test.menu : "-");
         CreateThread(nullptr, 0, TestWatchdog, nullptr, 0, nullptr);

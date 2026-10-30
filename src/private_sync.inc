@@ -1956,12 +1956,12 @@ void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
         uint8_t* who = world && npc < EntityCount(world) ? EntityById(world, npc) : nullptr;
         bool recruiter = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f0 / 4])(who);
         bool quartermaster = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f4 / 4])(who);
-        // Anyone who only barters (CanBarterWith, 254) shops as the quartermaster does: the shop's deal carries what
-        // changed. Not someone who also gambles (CanGambleWith, 256): a light conversation sends only its variables, so
-        // a gamble's items would stay on the talker's copy (the owner's mechanic paused everyone, 0.10.5).
+        // Anyone who barters (CanBarterWith, 254) or gambles (CanGambleWith, 256) shops as the quartermaster does: a
+        // gamble goes out as a shop too (shop_sync.inc), and the deal carries what changed (the owner: the mechanic
+        // paused everyone, 0.10.5 and 0.10.6).
         bool barters = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x3f8 / 4])(who);
         bool gambles = who && reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(who))[0x400 / 4])(who);
-        bool light = g_shop_no_pause && !recruiter && (quartermaster || (barters && !gambles));
+        bool light = g_shop_no_pause && !recruiter && (quartermaster || barters || gambles);
         if (mine) {
             g_my_conv_light = light;
             g_diff_mode = light ? 1 : 0;

@@ -102,6 +102,8 @@ HOST_IP = "127.0.0.1"  # --host-ip: the address joiners connect to (this PC's LA
 FORCE_FILE_SERVER = False  # set in main: trades with more than one joiner use the file-server path
 ENTITY_LOG = False  # --entity-log: every entity made or destroyed, with the code that did it
 CHAOS_NO_SELECT = False  # --chaos-no-select: the chaos bots never change their selection
+MERCHANT = 0  # --merchant N: trades with this NPC (bunker: 349 the mechanic barters and gambles, 104/274/288 barter)
+GAMBLE = False  # --gamble: trades: Gamble instead of Barter
 NO_SERIAL_SYNC = False  # --no-serial-sync: mutation, the host sends no entity serial at session start (0.10.5)
 RESYNC_IN_SHOP = False  # --resync-in-shop: trades: the host asks for a re-sync 3 s into its own shop
 EMPTY_STOCK = False  # --empty-stock: every joiner's quartermaster stock emptied at each session start
@@ -144,6 +146,10 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
             f.write("inv_chaos=1\n")
         if GROW_TABLE:
             f.write("grow_table=1\n")
+        if MERCHANT:
+            f.write(f"merchant={MERCHANT}\n")
+        if GAMBLE:
+            f.write("gamble=1\n")
         if NO_SERIAL_SYNC and mode == "host":
             f.write("no_serial_sync=1\n")
         if RESYNC_IN_SHOP and mode == "host":
@@ -225,6 +231,8 @@ def main():
     ap.add_argument("--menu-pause", action="store_true",
                     help="mutation: the Escape menu and save screen pause their own copy only (0.10.2 and earlier)")
     ap.add_argument("--hold-frames", type=int, default=0, help="dropin: stay this many frames in the joined session")
+    ap.add_argument("--merchant", type=int, default=0, help="trades: the trader's NPC id (default the quartermaster, 96)")
+    ap.add_argument("--gamble", action="store_true", help="trades: Gamble instead of Barter")
     ap.add_argument("--no-serial-sync", action="store_true", help="mutation: the host sends no entity serial at session start")
     ap.add_argument("--resync-in-shop", action="store_true", help="trades: the host asks for a re-sync 3 s into its own shop")
     ap.add_argument("--empty-stock", action="store_true", help="joiners' quartermaster stock emptied at each session start")
@@ -240,6 +248,9 @@ def main():
     GROW_TABLE = args.grow_table
     global SERIAL_SKEW, EMPTY_STOCK, NO_SERIAL_SYNC, RESYNC_IN_SHOP
     NO_SERIAL_SYNC = args.no_serial_sync
+    global MERCHANT, GAMBLE
+    MERCHANT = args.merchant
+    GAMBLE = args.gamble
     RESYNC_IN_SHOP = args.resync_in_shop
     EMPTY_STOCK = args.empty_stock
     SERIAL_SKEW = args.serial_skew
@@ -268,6 +279,14 @@ def main():
     def check(name, ok, detail=""):
         if RESYNC_IN_SHOP and name.startswith("no reload"):  # the test's own re-sync, asked for on purpose
             name, ok, detail = name + " (not checked: --resync-in-shop reloads on purpose)", True, ""
+        if GAMBLE and name.startswith("the shopper's own pauses were swallowed and balanced"):
+            # Gamble switches from the conversation straight to the gamble screen (0x4d0090: SetMode 7): the game pauses
+            # twice and resumes once. Swallowed, the world's own counter never moved (the checks after the close ran).
+            name, ok, detail = name + " (not checked: a gamble pauses twice and resumes once, all swallowed)", True, ""
+        if GAMBLE and (name.startswith("the barter screen's Offer button") or name.startswith("the trader's squad member kept")):
+            name, ok, detail = name + " (not checked: a gamble, won or lost)", True, ""
+        if args.save and "bunker.sav" not in args.save and "squad move: unit" in name:
+            name, ok, detail = name + " (not checked: the waypoints are bunker.sav's)", True, ""
         checks.append((name, ok, detail))
 
     # Preconditions: same mod build and same save in both copies.
@@ -366,6 +385,13 @@ def main():
 
     host, join = read(os.path.join(HOST_DIR, "netlog.txt")), read(os.path.join(JOIN_DIR, "netlog.txt"))
     extra_logs = [read(os.path.join(d, "netlog.txt")) for d in extras]
+    raw_logs = (host, join, *extra_logs)  # saved with the run as they are
+    if MERCHANT and MERCHANT != 96:  # the trade checks name the quartermaster; another trader stands in for it
+        host, join = (l.replace(f"NPC {MERCHANT}", "NPC 96") for l in (host, join))
+        extra_logs = [l.replace(f"NPC {MERCHANT}", "NPC 96") for l in extra_logs]
+    if GAMBLE:  # a gamble is a shop to these checks
+        host, join = (l.replace("co-op: gamble of NPC", "co-op: shop of NPC") for l in (host, join))
+        extra_logs = [l.replace("co-op: gamble of NPC", "co-op: shop of NPC") for l in extra_logs]
     if actor == "all" and scenario == "trade":  # the race: exactly one joiner gets the merchant; checked as the trader below
         joiner_logs = [join] + extra_logs
         winners = [i for i, l in enumerate(joiner_logs) if "co-op: .?AVWSpeech@@ opened for this player" in l]
@@ -733,7 +759,7 @@ def main():
         if SHOP_NO_PAUSE:  # the shop paused nobody: every other copy made the stock itself and kept running
             so = re.search(r"co-op: shop of NPC 96 open for another player at frame (\d+): stock made here without a window \((\d+) items\)", other)
             sc = re.search(r"co-op: shop closed at frame (\d+) \(the others' deal applied here\)", other)
-            check("the other copy made the shop's stock itself, without a window", bool(so) and int(so.group(2)) > 0,
+            check("the other copy made the shop's stock itself, without a window", bool(so) and (int(so.group(2)) > 0 or bool(MERCHANT and MERCHANT != 96)),  # a trader sells its own: no stock
                   so.group(0) if so else "no headless shop line")
             check("the other copy kept running while the shop was open (it closed frames later)",
                   bool(so and sc) and int(sc.group(1)) > int(so.group(1)) + 5,
@@ -1222,7 +1248,7 @@ def main():
             shows = [re.findall(r"(?:^|\| )(\w+) [\d,]+", m.group(1)) for m in re.finditer(r"dots: (.*)", log)]
             check(f"{who}'s squad bar showed all {len(colours)} players' dots", colours in shows,
                   shows[-1] if shows else "no dots line")
-    return report(args, checks, (host, join, *extra_logs))
+    return report(args, checks, raw_logs)
 
 
 def run_solo(args, scenario, actor):

@@ -49,6 +49,13 @@ bool g_shop_exec = false;       // this copy is running the game's own Barter ha
 uint8_t* g_shop_speech = nullptr;
 void* g_shop_button = nullptr;
 uint8_t* g_barter_trampoline = nullptr;  // the conversation's Barter button handler 0x4d0000
+// The conversation's Gamble button 0x4d0090 (__thiscall(WSpeech*, button), ret 4) sets the same pair and opens the same
+// barter screen (mission mode 7, 0x454330 with its gamble flag) straight away, on this copy only. What a gamble changes
+// is the two inventories, as a trade: so it goes out as a shop (kShopOpen, [19] = 1) and opens at its frame here, the
+// others make it without a window, and the deal at the close carries the result. Its random draw is harmless: the
+// game's random state starts again from the frame number at every frame (drift.inc).
+uint8_t* g_gamble_trampoline = nullptr;
+bool g_shop_gamble = false;  // the shop asked for is a gamble
 uint8_t* g_qm_dtor_trampoline = nullptr; // the quartermaster barter screen's destructor 0x454f40
 
 uint16_t SlotOf(uint32_t id) { return static_cast<uint16_t>(id >> 16); }
@@ -238,8 +245,8 @@ void HeadlessShopClose(uint8_t* world) {
     *reinterpret_cast<uint32_t*>(0x8bc204) = 0;
 }
 
-void __fastcall BarterButtonHook(uint8_t* speech, void* /*edx*/, void* button) {
-    auto original = reinterpret_cast<void(__thiscall*)(void*, void*)>(g_barter_trampoline);
+void ShopButton(uint8_t* speech, void* button, bool gamble) {
+    auto original = reinterpret_cast<void(__thiscall*)(void*, void*)>(gamble ? g_gamble_trampoline : g_barter_trampoline);
     extern bool g_my_conv_light;
     if (!g_my_conv_light || g_shop_exec || !(g_coop_host || g_coop_join)) {
         original(speech, button);
@@ -255,13 +262,18 @@ void __fastcall BarterButtonHook(uint8_t* speech, void* /*edx*/, void* button) {
     memcpy(r + 7, &buyer, 4);
     memcpy(r + 11, &merchant, 4);
     memcpy(r + 15, &g_my_claim, 4);
+    r[19] = gamble ? 1 : 0;
     SendCoopRecords(reinterpret_cast<const uint8_t(*)[27]>(r), 1);
     g_shop_requested = true;
+    g_shop_gamble = gamble;
     g_shop_speech = speech;
     g_shop_button = button;
-    Log("co-op: Barter pressed: shop of NPC %u for squad member %u goes out (claim %08x)", SlotOf(merchant), SlotOf(buyer),
-        g_my_claim);
+    Log("co-op: %s pressed: shop of NPC %u for squad member %u goes out (claim %08x)", gamble ? "Gamble" : "Barter",
+        SlotOf(merchant), SlotOf(buyer), g_my_claim);
 }
+
+void __fastcall BarterButtonHook(uint8_t* speech, void* /*edx*/, void* button) { ShopButton(speech, button, false); }
+void __fastcall GambleButtonHook(uint8_t* speech, void* /*edx*/, void* button) { ShopButton(speech, button, true); }
 
 void ExecuteShopOpen(const uint8_t* r) {
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
@@ -277,20 +289,22 @@ void ExecuteShopOpen(const uint8_t* r) {
     g_shop.merchant = merchant;
     g_shop.mine = g_shop_requested && claim && claim == g_my_claim;
     int frame = *reinterpret_cast<int*>(world + kWorldFrame);
+    bool gamble = r[19] != 0;
     if (g_shop.mine && g_shop_speech && g_shop_speech == g_private_speech) {
         g_shop_exec = true;
-        reinterpret_cast<void(__thiscall*)(void*, void*)>(g_barter_trampoline)(g_shop_speech, g_shop_button);
+        reinterpret_cast<void(__thiscall*)(void*, void*)>(gamble ? g_gamble_trampoline : g_barter_trampoline)(
+            g_shop_speech, g_shop_button);
         g_shop_exec = false;
         TakePrivateSnapshot();  // the deal is measured from here: the stock exists on every copy now
-        Log("co-op: shop of NPC %u open for this player at frame %d", SlotOf(merchant), frame);
+        Log("co-op: %s of NPC %u open for this player at frame %d", gamble ? "gamble" : "shop", SlotOf(merchant), frame);
     } else {
         if (g_shop.mine) {
             Log("co-op: our conversation closed before the shop opened: the stock is made without a window");
             g_shop.mine = false;
         }
         int made = HeadlessShopOpen(world);
-        Log("co-op: shop of NPC %u open for another player at frame %d: stock made here without a window (%d items)",
-            SlotOf(merchant), frame, made);
+        Log("co-op: %s of NPC %u open for another player at frame %d: stock made here without a window (%d items)",
+            gamble ? "gamble" : "shop", SlotOf(merchant), frame, made);
         Notice("Co-op: a player is trading - their character waits until they are done");
     }
     g_shop_requested = false;

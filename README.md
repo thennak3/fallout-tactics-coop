@@ -96,7 +96,8 @@ Checked by the automated tests in `test/`:
   save-and-reload). A save-and-reload asked for during a shop waits until it closes.
 - No drift after loads between copies that have been running for a long time, and one correction (no reload) when
   several joiners report the same drift at once (in 0.10.5 and earlier, everyone could wait 10 s and then reload).
-- Traders who only barter pause nobody, as the quartermaster (new in 0.10.6, not yet covered by a test).
+- Every trader pauses nobody, as the quartermaster: those who barter, and those who gamble too (the mechanic). A
+  gamble's result reaches everyone as a trade's does (tested with the mechanic, the host and a joiner gambling).
 - The selection dots, with 2 and 4 players.
 - Recruiting and dismissing squad members, without a reload (the game pauses for everyone while the recruit screen
   is up, since it changes the squad everyone plays).
@@ -137,7 +138,6 @@ Checked by the automated tests in `test/`:
 - While one player talks to anyone other than a merchant, or uses the recruiter, the other players' games pause until
   the conversation closes. Shops don't pause anyone (for the old behaviour, put the lines `[coop]` and
   `shop_no_pause=0` in a file `ftcoop.ini` next to `BOS.exe`, on every player's PC).
-- A trader who also gambles (such as the mechanic) still pauses everyone while you talk to them.
 - A character who joins the squad through a story conversation (not the recruiter) still means a save and reload
   for everyone.
 - Played on two PCs on one home network; not tested over the internet yet.

@@ -540,10 +540,12 @@ void BotTalk(uint8_t* client, uint8_t* world, uint16_t target, int frame) {
 // Observed (trade_host): the merchant holds 2 items of its own; opening the barter screen fills its inventory with the
 // shop's stock (30 stacks) and closing it takes the stock away again. What the other players must get is the trader's
 // game once the screens have closed (logged as INV SYNCED).
-const uint16_t kMerchant = 96;
+uint16_t kMerchant = 96;  // [test] merchant: another trader (the mechanic 349 barters and gambles)
 const uint16_t kQuestGiver = 266;  // QuestBarter.sav: General Barnaky (B01_GenBarnaky.ent)
-const float kMerchantApproach[3] = {359.5f, 32.0f, 320.5f};
+float kMerchantApproach[3] = {359.5f, 32.0f, 320.5f};  // next to the quartermaster; another: beside it the same way
 const uintptr_t kSpeechBarterButton = 0x4d0000;
+const uintptr_t kSpeechGambleButton = 0x4d0090;
+const uintptr_t kBarterGamble = 0x455860;  // the barter screen's Gamble button in gamble mode (0x454330: +0x114)
 const uintptr_t kBarterOffer = 0x455830;
 const size_t kVtAddInventory = 0x504, kVtRemoveInventory = 0x508;
 const size_t kActorOffer = 0x100a, kEntitySprite = 0x105, kItemValue = 0x1b6;
@@ -758,7 +760,8 @@ void BotDealPress(uint8_t* gm, uint8_t* world) {
         t108 ? *reinterpret_cast<int*>(t108 + 0x147) : -1);
     LogInv(world, "OFFER", OfferOf(world, buyer));
     LogInv(world, "OFFER", OfferOf(world, merchant));
-    PressHandler(kBarterOffer, table, "the barter table's Offer button");
+    if (g_test.gamble) PressHandler(kBarterGamble, table, "the barter table's Gamble button");
+    else PressHandler(kBarterOffer, table, "the barter table's Offer button");
     int caps_after = CapsOf(world, buyer, nullptr);
     LogInv(world, "AFTER", buyer);
     LogInv(world, "AFTER", merchant);
@@ -1037,8 +1040,8 @@ void BotTradeGameMainTick(uint8_t* w) {  // the mission screen's tick, after its
         Log("bot: pressing the conversation's Barter button (mode %d)", mode);
         LogInv(world, "BEFORE", g_bot_talker);
         LogInv(world, "BEFORE", kMerchant);
-        reinterpret_cast<void(__thiscall*)(void*, void*)>(kSpeechBarterButton)(speech, nullptr);
-        Log("bot: Barter button returned, mode %d", *reinterpret_cast<int*>(w + 0x156));
+        reinterpret_cast<void(__thiscall*)(void*, void*)>(g_test.gamble ? kSpeechGambleButton : kSpeechBarterButton)(speech, nullptr);
+        Log("bot: %s button returned, mode %d", g_test.gamble ? "Gamble" : "Barter", *reinterpret_cast<int*>(w + 0x156));
         wait = 1;
         return;
     }
@@ -1976,6 +1979,18 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
                             break;
                         }
                 }
+                if (m == 0)  // every trader on the map: who barters, who gambles (CanBarterWith 254, CanGambleWith 256)
+                    for (int t = 1; t < EntityCount(world); t++) {
+                        if (!IsActor(world, t)) continue;
+                        uint8_t* e = EntityById(world, static_cast<uint16_t>(t));
+                        bool bt = reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(e))[0x3f8 / 4])(e);
+                        bool gb = reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(e))[0x400 / 4])(e);
+                        bool q = reinterpret_cast<bool(__thiscall*)(void*)>((*reinterpret_cast<void***>(e))[0x3f4 / 4])(e);
+                        if (!bt && !gb && !q) continue;
+                        float* p = EntityPos(world, static_cast<uint16_t>(t));
+                        Log("bot: SURVEY trader NPC %d at (%.2f,%.2f,%.2f)%s%s%s", t, p[0], p[1], p[2], bt ? " barters" : "",
+                            gb ? " gambles" : "", q ? " quartermaster" : "");
+                    }
                 Log("bot: SURVEY member %d (%u) at (%.2f,%.2f,%.2f)", m, squad[m], a[0], a[1], a[2]);
                 for (const Near& nb : best) {
                     if (!nb.id) continue;
@@ -2328,7 +2343,14 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
                 kMerchantApproach[1], kMerchantApproach[2]);
             SendCommand(client, 0, g_bot_talker, 0, kMerchantApproach, 4);
         }
-        const int talk_at = 310;
+        // another trader is further from the route's end than the quartermaster: 300 frames more to walk there
+        const int talk_at = g_test.merchant && g_test.merchant != 96 ? 610 : 310;
+        if (g_test.merchant && g_test.merchant != kMerchant) {  // another trader: stand beside it as beside the quartermaster
+            float* m = EntityPos(world, static_cast<uint16_t>(g_test.merchant));
+            kMerchantApproach[0] = m[0] - 2.75f, kMerchantApproach[1] = m[1], kMerchantApproach[2] = m[2] + 2.0f;
+            kMerchant = static_cast<uint16_t>(g_test.merchant);
+            Log("bot: the trader is NPC %u at (%.2f,%.2f,%.2f)%s", kMerchant, m[0], m[1], m[2], g_test.gamble ? ", to gamble" : "");
+        }
         if (g_snap_tag == 1 && rel_s >= talk_at && Once(0) && i_act) {
             float* a = EntityPos(world, g_bot_talker);
             float* b = EntityPos(world, kMerchant);
