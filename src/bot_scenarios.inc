@@ -1241,7 +1241,7 @@ void PrivateCloseStep();  // below
 void FixHoldTick();       // drift.inc
 void LevelScreenClosed();  // recruit_sync.inc
 bool AnyLevelLock();
-bool PrivateScreensClosed();  // netlog.cpp
+bool PrivateScreensClosed(bool* alone);  // netlog.cpp
 void ReleaseTalkerHold();     // netlog.cpp
 extern uint8_t* g_private_speech;
 extern bool g_end_game_mode;
@@ -1880,6 +1880,29 @@ void BotFinish() {
     ExitProcess(0);
 }
 
+// A host alone (test joiners=0): once its conversation or shop has closed, its squad must still move. In 0.10.4 its
+// world stayed held after the screens closed and no frame ran again (the owner, alone in the bunker).
+void BotSoloAfterClose(uint8_t* client, uint8_t* world, int rel_s) {
+    static int closed_at = -1;
+    static uint16_t walker = 0;
+    static float from[3];
+    if (g_test.joiners != 0 || !g_coop_host || g_snap_tag != 1) return;
+    if (closed_at < 0) {
+        if (!g_bot_done_step[1] || g_private_open) return;
+        uint16_t squad[16];
+        if (GetSquad(world, squad, 16) < 1) return;
+        closed_at = rel_s;
+        walker = squad[0];
+        memcpy(from, EntityPos(world, walker), sizeof(from));
+        Log("bot: solo: the screens are closed at frame %d; moves squad member %u", rel_s, walker);
+        BotMoveMember(client, world, 0, 3);
+    } else if (rel_s >= closed_at + 150 && Once(15)) {
+        float* p = EntityPos(world, walker);
+        float d = sqrtf((p[0] - from[0]) * (p[0] - from[0]) + (p[2] - from[2]) * (p[2] - from[2]));
+        Log("bot: solo: 150 frames after the close, squad member %u moved %.1f units", walker, d);
+    }
+}
+
 void BotStep(uint8_t* client, uint8_t* world, int frame) {
     if (g_bot_t0 < 0) {
         g_bot_t0 = frame;
@@ -2094,6 +2117,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         }
         // While the conversation is open the talker's window tick drives the bot (BotSpeechTick). The changes reach
         // the others as a delta at the conversation's end, no reload: both copies play on in session 1.
+        BotSoloAfterClose(client, world, rel_s);
         if (g_snap_tag == 1 && rel_s >= talk_at + 450) BotFinish();
     } else if (IsRecruitScenario()) {
         // Bunker save: [test] actor's member 0 walks the owner's route to the recruiting NPC, talks, presses Recruit
@@ -2358,6 +2382,7 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
                 BotTalk(client, world, kMerchant, frame);
             }
         }
+        BotSoloAfterClose(client, world, rel_s);
         int end_at = _stricmp(s, "trade2") == 0 ? talk_at + 750 : shopresync ? talk_at + 1500 : talk_at + 450;
         if ((g_snap_tag >= 2 && rel_s >= 300) || (g_snap_tag == 1 && rel_s >= end_at)) BotFinish();  // no reload: session 1 goes on
     } else if (_stricmp(s, "turnbased") == 0 || _stricmp(s, "tbauto") == 0) {
@@ -2381,32 +2406,41 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
 #include "private_sync.inc"
 
 void PrivateCloseStep() {  // frame hook, and the mission screen's tick (the world may be held: no frames)
-    if (PrivateScreensClosed()) {
-        if (g_test.enabled && (IsTradeScenario() || IsRecruitScenario() || IsShopTalk())) {
-            uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);  // what the others will get
-            LogInv(world, "SYNCED", g_bot_talker);
-            LogInv(world, "SYNCED", kMerchant);
-            LogSquad(world, "SYNCED");
-        }
-        int diff = PrivateScreensDiff();
-        LevelScreenClosed();  // a character screen's lock goes once its changes are out
-        ReleaseTalkerHold();  // the delta is out: this world goes on (a re-sync needs frames too)
+    bool alone = false;
+    if (!PrivateScreensClosed(&alone)) return;
+    if (alone) {
+        // A host on its own sends nothing, but its world was held for the screens like anyone's: it stayed held, and
+        // nobody could move after a conversation or a shop (the owner, alone in the bunker, 0.10.4).
+        LevelScreenClosed();
+        ReleaseTalkerHold();
         extern bool g_suppress_pause;
-        extern int g_suppressed;
-        if (g_suppress_pause) {
-            g_suppress_pause = false;
-            Log("co-op: the light conversation is over: pause changes go through again (balance %d%s)", g_suppressed,
-                g_suppressed ? ", NOT ZERO" : "");
-        }
-        if (diff != kDiffFull) {
-            // nothing to reload: the co-op commands carried what changed
-        } else if (g_coop_host) {
-            RequestResync("the host's private screens closed");
-            Notice("Co-op: the host traded or changed the squad - saving and reloading for everyone");
-        } else if (g_coop_join) {
-            g_push_state = 1;
-            Notice("Co-op: sending your trades and squad changes to the host");
-        }
+        g_suppress_pause = false;
+        return;
+    }
+    if (g_test.enabled && (IsTradeScenario() || IsRecruitScenario() || IsShopTalk())) {
+        uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);  // what the others will get
+        LogInv(world, "SYNCED", g_bot_talker);
+        LogInv(world, "SYNCED", kMerchant);
+        LogSquad(world, "SYNCED");
+    }
+    int diff = PrivateScreensDiff();
+    LevelScreenClosed();  // a character screen's lock goes once its changes are out
+    ReleaseTalkerHold();  // the delta is out: this world goes on (a re-sync needs frames too)
+    extern bool g_suppress_pause;
+    extern int g_suppressed;
+    if (g_suppress_pause) {
+        g_suppress_pause = false;
+        Log("co-op: the light conversation is over: pause changes go through again (balance %d%s)", g_suppressed,
+            g_suppressed ? ", NOT ZERO" : "");
+    }
+    if (diff != kDiffFull) {
+        // nothing to reload: the co-op commands carried what changed
+    } else if (g_coop_host) {
+        RequestResync("the host's private screens closed");
+        Notice("Co-op: the host traded or changed the squad - saving and reloading for everyone");
+    } else if (g_coop_join) {
+        g_push_state = 1;
+        Notice("Co-op: sending your trades and squad changes to the host");
     }
 }
 

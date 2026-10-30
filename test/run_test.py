@@ -93,7 +93,10 @@ TESTS = {
     "browse_join": ("browse", "join", 6),  # the same with the joiner browsing; the host is refused
     "exit_host": ("exit", "host", 4),  # bunker: the host walks the squad onto the exit grid; world map, host picks
     "exit_join": ("exit", "join", 4),  # the same with the joiner walking the squad out; the host still picks
+    "solo_talk": ("talk", "host", 0),  # bunker, the host alone (no joiner copy): talks to the recruiter, then moves
+    "solo_trade": ("trade", "host", 0),  # bunker, the host alone: trades with the merchant, then moves
 }
+SOLO_TESTS = {"solo_talk", "solo_trade"}
 MENU_TESTS = {"menu_join", "dropin"}
 HOST_IP = "127.0.0.1"  # --host-ip: the address joiners connect to (this PC's LAN address tests the real network path)
 FORCE_FILE_SERVER = False  # set in main: trades with more than one joiner use the file-server path
@@ -237,6 +240,8 @@ def main():
         SAVE = "user/save/QuestBarter.sav"
     if args.test == "soak":
         min_frames = args.soak_frames // 50 - 1
+    if args.test in SOLO_TESTS:
+        return run_solo(args, scenario, actor)
     checks = []
 
     def check(name, ok, detail=""):
@@ -1167,6 +1172,55 @@ def main():
             check(f"{who}'s squad bar showed all {len(colours)} players' dots", colours in shows,
                   shows[-1] if shows else "no dots line")
     return report(args, checks, (host, join, *extra_logs))
+
+
+def run_solo(args, scenario, actor):
+    """A co-op host with nobody joined: after its conversation or shop closes, its squad still moves (0.10.4: the
+    host's world stayed held, nobody could move)."""
+    checks = []
+
+    def check(name, ok, detail=""):
+        checks.append((name, ok, detail))
+
+    shutil.copyfile(DLL, os.path.join(HOST_DIR, "netlog.dll"))
+    check("precondition: the host has the save", os.path.exists(os.path.join(HOST_DIR, "core", *SAVE.split("/"))), SAVE)
+    if not checks[-1][1]:
+        return report(args, checks, None)
+    ini = os.path.join(HOST_DIR, "ftcoop.ini")
+    text = read(ini) if os.path.exists(ini) else None
+    backup = "[coop]\r\nmode=host\r\n" if text is not None and "[test]" in text else text
+    log_path = os.path.join(HOST_DIR, "netlog.txt")
+    if os.path.exists(log_path):
+        os.remove(log_path)
+    write_ini(HOST_DIR, "host", scenario, actor, args.timeout, True, args.soak_frames, SAVE, joiners=0)
+    try:
+        p = subprocess.Popen([os.path.join(HOST_DIR, "BOS.exe")], cwd=HOST_DIR)
+        try:
+            code = p.wait(timeout=args.timeout + 30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            code = "killed (hung)"
+    finally:
+        if backup is None:
+            os.remove(ini)
+        else:
+            with open(ini, "w", newline="") as f:
+                f.write(backup)
+    host = read(log_path)
+    check("the host exited cleanly (code 0)", code == 0, f"host={code}")
+    check("host became the co-op host, with no joiner", "co-op: hosting" in host and "bot: 1 players ready (host + 0)" in host)
+    check("the conversation opened for the host", "co-op: .?AVWSpeech@@ opened for this player" in host)
+    if scenario == "trade":
+        check("the host traded", "bot: buying " in host)
+    if scenario == "talk":  # the recruiter's conversation holds the talker's world (a quartermaster's shop does not)
+        check("the conversation held the host's own world", "(before this copy's hold)" in host)
+    check("the screens closed with nobody else here", "co-op: private screens closed, nobody else here" in host)
+    m = re.search(r"bot: solo: 150 frames after the close, squad member (\d+) moved ([\d.]+) units", host)
+    check("150 frames ran after the close and the host's squad member walked (at least %.0f units)" % MIN_MOVE,
+          bool(m) and float(m.group(2)) >= MIN_MOVE, m.group(0) if m else "no frames after the close")
+    check("no bot failure", "bot: FAIL" not in host)
+    return report(args, checks, [host])
 
 
 def report(args, checks, logs):

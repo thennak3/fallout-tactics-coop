@@ -963,7 +963,8 @@ void ReleaseTalkerHold() {  // after the diff: this copy's world goes on with ev
     if (world) WorldPause(world, false);
 }
 
-bool PrivateScreensClosed() {
+bool PrivateScreensClosed(bool* alone) {
+    *alone = false;
     if (!g_private_open) return false;
     // Closed: the mission screen is back to its plain modes and no private screen has ticked for a moment. The world
     // is held (g_talker_hold), so no frame has run since: the talker's changes are exactly what the screens did.
@@ -972,7 +973,8 @@ bool PrivateScreensClosed() {
     g_private_speech = nullptr;
     bool others = g_coop_join || LiveJoiners() > 0;
     Log("co-op: private screens closed%s", others ? ", bringing the other players up to date" : ", nobody else here");
-    return others;
+    *alone = !others;
+    return true;
 }
 
 // A load (a re-sync, the host's save, a quick-load) closes every screen: whatever they did is gone with the old

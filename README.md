@@ -88,6 +88,8 @@ Checked by the automated tests in `test/`:
 - A re-sync while a player is shopping: afterwards everyone can talk to the merchant and order that character again,
   with no extra reloads. (In 0.10.3 and earlier the merchant and the shopper's character stayed refused, "a player
   is trading", in every later session, even after going back to the menu.)
+- A co-op host playing alone, before anyone joins: after a conversation or a shop the squad moves again (in 0.10.4
+  and earlier, the host's game stayed paused after it closed and nothing could move).
 - The selection dots, with 2 and 4 players.
 - Recruiting and dismissing squad members, without a reload (the game pauses for everyone while the recruit screen
   is up, since it changes the squad everyone plays).
