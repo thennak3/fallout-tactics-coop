@@ -59,7 +59,8 @@ your original `binkw32.dll`.
 - **Host:** Multiplayer, then **Start Co-op**, then load a save or start a new campaign. You play straight away.
 - **Friends:** Multiplayer, select **[Co-op] <host name>** in the session list, then **Join**. A message shows
   while you wait. Your game then copies the host's save and loads it.
-- Friends can join a game already in progress. The host's game saves and reloads once to bring them in.
+- Friends can join a game already in progress. The host's game saves and reloads once to bring them in (about 9
+  seconds; the joining player loads the save while the host's game reloads).
 - Everyone controls the whole squad. Agree among yourselves who moves whom. Coloured dots above each name tab
   show which players have that character selected: the host is red, then blue, yellow and green in the order
   players joined.
