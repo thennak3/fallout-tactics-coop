@@ -66,6 +66,7 @@ struct Joiner {
     char state;     // W, L or P (see above)
     long gen;       // generation the joiner loaded
     DWORD last_seen, last_resync;
+    bool came_back;  // it reported W after P: it left (the menu) and returned inside the notice delay; acted on once
     int colour;     // selection dots: 1..3 (blue, yellow, green), 0 none yet (the host is red)
 };
 Joiner g_joiners[8] = {};
@@ -83,6 +84,11 @@ void NoteJoiner(unsigned id, const char* name, char state, long gen) {  // file 
         Joiner& j = g_joiners[i];
         if (j.id == id) {
             if (j.state != state) Log("host: %s is now %c (generation %ld)", j.name, state, gen);
+            // P then W: this joiner id was playing and is waiting at the main menu again. Its polls never stopped for
+            // 15 s, so NoticeLeftJoiners saw it live and left its shop, talks, save and character lock open (the
+            // fuzzer: a joiner back inside 15 s kept the host's re-sync waiting for its old shop). P then L is a normal
+            // re-sync (every joiner loads the new generation), so only W counts.
+            if (j.state == 'P' && state == 'W') j.came_back = true;
             j.state = state;
             j.gen = gen;
             j.last_seen = now;
@@ -96,6 +102,7 @@ void NoteJoiner(unsigned id, const char* name, char state, long gen) {  // file 
     j.state = state;
     j.gen = gen;
     j.last_seen = now;
+    j.came_back = false;
     j.last_resync = now - kResyncSpacingMs;
     Log("host: %s joined (id %08x, state %c)", j.name, id, state);
 }
@@ -399,6 +406,7 @@ void DropPrivateScreens();  // netlog.cpp
 // others applied it in the new session (shopresync: the free lists apart from then on).
 bool g_world_closing = false;
 
+void CloseHeadlessRecruit();  // recruit_sync.inc
 // Host: every load passes its save file through the save check; serve it as a new generation.
 char __fastcall LoadCheckHook(void* self, void* /*edx*/, void** file) {
     char name[260] = "";
@@ -407,6 +415,10 @@ char __fastcall LoadCheckHook(void* self, void* /*edx*/, void** file) {
     if (g_coop_host || g_coop_join) {
         g_world_closing = true;
         DropPrivateScreens();
+        // A recruit screen made here for another player's visit goes with the world it was made in, now, while that
+        // world exists: a session start did not close it, and a later conversation's done freed its entities in the
+        // new world (the fuzzer's reload_during_recruit).
+        CloseHeadlessRecruit();
     }
     if (g_coop_host && g_quicksave_guard && _stricmp(name, kQuickSaveName) == 0) {
         // Serve a copy: the player's own QuickSave.sav goes back in place once this session starts.
@@ -904,6 +916,8 @@ bool JoinerLive(unsigned id) {  // host, main thread
 void CloseAbandonedShop(const char* who);  // shop_sync.inc
 void CloseAbandonedTalks(unsigned joiner, const char* who);  // private_sync.inc
 void CloseAbandonedSave(unsigned joiner, const char* who);   // save_sync.inc
+void CloseAbandonedLevel(unsigned joiner, const char* who);  // recruit_sync.inc
+void ForgetGoneJoiner(unsigned joiner);                      // private_sync.inc
 uint32_t OpenShopOwner();                  // shop_sync.inc
 
 void NoticeLeftJoiners() {
@@ -912,17 +926,28 @@ void NoticeLeftJoiners() {
     unsigned left[8];
     char left_name[8][32];
     int nleft = 0;
+    unsigned playing[8];  // live and playing: no longer gone, whatever happened before (a joiner that came back)
+    int nplaying = 0;
     uint32_t owner = OpenShopOwner();
     EnterCriticalSection(&g_serve_lock);
     DWORD now = GetTickCount();
     for (int i = 0; i < g_joiner_count; i++) {
         bool live = now - g_joiners[i].last_seen <= kJoinerTimeoutMs;
+        bool back = g_joiners[i].came_back;  // left and returned inside the delay: its old self is gone all the same
+        g_joiners[i].came_back = false;
+        if (back && live && was_live[i]) {
+            Notice("Co-op: %s left and came back", g_joiners[i].name);
+            left[nleft] = g_joiners[i].id;
+            strcpy_s(left_name[nleft++], g_joiners[i].name);
+        }
+        if (back && owner && g_joiners[i].id == owner) strcpy_s(gone, g_joiners[i].name);
         if (was_live[i] && !live) {
             Notice("Co-op: %s left", g_joiners[i].name);
             left[nleft] = g_joiners[i].id;
             strcpy_s(left_name[nleft++], g_joiners[i].name);
         }
         if (owner && g_joiners[i].id == owner && !live) strcpy_s(gone, g_joiners[i].name);  // even gone before it opened
+        if (live && !back && g_joiners[i].state == 'P') playing[nplaying++] = g_joiners[i].id;
         was_live[i] = live;
     }
     LeaveCriticalSection(&g_serve_lock);
@@ -930,7 +955,11 @@ void NoticeLeftJoiners() {
     for (int i = 0; i < nleft; i++) {
         CloseAbandonedTalks(left[i], left_name[i]);
         CloseAbandonedSave(left[i], left_name[i]);
+        CloseAbandonedLevel(left[i], left_name[i]);
     }
+    // A joiner that came back (the same game, the same id) is playing again: its talks are its own again, not a gone
+    // talker's to close at once (CloseTalkOfGone would have ended its next conversation).
+    for (int i = 0; i < nplaying; i++) ForgetGoneJoiner(playing[i]);
 }
 
 // Runtime roles, chosen in the Multiplayer menu (or by ftcoop.ini [coop] mode= for the tests).

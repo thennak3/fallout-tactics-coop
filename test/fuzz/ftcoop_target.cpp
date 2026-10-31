@@ -39,6 +39,25 @@
 // Activate opens a shop for 1 to 30 s; Pickup moves an item between squad members; Move moves one; Join and Leave;
 // Load is the host's quick-load. heal() ends the session with one more reload, so what a session start mends is mended.
 //
+// Added later (all four modelled as the mod is now, so a bug in them shows):
+//   - Leaves are noticed late (save_transfer.inc NoticeLeftJoiners): the host acts on a leave (CloseAbandonedShop,
+//     CloseAbandonedTalks, CloseAbandonedSave, the gone set, CloseTalkOfGone, HostHoldTimeout's "alone") only once the
+//     joiner's polls have stopped for kJoinerTimeoutMs = 15 s. The copy's own state is cleared at once.
+//   - Level-up screens (recruit_sync.inc), op Drop with an odd b: copy m opens character a % 4's level screen for 1 to
+//     10 s. The open goes up to the host and is relayed to every copy in one order; the first for a character wins; a
+//     loser's screen closes. The others keep a lock (4 slots) until the close; the leveller's world is held meanwhile.
+//     Locks are cleared by a session start, and for a leveller who left the host sends its close when it notices
+//     (CloseAbandonedLevel; the twin no_abandoned_level). While any lock is held, a talk to a recruiter (NPC 303) is refused.
+//   - Recruiting (Hit on NPC 303, a % 4 == 3): a held conversation; the recruiter's copy makes 5 entities for its
+//     screen, every other copy 5 more when it opens (the headless screen) and frees them at the next done of any
+//     conversation (CloseHeadlessRecruit on kSyncDone), the recruiter's own at its close. A session start does not close
+//     the headless screen, but a load does (LoadCheckHook; the twin no_recruit_drop_on_load: stale_screen), and only that
+//     recruiter's done does (any_done_closes_recruit). A joiner back inside the notice delay is taken as a leave
+//     (no_rejoin_as_leave). b / 15 odd: the visit hires someone and ends in a re-sync.
+//   - The world map (Move with c = 1 or 2, c = 1 from the host leaves the mission for the map or, on the map, chooses a
+//     destination; c = 2 is a travel click to (a, b)): only the host travels, chooses and rolls encounters; the joiners
+//     follow its poll-answered reports (snap, dead-reckoning between).
+//
 // Oracles beyond the fuzzer's own: frozen (a copy held for a correction that never came), needless_repair (a correction
 // or a drift reload while every copy was the same as the host), apart_after_save (a save's write on the saver's copy only), apart_after_load (a copy not the same as the host 10
 // frames into a session, with no fault since it started), saved_during_shop (a re-sync's save while a shop is open).
@@ -49,6 +68,7 @@
 // no_solo_release (0.10.5: a host on its own stays held after its conversation), no_abandoned_talk (found by this
 // fuzzer: a talker that left kept the NPC locked and everyone waiting).
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <deque>
@@ -72,6 +92,11 @@ const uint32_t kFixGiveUpMs = 8000;
 const uint32_t kLoadMs = 3000;
 const uint64_t kSaveHoldMaxMs = 600000;  // kSaveHoldMaxMs: a saver gone quiet, everyone goes on
 const int kExecDelay = 2;  // a command acts this many frames after the host has it
+const uint64_t kJoinerTimeoutMs = 15000;  // save_transfer.inc: a joiner not polled for this long is gone
+const uint64_t kNoticeMarginMs = 5000;    // what a wait on a gone copy may last beyond the notice before it is a bug
+const uint64_t kWaitLimitMs = kJoinerTimeoutMs + kNoticeMarginMs;
+const int kRecruitEntities = 5;           // what a recruit screen's candidates take from the entity table
+const double kMapSpeed = 60.0;            // world map units a second
 
 enum CmdType : uint8_t { CMove, CGive, CShopOpen, CShopClose, CFixHold, CSerial, CStock, CJoinersApart, CTalk, CTalkDone, CSaveHold };
 
@@ -244,6 +269,30 @@ struct Copy {
     // NPCs whose gone talker's done came first (g_cancelled[8]), 10 s each; one_cancel_slot: only the last
     std::vector<std::pair<int, uint64_t>> cancelled;
     int cancelled_next = 0;
+    // level-up screens (recruit_sync.inc): other players' open screens, and this copy's own
+    struct LvlLock {
+        bool open = false;
+        int who = 0, owner = -1;
+        uint32_t claim = 0;
+        uint64_t orphan_since = 0;
+        bool said = false;
+    };
+    LvlLock lvl_locks[4];
+    bool lvl_open = false, lvl_won = false;
+    int lvl_char = 0;
+    uint32_t lvl_claim = 0;
+    uint64_t lvl_until = 0;
+    // recruiting: this copy's own screen, and another player's built here without a window
+    bool rec_mine = false;
+    bool rec_hire = false;
+    std::vector<int> rec_ents;
+    bool hl_up = false;
+    long hl_gen = 0;
+    std::vector<int> hl_ents;
+    // the world map
+    bool map_active = false, map_diverged = false, mmoving = false, map_said = false;
+    double mx = 0, my = 0, mdx = 0, mdy = 0;
+    uint64_t wm_blocked = 0;  // when this joiner last could not poll
 };
 
 class FtTarget : public TargetBase {
@@ -271,6 +320,10 @@ public:
         int m = std::max(0, std::min(n_ - 1, op.m));
         switch (op.kind) {
             case OpKind::Move: {
+                if (op.c >= 1) {  // the world map: c = 1 leaves the mission / chooses a destination, c = 2 a travel click
+                    MapOp(m, op);
+                    break;
+                }
                 Cmd c;
                 c.type = CMove, c.a = op.a % kActors, c.b = op.b, c.c = op.c;
                 Request(m, c);
@@ -279,6 +332,10 @@ public:
             }
             case OpKind::Pickup:
             case OpKind::Drop: {
+                if (op.kind == OpKind::Drop && (op.b & 1)) {  // an odd b: a level-up screen (the others are item moves)
+                    LevelOp(m, op);
+                    break;
+                }
                 Cmd c;
                 c.type = CGive, c.a = op.a % kActors, c.b = (op.a + 1) % kActors, c.c = op.b % kKinds;
                 Request(m, c);
@@ -300,7 +357,11 @@ public:
             case OpKind::Hit: {  // a conversation: copy m talks to NPC 300 + a % 3
                 if (!Quarter(op) || !copies_[m].connected || copies_[m].loading || copies_[m].talking || copies_[m].talk_pending) break;
                 Copy& c = copies_[m];
-                int npc = 300 + op.a % 3;
+                int npc = 300 + op.a % 4;
+                if (npc == 303) {  // the recruiter
+                    if (c.lvl_open) break;  // this player's own character screen is up
+                    if (RefuseRecruit(m)) break;
+                }
                 auto l = c.npc_lock.find(npc);
                 if (l != c.npc_lock.end() && l->second != m) {  // RefuseLockedTalk
                     Trace("copy %d's talk to NPC %d refused here: copy %d is talking to them", m, npc, l->second);
@@ -320,6 +381,7 @@ public:
                 }
                 Cmd t;
                 t.type = CTalk, t.a = npc, t.b = m, t.c = 1 + op.b % 15;
+                t.value = (op.b / 15) % 2;  // a recruiter's visit: odd hires someone (a re-sync at the close)
                 Request(m, t);
                 c.talk_pending = true, c.pending_npc = npc;
                 counters_["op_talk"]++;
@@ -355,6 +417,29 @@ public:
                     c.w.serial += 5000 + rng_.range(0, 5000);  // its own game ran meanwhile
                     if (op.a == 1 || rng_.range(0, 1)) for (int& k : c.w.stock) k = 0;  // and may have no stock at all
                     counters_["op_join"]++;
+                    // Back inside the notice delay (the joiner id is kept for the process's life). It reports W after P: the host
+                    // takes that as a leave and closes what it holds for the old self right away (NoteJoiner came_back).
+                    // The twin no_rejoin_as_leave: the host sees the id live and keeps it all (a re-sync gated on the shop).
+                    if (left_pending_[m]) {
+                        std::string what;
+                        if (copies_[0].shop && copies_[0].shop_shopper == m) what += " a shop";
+                        for (int npc = 300; npc < 304; npc++)
+                            if (host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_)) && TalkOwner(npc) == m) what += " a conversation";
+                        if (copies_[0].save_hold && copies_[0].save_saver == m && !copies_[0].save_mine) what += " a save";
+                        for (auto& l : copies_[0].lvl_locks)
+                            if (l.open && l.owner == m) what += " a character lock";
+                        if (!bugs_.count("no_rejoin_as_leave")) {
+                            if (copies_[0].shop && copies_[0].shop_shopper == m && !abandon_sent_) {
+                                abandon_sent_ = true;
+                                CloseAbandoned();
+                            }
+                            HostNotices(m);
+                        } else if (!what.empty()) {
+                            Violate("rejoin_before_notice", "copy " + std::to_string(m) + " rejoined within 15 s of leaving; the host still holds" + what + " for its old self");
+                        }
+                    }
+                    left_pending_[m] = false;
+                    last_seen_[m] = now_;
                     Trace("copy %d joins", m);
                     if (reload_pending_ || loading_until_) join_again_ = true;  // that reload's save is already made
                     else StartReload(false, "a joiner arrived");
@@ -362,29 +447,21 @@ public:
                 break;
             case OpKind::Leave:
                 if (Quarter(op) && m != 0 && copies_[m].connected && connectedCount() > 1) {  // down to a host alone
-                    copies_[m].connected = false;
-                    copies_[m].held = false;
-                    bool saver_mid_save = copies_[0].save_hold && copies_[0].save_saver == m && !copies_[0].save_mine;
-                    copies_[m].save_requested = copies_[m].save_mine = copies_[m].save_hold = false;  // the others' holds stay
-                    gone_.insert(m);
-                    if (saver_mid_save && !bugs_.count("no_abandoned_save")) {  // CloseAbandonedSave: nothing saved
-                        Trace("the host ends copy %d's save for everyone (nothing saved)", m);
-                        for (int j = 0; j < n_; j++)
-                            if (copies_[j].connected) save_done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, m, false});
-                    }
+                    Copy& c = copies_[m];
+                    c.connected = false;
+                    c.held = false;
+                    c.save_requested = c.save_mine = c.save_hold = false;  // the others' holds stay
+                    // the host notices when the polls have stopped for kJoinerTimeoutMs (HostNotices); the copy's own state
+                    // is cleared at once
+                    left_pending_[m] = true;
                     counters_["op_leave"]++;
-                    Trace("copy %d leaves%s", m, copies_[m].my_shop ? " in the middle of its own shop" : copies_[m].shop ? " with a shop open" : "");
-                    if (copies_[0].shop && copies_[0].shop_shopper == m) CloseAbandoned();
-                    copies_[m].talking = copies_[m].talk_pending = copies_[m].talk_held = false;
-                    copies_[m].conv_wait = false, copies_[m].npc_lock.clear();  // a copy that comes back starts from nothing
-                    if (!bugs_.count("no_abandoned_talk"))  // CloseAbandonedTalks: its NPCs' done, for everyone
-                        for (int npc = 300; npc < 303; npc++)
-                            if (host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_)) && TalkOwner(npc) == m) {
-                                host_locks_.Free(static_cast<uint16_t>(npc));
-                                Trace("the host ends copy %d's conversation with NPC %d for everyone", m, npc);
-                                for (int j = 0; j < n_; j++)
-                                    if (copies_[j].connected) done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, npc, m, true});
-                            }
+                    Trace("copy %d leaves%s", m, c.my_shop ? " in the middle of its own shop" : c.shop ? " with a shop open" : "");
+                    c.talking = c.talk_pending = c.talk_held = false;
+                    c.conv_wait = false, c.npc_lock.clear();  // a copy that comes back starts from nothing
+                    c.lvl_open = c.lvl_won = false;
+                    for (auto& l : c.lvl_locks) l = Copy::LvlLock();
+                    c.rec_mine = c.hl_up = false, c.rec_ents.clear(), c.hl_ents.clear();
+                    c.map_active = c.map_diverged = c.mmoving = false;
                 }
                 break;
             case OpKind::Load:
@@ -414,11 +491,14 @@ public:
     bool quiescent() const override {
         if (!frozen_ || final_reload_ || reload_pending_ || loading_until_ || resync_wait_) return false;
         if (any_shop_ || judge_.reason || fix_pending_ || host_hold_npc_ || !done_due_.empty() || !save_done_due_.empty()) return false;
+        if (!lvl_up_.empty() || !lvl_down_.empty() || hire_reload_at_ || !wm_due_.empty()) return false;
+        for (int m = 0; m < n_; m++)
+            if (left_pending_[m]) return false;  // the host has not noticed it yet
         // Lockstep frames and polls never stop: quiet is the drift machinery idle with every copy 160 frames (six checks)
         // into the session that heal() started.
         for (const Copy& c : copies_)
             if (c.connected && (c.held || c.loading || c.frame < 160 || c.talking || c.conv_wait || c.talk_held ||
-                              c.save_hold || c.save_requested))
+                              c.save_hold || c.save_requested || c.lvl_open || c.map_active))
                 return false;
         return true;
     }
@@ -466,9 +546,16 @@ public:
                                                       " locked for copy " + std::to_string(l.second) + " || trace" + Recent(), now_});
                         break;
                     }
-            for (int npc = 300; npc < 303; npc++)
+            for (int npc = 300; npc < 304; npc++)
                 if (host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_)))
                     v.push_back({"lock_leak", "the host still holds NPC " + std::to_string(npc) + " || trace" + Recent(), now_});
+            for (int m = 0; m < n_; m++)  // nothing is levelling up: a session start cleared every character lock
+                for (auto& l : copies_[m].lvl_locks)
+                    if (copies_[m].connected && l.open) {
+                        v.push_back({"level_lock_leak", "copy " + std::to_string(m) + " still has a lock on character " +
+                                                            std::to_string(l.who) + " for copy " + std::to_string(l.owner) + " || trace" + Recent(), now_});
+                        break;
+                    }
         }
         if (frozen_ && !quiescent()) {  // what keeps it busy, for the report
             std::string d = "busy:";
@@ -493,7 +580,18 @@ public:
                 if (c.talk_held) d += " talk_held" + std::to_string(m);
                 if (c.save_hold) d += " save_hold" + std::to_string(m) + "(saver " + std::to_string(c.save_saver) + (c.save_mine ? ", mine" : "") + ")";
                 if (c.save_requested) d += " save_asked" + std::to_string(m);
+                if (c.lvl_open) d += " level_screen" + std::to_string(m) + "(char " + std::to_string(c.lvl_char) + (c.lvl_won ? ", won" : ", unsure") + ")";
+                for (auto& l : c.lvl_locks)
+                    if (l.open) d += " level_lock_on" + std::to_string(m) + "(char " + std::to_string(l.who) + ", copy " + std::to_string(l.owner) + ")";
+                if (c.hl_up) d += " headless_screen" + std::to_string(m) + "(gen " + std::to_string(c.hl_gen) + ")";
+                if (c.rec_mine) d += " recruit_screen" + std::to_string(m);
+                if (c.map_active) d += " world_map" + std::to_string(m) + (c.map_diverged ? "(diverged)" : "");
             }
+            for (int m = 0; m < n_; m++)
+                if (left_pending_[m]) d += " notice_pending" + std::to_string(m);
+            if (!lvl_up_.empty() || !lvl_down_.empty()) d += " level_records_on_the_way";
+            if (hire_reload_at_) d += " hire_resync_pending";
+            if (!wm_due_.empty()) d += " map_reports_on_the_way";
             v.push_back({"stuck", d + " || trace" + Recent(), now_});
         }
         return v;
@@ -556,9 +654,17 @@ private:
             }
         }
         if (c.type == CTalkDone) host_locks_.Done(static_cast<uint16_t>(c.a), c.b);
+        if (c.type == CTalkDone && c.a == 303 && c.value) {  // a hire: the host re-syncs once the done went round
+            hire_reload_at_ = now_ + 1;
+            Trace("the host will re-sync for the hire of copy %d's visit", c.b);
+        }
         if (c.type == CTalkDone && Held(c.a)) {  // a held conversation's done: on arrival (nobody runs frames)
             for (int m = 0; m < n_; m++)
-                if (copies_[m].connected) done_due_.push_back({m == 0 ? now_ : now_ + Latency(), m, c.a, c.b, false});
+                if (copies_[m].connected) {
+                    uint64_t at = m == 0 ? now_ : now_ + Latency();
+                    done_due_.push_back({at, m, c.a, c.b, false});
+                    if (hire_reload_at_) hire_reload_at_ = std::max(hire_reload_at_, at + 1);
+                }
             return;
         }
         schedule_[copies_[0].frame + kExecDelay].push_back(c);
@@ -636,7 +742,25 @@ private:
             c.save_gone_since = 0, c.save_gone_said = false;
             c.save_done_sent = 0, c.early_saver = -1, c.cancelled.clear(), c.cancelled_next = 0, c.save_stuck_said = false;
         }
-        gone_.clear();
+        // (gone_ is not cleared by a session start: g_gone_joiners is not; a copy leaves it when it plays again, below)
+        // A load closes the character screens and the recruit screen made for this copy's own player; the other players'
+        // locks go with ClearLevelLocks (the mutation no_level_clear: kept). The headless screen of another player's visit
+        // is NOT closed by a session start (recruit_sync.inc): its entities were in the old world.
+        for (Copy& c : copies_) {
+            c.lvl_open = c.lvl_won = false;
+            if (!bugs_.count("no_level_clear"))
+                for (auto& l : c.lvl_locks) l = Copy::LvlLock();
+            c.rec_mine = false, c.rec_ents.clear();
+            // LoadCheckHook closes a headless recruit screen while the old world exists; its entities go with that world.
+            // The twin no_recruit_drop_on_load: it survives into the new session.
+            if (!bugs_.count("no_recruit_drop_on_load")) c.hl_up = false, c.hl_ents.clear();
+            c.map_active = c.map_diverged = c.mmoving = false;
+            c.map_said = false;
+        }
+        lvl_up_.clear(), lvl_down_.clear(), wm_due_.clear();
+        hire_reload_at_ = 0;
+        abandon_sent_ = false;
+        two_lev_said_.clear();
         // What the host sends at every session's start (settings_sync.inc), acting at the same frame everywhere.
         if (!bugs_.count("no_serial_sync")) {
             Cmd c;
@@ -714,7 +838,7 @@ private:
                                                         std::to_string(StockItems(w)) + " items here, " +
                                                         std::to_string(StockItems(hw->second)) + " on the host)");
                 }
-                if (m == 0 && !copies_[c.b].connected) pending_abandon_ = true;  // gone before its shop opened
+                if (m == 0) abandon_sent_ = false;  // (a shopper gone before its shop opened: the notice step closes it)
                 cp.shop = true;
                 cp.shop_shopper = c.b;
                 cp.shop_buyer = c.a;
@@ -799,8 +923,12 @@ private:
                     cp.conv_wait = true;
                     if (m == 0) host_hold_npc_ = c.a, host_hold_since_ = now_;
                 }
+                if (c.a == 303) OpenRecruit(m, c);
                 if (m == 0)
                     Trace("copy %d's conversation with NPC %d opens at frame %d%s", c.b, c.a, cp.frame, Held(c.a) ? " (everyone waits)" : "");
+                if (m == 0 && gone_.count(c.b) && copies_[c.b].connected && !copies_[c.b].loading)
+                    Violate("live_talk_cancelled", "copy " + std::to_string(c.b) + " is connected and playing, but its talk to NPC " +
+                                                       std::to_string(c.a) + " is closed as a gone talker's");
                 if (m == 0 && gone_.count(c.b) && !bugs_.count("no_cancel_mark") && TalkOwner(c.a) == c.b) {  // (a second done is harmless)  // CloseTalkOfGone
                     host_locks_.Free(static_cast<uint16_t>(c.a));
                     talk_owner_.erase(c.a);
@@ -927,6 +1055,7 @@ private:
             if (!other) c.conv_wait = false;
         }
         if (m == 0 && host_hold_npc_ == npc) host_hold_npc_ = 0;
+        if (m != talker) CloseHeadless(m, npc == 303);  // kSyncDone: CloseHeadlessRecruit, first (any conversation's done)
     }
     struct DoneDue {
         uint64_t at;
@@ -970,10 +1099,6 @@ private:
         if (m == 0 && fix_snapshot_) {
             fix_snapshot_ = false;
             fix_world_ = c.w;
-        }
-        if (m == 0 && pending_abandon_) {
-            pending_abandon_ = false;
-            CloseAbandoned();
         }
         c.worlds[c.frame] = c.w;
         if (c.worlds.size() > 400) c.worlds.erase(c.worlds.begin());
@@ -1084,6 +1209,353 @@ private:
         return h == host_frames_.end() || !h->second.shop;
     }
 
+
+    // ---- the host notices a joiner is gone only when its polls have stopped for kJoinerTimeoutMs (NoticeLeftJoiners)
+    bool JoinerLive(int m) const {  // LiveJoiners' test: polled in the last kJoinerTimeoutMs
+        if (m == 0 || copies_[m].connected) return true;
+        return left_pending_[m] && now_ - last_seen_[m] <= kJoinerTimeoutMs;
+    }
+    int LiveJoiners() const {
+        int k = 0;
+        for (int m = 1; m < n_; m++) k += JoinerLive(m);
+        return k;
+    }
+    void HostNotices(int m) {
+        left_pending_[m] = false;
+        Trace("the host notices copy %d is gone (no poll for %d s)", m, static_cast<int>(kJoinerTimeoutMs / 1000));
+        gone_.insert(m);  // CloseAbandonedTalks: g_gone_joiners, then the talks it owned
+        if (!bugs_.count("no_abandoned_talk"))
+            for (int npc = 300; npc < 304; npc++)
+                if (host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_)) && TalkOwner(npc) == m) {
+                    host_locks_.Free(static_cast<uint16_t>(npc));
+                    Trace("the host ends copy %d's conversation with NPC %d for everyone", m, npc);
+                    for (int j = 0; j < n_; j++)
+                        if (copies_[j].connected) done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, npc, m, true});
+                }
+        if (!bugs_.count("no_abandoned_level"))  // CloseAbandonedLevel: the close it would have sent, for every copy
+            for (auto& l : copies_[0].lvl_locks)
+                if (l.open && l.owner == m) {
+                    Trace("the host closes copy %d's level screen of character %d for everyone", m, l.who);
+                    SendLevel(0, 1, l.who, l.claim);
+                }
+        Copy& h = copies_[0];  // CloseAbandonedSave: nothing saved
+        if (h.save_hold && h.save_saver == m && !h.save_mine && !bugs_.count("no_abandoned_save")) {
+            Trace("the host ends copy %d's save for everyone (nothing saved)", m);
+            for (int j = 0; j < n_; j++)
+                if (copies_[j].connected) save_done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, m, false});
+        }
+    }
+
+    // ---- level-up screens (recruit_sync.inc)
+    struct LvlMsg {
+        uint64_t at;
+        int from, to, kind, who;  // kind 0 open, 1 close
+        uint32_t claim;
+        long gen;
+    };
+    Copy::LvlLock* LockOf(Copy& c, int who) {
+        for (auto& l : c.lvl_locks)
+            if (l.open && l.who == who) return &l;
+        return nullptr;
+    }
+    static bool AnyLock(const Copy& c) {
+        for (auto& l : c.lvl_locks)
+            if (l.open) return true;
+        return false;
+    }
+    void SendLevel(int m, int kind, int who, uint32_t claim) {
+        LvlMsg g{0, m, -1, kind, who, claim, gen_};
+        if (m == 0) {
+            g.at = now_;
+            RelayLevel(g);
+            return;
+        }
+        g.at = std::max(lvl_up_last_[m], now_ + Latency());
+        lvl_up_last_[m] = g.at;
+        lvl_up_.push_back(g);
+    }
+    void RelayLevel(const LvlMsg& g) {  // the host passes it on, in its own order, to every copy (the sender's included)
+        for (int j = 0; j < n_; j++) {
+            if (!copies_[j].connected) continue;
+            LvlMsg d = g;
+            d.to = j;
+            d.at = j == 0 ? now_ : std::max(lvl_down_last_[j], now_ + Latency());
+            if (j != 0) lvl_down_last_[j] = d.at;
+            lvl_down_.push_back(d);
+        }
+    }
+    void LevelOp(int m, const Op& op) {  // copy m's player opens character a % 4's screen for 1 to 10 s
+        Copy& c = copies_[m];
+        if (!Quarter(op) || !c.connected || c.loading || c.lvl_open) return;
+        int ch = op.a % 4;
+        if (LockOf(c, ch)) {  // LevelLockedScreen: another player has this character, the screen closes at once
+            counters_["level_open_refused"]++;
+            Trace("copy %d's level screen of character %d is refused here: another player has them", m, ch);
+            return;
+        }
+        c.lvl_open = true, c.lvl_won = false, c.lvl_char = ch;
+        c.lvl_claim = ++claim_seq_;
+        c.lvl_until = now_ + 1000u * (1 + op.c % 10);
+        counters_["op_level"]++;
+        Trace("copy %d opens the level screen of character %d (claim %u)", m, ch, c.lvl_claim);
+        SendLevel(m, 0, ch, c.lvl_claim);
+    }
+    void HandleLevel(int m, const LvlMsg& g) {
+        Copy& c = copies_[m];
+        bool mine = c.lvl_open && g.claim == c.lvl_claim;
+        if (g.kind == 0 && mine) {
+            if (LockOf(c, g.who) && !bugs_.count("no_level_race")) {
+                Trace("copy %d's level screen of character %d loses: another player's open came first", m, g.who);
+                counters_["level_open_lost"]++;
+                c.lvl_open = c.lvl_won = false;
+                SendLevel(m, 1, g.who, g.claim);
+            } else {
+                c.lvl_won = true;
+            }
+        } else if (g.kind == 0 && !LockOf(c, g.who)) {
+            bool ours_first = c.lvl_open && c.lvl_char == g.who && c.lvl_won;
+            if (!ours_first)
+                for (auto& l : c.lvl_locks)
+                    if (!l.open) {
+                        l = Copy::LvlLock();
+                        l.open = true, l.who = g.who, l.claim = g.claim, l.owner = g.from;
+                        Trace("copy %d locks character %d for copy %d", m, g.who, g.from);
+                        break;
+                    }
+        } else if (g.kind == 1 && !mine) {
+            for (auto& l : c.lvl_locks)
+                if (l.open && l.claim == g.claim) {
+                    l = Copy::LvlLock();
+                    Trace("copy %d unlocks character %d", m, g.who);
+                }
+        }
+    }
+    bool LevelMsgFor(uint32_t claim) const {
+        for (const LvlMsg& g : lvl_up_)
+            if (g.claim == claim) return true;
+        for (const LvlMsg& g : lvl_down_)
+            if (g.claim == claim) return true;
+        return false;
+    }
+    // A talk to a recruiter while a level lock is held here: refused (RefuseDuringLevelUp). Wrong when nobody is levelling.
+    bool RefuseRecruit(int m) {
+        Copy& c = copies_[m];
+        if (!AnyLock(c)) return false;
+        counters_["recruit_refused_level"]++;
+        bool really = !lvl_up_.empty() || !lvl_down_.empty();
+        for (const Copy& o : copies_) really |= o.connected && o.lvl_open;
+        for (auto& l : c.lvl_locks) really |= l.open && l.owner >= 0 && left_pending_[l.owner];  // gone, the host has not noticed yet
+        Trace("copy %d's talk to the recruiter is refused: a player is levelling up", m);
+        if (!really) {
+            std::string d = "copy " + std::to_string(m) + "'s talk to the recruiter is refused: nobody has a character screen open";
+            Violate("recruit_refused_wrongly", d);
+        }
+        return true;
+    }
+    void LevelStep() {
+        for (size_t i = 0; i < lvl_up_.size();) {
+            if (lvl_up_[i].at > now_) { ++i; continue; }
+            LvlMsg g = lvl_up_[i];
+            lvl_up_.erase(lvl_up_.begin() + i);
+            if (g.gen != gen_ || !copies_[g.from].connected) continue;  // lost with its connection or its session
+            RelayLevel(g);
+        }
+        for (size_t i = 0; i < lvl_down_.size();) {
+            if (lvl_down_[i].at > now_) { ++i; continue; }
+            LvlMsg g = lvl_down_[i];
+            lvl_down_.erase(lvl_down_.begin() + i);
+            if (g.gen != gen_ || !copies_[g.to].connected || copies_[g.to].loading) continue;
+            HandleLevel(g.to, g);
+        }
+        for (int m = 0; m < n_; m++) {  // the leveller presses Done once its open is known to have won
+            Copy& c = copies_[m];
+            if (c.connected && c.lvl_open && c.lvl_won && now_ >= c.lvl_until) {
+                c.lvl_open = c.lvl_won = false;
+                Trace("copy %d's level screen of character %d closes", m, c.lvl_char);
+                SendLevel(m, 1, c.lvl_char, c.lvl_claim);
+            }
+        }
+        for (int a = 0; a < n_; a++)  // two players' screens for one character, both allowed to keep their changes
+            for (int b = a + 1; b < n_; b++) {
+                const Copy &x = copies_[a], &y = copies_[b];
+                if (x.connected && y.connected && x.lvl_open && y.lvl_open && x.lvl_won && y.lvl_won && x.lvl_char == y.lvl_char &&
+                    two_lev_said_.insert({x.lvl_claim, y.lvl_claim}).second)
+                    Violate("two_levellers", "copies " + std::to_string(a) + " and " + std::to_string(b) + " both level up character " +
+                                                 std::to_string(x.lvl_char));
+            }
+        for (int m = 0; m < n_; m++) {  // a lock whose leveller has no screen up and no record is on its way
+            Copy& c = copies_[m];
+            if (!c.connected) continue;
+            for (auto& l : c.lvl_locks) {
+                if (!l.open) continue;
+                const Copy& o = copies_[l.owner];
+                bool alive = o.connected && o.lvl_open && o.lvl_claim == l.claim;
+                if (alive || LevelMsgFor(l.claim)) {
+                    l.orphan_since = 0;
+                } else if (!l.orphan_since) {
+                    l.orphan_since = now_;
+                } else if (!l.said && now_ - l.orphan_since > kWaitLimitMs) {
+                    l.said = true;
+                    std::string d = "copy " + std::to_string(m) + " has held a lock on character " + std::to_string(l.who) +
+                                    " for 20 s for copy " + std::to_string(l.owner) +
+                                    (o.connected ? ", whose screen is closed" : ", which is gone");
+                    Violate("level_lock_leak", d);
+                }
+            }
+        }
+    }
+
+    // ---- recruiting
+    void OpenRecruit(int m, const Cmd& c) {  // the talk to the recruiter opens on copy m (kRecruitOpen, built where it arrives)
+        Copy& cp = copies_[m];
+        if (m == c.b && cp.connected) {
+            cp.rec_mine = true, cp.rec_hire = c.value != 0;
+            cp.rec_ents.clear();
+            for (int i = 0; i < kRecruitEntities; i++) cp.rec_ents.push_back(cp.w.Make());
+            return;
+        }
+        if (m == c.b || bugs_.count("no_headless_recruit")) return;
+        if (cp.hl_up) {  // "one is already up: not made here"
+            counters_["headless_already_up"]++;
+            Trace("a recruit screen opened elsewhere, but one is already up on copy %d: not made there", m);
+            return;
+        }
+        cp.hl_up = true, cp.hl_gen = gen_;
+        cp.hl_ents.clear();
+        for (int i = 0; i < kRecruitEntities; i++) cp.hl_ents.push_back(cp.w.Make());
+        if (m == 0) Trace("copy %d's recruit screen is made headless on every other copy", c.b);
+    }
+    void CloseHeadless(int m, bool own_visit) {  // kSyncDone: the screen's destructor frees its entities, before the delta
+        Copy& cp = copies_[m];
+        if (!cp.hl_up) return;
+        if (!own_visit && !bugs_.count("any_done_closes_recruit")) return;  // only that recruiter's done closes it
+        cp.hl_up = false;
+        if (cp.hl_gen != gen_) {  // built in a world that no longer exists: freeing what is not there
+            Trace("copy %d frees a recruit screen built in session %ld (now %ld)", m, cp.hl_gen, gen_);
+            Violate("stale_screen", "copy " + std::to_string(m) + " frees the entities of a recruit screen made in session " +
+                                    std::to_string(cp.hl_gen) + ", in session " + std::to_string(gen_));
+            cp.hl_ents.clear();
+            return;
+        }
+        for (auto it = cp.hl_ents.rbegin(); it != cp.hl_ents.rend(); ++it) cp.w.Destroy(*it);
+        cp.hl_ents.clear();
+    }
+
+    // ---- the world map
+    bool MapQuiet() const {
+        if (reload_pending_ || loading_until_ || any_shop_ || fix_pending_ || host_hold_npc_ || frozen_ || copies_[0].map_active)
+            return false;
+        for (const Copy& c : copies_)
+            if (c.connected && (c.loading || c.held || c.talking || c.conv_wait || c.talk_held || c.save_hold || c.save_requested ||
+                                c.lvl_open || c.shop || c.talk_pending))
+                return false;
+        return true;
+    }
+    void MapOp(int m, const Op& op) {
+        Copy& c = copies_[m];
+        Copy& h = copies_[0];
+        if (!c.connected || c.loading) return;
+        if (op.c == 1) {
+            if (!h.map_active) {
+                if (m == 0 && Quarter(op) && MapQuiet()) {
+                    h.map_active = true, h.map_diverged = false, h.mmoving = false;
+                    h.mx = h.my = 500, h.mdx = h.mdy = 500;
+                    wm_stop_at_ = now_;
+                    counters_["map_phases"]++;
+                    Trace("the host leaves the mission: world map");
+                }
+            } else if (m == 0) {
+                if (Quarter(op)) {  // GoToMap on the host: the next mission is a load, every joiner follows
+                    counters_["map_missions"]++;
+                    Trace("the host chooses a destination: the mission loads");
+                    h.map_active = h.mmoving = false;
+                    StartReload(false, "the host entered a mission");
+                }
+            } else if (!c.map_diverged) {
+                counters_["map_choice_refused"]++;  // GoToMapHook: only the host chooses where to go
+                Trace("copy %d's world map choice is refused: only the host chooses", m);
+            }
+            return;
+        }
+        if (!h.map_active) return;
+        if (m == 0) {
+            h.mdx = op.a % 1000, h.mdy = op.b % 1000;
+            h.mmoving = true;
+            counters_["map_travels"]++;
+            Trace("the host's party travels to (%.0f, %.0f)", h.mdx, h.mdy);
+        } else if (!c.map_diverged) {
+            if (bugs_.count("joiner_travels")) {  // the twin: a joiner's click is not refused
+                c.mdx = op.a % 1000, c.mdy = op.b % 1000, c.mmoving = true, c.map_active = true;
+                Violate("two_destinations", "copy " + std::to_string(m) + "'s world map travel click got through: two parties travel");
+            } else {
+                counters_["map_travel_refused"]++;  // WorldMapTravelHook
+                Trace("copy %d's world map travel click is refused: only the host moves the party", m);
+            }
+        }
+    }
+    struct WmReport {
+        uint64_t at;
+        int to;
+        double x, y, dx, dy;
+        bool moving;
+        long gen;
+    };
+    void MapStep() {
+        Copy& h = copies_[0];
+        for (int m = 0; m < n_; m++) {  // the party walks towards its destination (the same speed on every copy)
+            Copy& c = copies_[m];
+            if (!c.connected || !c.map_active || !c.mmoving) continue;
+            double dx = c.mdx - c.mx, dy = c.mdy - c.my, d = std::sqrt(dx * dx + dy * dy), step = kMapSpeed * 0.01;
+            if (d <= step) {
+                c.mx = c.mdx, c.my = c.mdy, c.mmoving = false;
+                if (m == 0) wm_stop_at_ = now_;
+            } else {
+                c.mx += dx / d * step, c.my += dy / d * step;
+            }
+            // random encounters: rolled by the copy whose WorldMapEncounterHook lets it (3 % a second while travelling)
+            if (c.mmoving && rng_.range(0, 9999) < 3) {
+                if (m == 0) {
+                    counters_["map_encounters"]++;
+                    Trace("the host's party meets an encounter: the mission loads");
+                    c.map_active = c.mmoving = false;
+                    StartReload(false, "an encounter");
+                } else if (bugs_.count("joiner_rolls")) {  // the twin: a joiner rolls its own encounter
+                    Trace("copy %d rolls its own encounter and enters another map than the host", m);
+                    c.map_diverged = true, c.map_active = c.mmoving = false;
+                    if (h.map_active)
+                        Violate("map_apart", "copy " + std::to_string(m) + " entered another map than the host's world map");
+                } else {
+                    counters_["map_roll_refused"]++;
+                }
+            }
+        }
+        // at rest long enough for the last report to have come: every joiner's party is where the host's is
+        uint64_t settle = 1500 + 3ull * link_.maxLatencyMs;
+        if (h.map_active && !h.mmoving && now_ - wm_stop_at_ > settle)
+            for (int m = 1; m < n_; m++) {
+                Copy& c = copies_[m];
+                if (!c.connected || c.loading || c.map_said || c.map_diverged || now_ - c.wm_blocked <= settle) continue;
+                double off = std::fabs(c.mx - h.mx) + std::fabs(c.my - h.my);
+                if (!c.map_active || off > 2.0) {
+                    c.map_said = true;
+                    char d[160];
+                    snprintf(d, sizeof(d), "copy %d's party is %s, the host's at (%.0f, %.0f) for %llu ms", m,
+                             c.map_active ? "elsewhere" : "not on the map", h.mx, h.my,
+                             static_cast<unsigned long long>(now_ - wm_stop_at_));
+                    Violate("map_apart", d);
+                }
+            }
+        for (size_t i = 0; i < wm_due_.size();) {  // the host's report reaches a joiner (the answer to its poll)
+            if (wm_due_[i].at > now_) { ++i; continue; }
+            WmReport r = wm_due_[i];
+            wm_due_.erase(wm_due_.begin() + i);
+            Copy& c = copies_[r.to];
+            if (r.gen != gen_ || !c.connected || c.loading || c.map_diverged) continue;
+            c.map_active = true;
+            c.mx = r.x, c.my = r.y, c.mdx = r.dx, c.mdy = r.dy, c.mmoving = r.moving;
+        }
+    }
+
     void Step() {
         // loading: everyone starts the new session together
         if (loading_until_ && now_ >= loading_until_) {
@@ -1141,6 +1613,21 @@ private:
             Trace("copy %d is done talking to NPC %d", m, c.talk_npc);
             Cmd d;
             d.type = CTalkDone, d.a = c.talk_npc, d.b = m;
+            if (c.talk_npc == 303 && c.rec_mine) {  // the recruit screen's destructor, then the diff
+                for (int j = 0; j < n_; j++) {  // every copy that is in the visit has made the screen's entities too
+                    const Copy& o = copies_[j];
+                    auto lk = o.npc_lock.find(303);
+                    if (j == m || !o.connected || o.loading || lk == o.npc_lock.end() || lk->second != m) continue;
+                    if (o.hl_up && o.hl_gen == gen_) continue;
+                    std::string det = "copy " + std::to_string(j) + " has no copy of copy " + std::to_string(m) +
+                                      "'s recruit screen at its close: the entity tables are apart" + (o.hl_up ? " (an old screen is still up there)" : "");
+                    Violate("recruit_apart", det);
+                }
+                d.value = c.rec_hire;
+                for (auto it = c.rec_ents.rbegin(); it != c.rec_ents.rend(); ++it) c.w.Destroy(*it);
+                c.rec_ents.clear(), c.rec_mine = false;
+                Trace("copy %d's recruit screen closes (%s)", m, d.value ? "someone was hired" : "no change to the squad");
+            }
             Request(m, d);
         }
         for (size_t i = 0; i < done_due_.size();) {
@@ -1151,6 +1638,26 @@ private:
             DoneDue d = done_due_[i];
             done_due_.erase(done_due_.begin() + i);
             if (copies_[d.m].connected) FreeNpc(d.m, d.npc, d.talker, d.gone);
+        }
+        if (!bugs_.count("no_forget_gone"))  // ForgetGoneJoiner: a live joiner in state P is not a gone one (it came back)
+            for (int m = 1; m < n_; m++)
+                if (copies_[m].connected && !copies_[m].loading) gone_.erase(m);
+        for (int m = 1; m < n_; m++)  // the joiners' poll threads go on whatever the main thread waits for
+            if (copies_[m].connected) last_seen_[m] = now_;
+        // NoticeLeftJoiners: a joiner whose polls stopped kJoinerTimeoutMs ago is gone; the shop of a gone shopper closes
+        // (even one gone before its shop opened)
+        for (int m = 1; m < n_; m++)
+            if (left_pending_[m] && now_ - last_seen_[m] > kJoinerTimeoutMs) HostNotices(m);
+        if (copies_[0].shop && copies_[0].shop_shopper > 0 && !JoinerLive(copies_[0].shop_shopper) && !abandon_sent_) {
+            abandon_sent_ = true;
+            CloseAbandoned();
+        }
+        LevelStep();
+        MapStep();
+        if (hire_reload_at_ && now_ >= hire_reload_at_) {  // a hired recruit: the squad changed, a full re-sync
+            hire_reload_at_ = 0;
+            counters_["hire_resyncs"]++;
+            StartReload(false, "a recruit was hired");
         }
         // saves: the saver is done (the write changes its game); its done goes to everyone, as it arrives
         for (int m = 0; m < n_; m++) {
@@ -1189,9 +1696,9 @@ private:
             // the saver is gone: nothing but those 10 minutes ends the wait
             if (c.connected && c.save_hold && !c.save_mine && c.save_saver >= 0 && !copies_[c.save_saver].connected) {
                 if (!c.save_gone_since) c.save_gone_since = now_;
-                if (now_ - c.save_gone_since > 5000 && !c.save_gone_said) {
+                if (now_ - c.save_gone_since > kWaitLimitMs && !c.save_gone_said) {
                     c.save_gone_said = true;
-                    Violate("waits_for_gone", "copy " + std::to_string(m) + " has waited 5 s for the save of copy " +
+                    Violate("waits_for_gone", "copy " + std::to_string(m) + " has waited 20 s for the save of copy " +
                                                   std::to_string(c.save_saver) + ", which is gone");
                 }
             } else {
@@ -1218,9 +1725,9 @@ private:
                     if (Held(l.first) && l.second != m) talker = l.second;
             if (talker >= 0 && !copies_[talker].connected) {
                 if (!c.gone_wait_since) c.gone_wait_since = now_;
-                if (now_ - c.gone_wait_since > 5000 && !c.gone_wait_said) {
+                if (now_ - c.gone_wait_since > kWaitLimitMs && !c.gone_wait_said) {
                     c.gone_wait_said = true;
-                    Violate("waits_for_gone", "copy " + std::to_string(m) + " has waited 5 s for the conversation of copy " +
+                    Violate("waits_for_gone", "copy " + std::to_string(m) + " has waited 20 s for the conversation of copy " +
                                                   std::to_string(talker) + ", which is gone");
                 }
             } else {
@@ -1228,7 +1735,7 @@ private:
             }
         }
         if (host_hold_npc_) {  // HostHoldTimeout: every joiner gone, or 10 minutes
-            bool alone = connectedCount() == 1;
+            bool alone = LiveJoiners() == 0;  // HostHoldTimeout: LiveJoiners() == 0 (the polls stopped 15 s ago)
             if (alone || now_ - host_hold_since_ > talk::kLockMaxMs) {
                 Trace("the host stops waiting for NPC %d's conversation (%s)", host_hold_npc_,
                       alone ? "the other player left" : "waited too long");
@@ -1243,7 +1750,7 @@ private:
             fix_release_host_at_ = 0;
             judge_.CorrectionDone(gen_, fix_frame_);
         }
-        if (!h.held && !h.conv_wait && !h.talk_held && !h.save_hold && now_ >= next_host_frame_) {
+        if (!h.held && !h.conv_wait && !h.talk_held && !h.save_hold && !h.lvl_open && now_ >= next_host_frame_) {
             next_host_frame_ = now_ + kFrameMs;
             std::vector<Cmd> cmds;
             auto it = schedule_.find(h.frame + 1);
@@ -1263,8 +1770,12 @@ private:
         // joiners: run the frames they have, unless held
         for (int m = 1; m < n_; m++) {
             Copy& c = copies_[m];
-            if (!c.connected || c.loading) continue;
+            if (!c.connected || c.loading) {
+                c.wm_blocked = now_;
+                continue;
+            }
             if (c.held) {
+                c.wm_blocked = now_;  // no poll while it waits for a correction
                 auto due = fix_due_.find(m);
                 if (due != fix_due_.end() && now_ >= due->second) {  // the host's values: positions, free list, serial, inventories
                     World& w = c.w;
@@ -1289,7 +1800,7 @@ private:
                 if (c.held) continue;
             }
             while (!c.stream.empty() && c.stream.front().at <= now_ && !c.held && !c.conv_wait && !c.talk_held &&
-                   !c.save_hold) {
+                   !c.save_hold && !c.lvl_open) {
                 Delivery d = c.stream.front();
                 c.stream.pop_front();
                 if (d.gen != gen_) continue;
@@ -1310,6 +1821,12 @@ private:
             Poll p = polls_[i];
             polls_.erase(polls_.begin() + i);
             if (!copies_[p.from].connected) continue;
+            if (copies_[0].map_active) {  // the answer carries the host's party (WMAP), in the order of the polls
+                Copy& h0 = copies_[0];
+                uint64_t at = std::max(wm_last_[p.from], now_ + Latency());
+                wm_last_[p.from] = at;
+                wm_due_.push_back({at, p.from, h0.mx, h0.my, h0.mdx, h0.mdy, h0.mmoving, gen_});
+            }
             for (const drift::Rec& j : p.recs) {
                 const drift::Rec* mine = nullptr;
                 for (const drift::Rec& r : copies_[0].ring)
@@ -1408,7 +1925,7 @@ private:
     std::map<int, Hashes> host_frames_;  // the host's hashes at each frame of this session
     long fault_gen_ = -1;
     int drift_from_ = -1, drift_frame_ = 0;
-    bool pending_abandon_ = false;
+    bool abandon_sent_ = false;  // the host's empty close for a gone shopper went out (g_shop.owner = 0)
     std::set<int> gone_;  // the host's note of the copies that left this session (g_gone_joiners)
     talk::HostLocks host_locks_;
     int host_hold_npc_ = 0;
@@ -1433,13 +1950,27 @@ private:
     long gen_ = 0;
     uint32_t next_id_ = 0;
     uint64_t faults_ = 0, fixes_ = 0, drift_reloads_ = 0;
+    // leaves noticed late
+    bool left_pending_[4] = {};
+    uint64_t last_seen_[4] = {};  // when the host last had a poll from each joiner
+    // level-up screens
+    std::vector<LvlMsg> lvl_up_, lvl_down_;
+    uint64_t lvl_up_last_[4] = {}, lvl_down_last_[4] = {};
+    uint32_t claim_seq_ = 0;
+    std::set<std::pair<uint32_t, uint32_t>> two_lev_said_;
+    // recruiting
+    uint64_t hire_reload_at_ = 0;
+    // the world map
+    std::vector<WmReport> wm_due_;
+    uint64_t wm_last_[4] = {}, wm_stop_at_ = 0;
 };
 
 // probe_late_report is no bug: it reports the moment a differing check reaches the host during a correction, so the
 // triage shows how that comes about.
 const char* kBugs[] = {"no_shop_skip", "no_drop_before_fix", "no_serial_sync", "no_stock_sync", "no_resync_gate", "no_abandoned_close",
                        "probe_late_report", "probe_race", "probe_undetected",
-                       "no_host_filter", "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check", "save_alone", "no_abandoned_save", "no_early_save_done", "no_cancel_mark", "one_cancel_slot", "no_gone_saver_at_hold"};
+                       "no_host_filter", "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check", "save_alone", "no_abandoned_save", "no_early_save_done", "no_cancel_mark", "one_cancel_slot", "no_gone_saver_at_hold",
+                       "no_level_race", "no_level_clear", "no_headless_recruit", "joiner_travels", "joiner_rolls", "no_abandoned_level", "no_recruit_drop_on_load", "any_done_closes_recruit", "no_rejoin_as_leave", "no_forget_gone"};
 
 std::unique_ptr<ITarget> makeFt(const Scenario& s, std::string* err) {
     std::set<std::string> bugs;
@@ -1458,7 +1989,8 @@ std::unique_ptr<ITarget> makeFt(const Scenario& s, std::string* err) {
 const TargetRegistrar kRegisterFt(TargetInfo{
     "ftcoop", "Fallout Tactics co-op on a fake world: lockstep, shops, drift checks, corrections, reloads, forced desyncs",
     {"no_shop_skip", "no_drop_before_fix", "no_serial_sync", "no_stock_sync", "no_resync_gate", "no_abandoned_close", "probe_late_report", "probe_race", "probe_undetected", "no_host_filter",
-     "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check", "save_alone", "no_abandoned_save", "no_early_save_done", "no_cancel_mark", "one_cancel_slot", "no_gone_saver_at_hold"}, makeFt});
+     "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check", "save_alone", "no_abandoned_save", "no_early_save_done", "no_cancel_mark", "one_cancel_slot", "no_gone_saver_at_hold",
+     "no_level_race", "no_level_clear", "no_headless_recruit", "joiner_travels", "joiner_rolls", "no_abandoned_level", "no_recruit_drop_on_load", "any_done_closes_recruit", "no_rejoin_as_leave", "no_forget_gone"}, makeFt});
 
 }  // namespace
 }  // namespace coopfuzz

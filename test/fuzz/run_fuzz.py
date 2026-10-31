@@ -46,6 +46,16 @@ TWINS = {
     "no_early_save_done": "save_hold_stuck",  # a done before a lagging copy's hold frame was dropped: held 10 minutes
     "no_gone_saver_at_hold": "waits_for_gone",  # a saver gone before its hold acted: nobody ends the hold
     "no_cancel_mark": "waits_for_gone",       # a talk relayed before its talker left reaches its frame afterwards
+    "no_level_race": "two_levellers",         # two players open one character's level screen: the second wins too
+    "no_level_clear": "level_lock_leak",      # a session start keeps the character locks
+    "no_headless_recruit": "recruit_apart",   # the other copies do not make the recruit screen's entities
+    "joiner_travels": "two_destinations",     # a joiner's world map travel click is not refused
+    "joiner_rolls": "map_apart",              # a joiner rolls its own encounter: another map than the host's
+    "no_abandoned_level": "level_lock_leak",  # a leveller that left keeps its character lock on every copy
+    "no_recruit_drop_on_load": "stale_screen",  # a load leaves the headless recruit screen up: freed in the next world
+    "any_done_closes_recruit": "recruit_apart",  # another conversation's done closes a visit's recruit screen early
+    "no_forget_gone": "live_talk_cancelled",  # a joiner back with the same id stays in the gone set: its talk is ended at once
+    "no_rejoin_as_leave": "rejoin_before_notice",  # a joiner back inside 15 s: the host keeps what it held for the old self
 }
 # Fixtures: one exact situation each, written out and replayed over 20 seeds (the seed decides latencies and the joiners'
 # poll clocks). Clean, every seed must pass; with its twin, at least one seed must break the twin's invariant. Random
@@ -58,6 +68,9 @@ def quarter(t):
 
 
 FIXTURES = {
+    # the host shops for 7 s: the checks in the middle of it differ from the joiners' (its purchase is its alone until the deal)
+    "host_shop_checks": ("no_shop_skip", 3, 15000, lambda: [
+        {"t": quarter(1000), "op": "activate", "m": 0, "a": 0, "b": 6}]),
     # the owner's night: every joiner apart from the same frame; the second joiner's report reaches the host after it
     # asked for the correction the first one's started
     "two_joiners_same_drift": ("no_drop_before_fix", 3, 9000, lambda: [
@@ -76,34 +89,87 @@ FIXTURES = {
         {"t": quarter(1000), "op": "spawn", "m": 2, "a": 1},
         {"t": quarter(13000), "op": "activate", "m": 0, "a": 0, "b": 4}]),
     # a joiner talks to a story NPC (everyone waits) and leaves in the middle of it
-    "talker_leaves": ("no_abandoned_talk", 3, 12000, lambda: [
+    "talker_leaves": ("no_abandoned_talk", 3, 30000, lambda: [
         {"t": quarter(500), "op": "hit", "m": 1, "a": 0, "b": 12},
         {"t": quarter(2500), "op": "leave", "m": 1}]),
     # the host opens the save screen: every copy holds at one frame and writes the same save
     "save_in_step": ("save_alone", 3, 12000, lambda: [
         {"t": quarter(800), "op": "save", "m": 0, "a": 1, "b": 3}]),
     # a joiner opens the save screen and leaves in the middle of it: the host ends the save for everyone, nothing saved
-    "saver_leaves": ("no_abandoned_save", 3, 12000, lambda: [
+    "saver_leaves": ("no_abandoned_save", 3, 30000, lambda: [
         {"t": quarter(500), "op": "save", "m": 1, "a": 1, "b": 9},
         {"t": quarter(2500), "op": "leave", "m": 1}]),
     # a slow link, the host quick-saves: its done can reach a copy before that copy's hold frame
     "save_done_early": ("no_early_save_done", 3, 45000, lambda: [
         {"t": quarter(800), "op": "save", "m": 0, "a": 0, "b": 0}], {"maxLatencyMs": 2500}),
-    # a joiner talks to a story NPC and leaves a moment later: the talk reaches its frame after the talker is gone
-    "talk_then_leave": ("no_cancel_mark", 3, 20000, lambda: [
-        {"t": quarter(800), "op": "hit", "m": 1, "a": 0, "b": 5},
-        {"t": quarter(quarter(800) + 100), "op": "leave", "m": 1}]),
-    # a joiner asks to save and leaves before the hold acts (a slow link: the host has the ask, the frame is later)
-    "saver_leaves_before_hold": ("no_gone_saver_at_hold", 3, 15000, lambda: [
-        {"t": quarter(500), "op": "save", "m": 1, "a": 1, "b": 3},
-        {"t": quarter(quarter(500) + 130), "op": "leave", "m": 1}], {"minLatencyMs": 100, "maxLatencyMs": 100}),
+    # a joiner talks to a story NPC and leaves a moment later: the talk reaches its frame after the talker is gone. The host
+    # notices a leave 15 s late, so its frame has to wait that long: another joiner's 15 s conversation holds the host
+    "talk_then_leave": ("no_cancel_mark", 3, 60000, lambda: [
+        {"t": quarter(300), "op": "hit", "m": 2, "a": 0, "b": 14},
+        {"t": quarter(quarter(300) + 200), "op": "hit", "m": 1, "a": 2, "b": 5},
+        {"t": quarter(quarter(300) + 400), "op": "leave", "m": 1}], {"minLatencyMs": 100, "maxLatencyMs": 100}),
+    # a joiner asks to save and leaves before the hold acts: the host is held by another joiner's 15 s conversation, so the
+    # hold's frame comes after the host has noticed the leave (15 s)
+    "saver_leaves_before_hold": ("no_gone_saver_at_hold", 3, 45000, lambda: [
+        {"t": quarter(300), "op": "hit", "m": 2, "a": 0, "b": 14},
+        {"t": quarter(quarter(300) + 200), "op": "save", "m": 1, "a": 1, "b": 3},
+        {"t": quarter(quarter(300) + 400), "op": "leave", "m": 1}], {"minLatencyMs": 100, "maxLatencyMs": 100}),
     # a joiner opens a shop for 10 s and leaves in the middle of it
-    "shopper_leaves": ("no_abandoned_close", 3, 9000, lambda: [
+    "shopper_leaves": ("no_abandoned_close", 3, 25000, lambda: [
         {"t": quarter(500), "op": "activate", "m": 1, "a": 0, "b": 9},
         {"t": quarter(2500), "op": "leave", "m": 1}]),
+    # two joiners open one character's level screen at the same moment: one gets it, the other's screen closes
+    "level_race": ("no_level_race", 3, 15000, lambda: [
+        {"t": quarter(800), "op": "drop", "m": 1, "a": 0, "b": 1, "c": 5},
+        {"t": quarter(800), "op": "drop", "m": 2, "a": 0, "b": 1, "c": 5}]),
+    # a joiner levels up for 8 s and the host quick-loads in the middle: a session start clears the character locks
+    "level_then_load": ("no_level_clear", 3, 30000, lambda: [
+        {"t": quarter(500), "op": "drop", "m": 1, "a": 2, "b": 1, "c": 7},
+        {"t": quarter(3000), "op": "load", "m": 0}]),
+    # a joiner recruits (browses) for 8 s: the other copies make the screen's candidates and free them at its close
+    "recruit_visit": ("no_headless_recruit", 3, 20000, lambda: [
+        {"t": quarter(800), "op": "hit", "m": 1, "a": 3, "b": 7}]),
+    # a joiner's world map travel click and choice are refused; the host travels and the joiners follow it
+    "joiner_clicks_map": ("joiner_travels", 3, 25000, lambda: [
+        {"t": quarter(500), "op": "move", "m": 0, "c": 1},
+        {"t": 1500, "op": "move", "m": 0, "c": 2, "a": 900, "b": 900},
+        {"t": 3000, "op": "move", "m": 1, "c": 2, "a": 100, "b": 100},
+        {"t": 3500, "op": "move", "m": 2, "c": 1}]),
+    # a long trip on the world map: the host rolls its encounters, the joiners' hooks refuse theirs
+    "joiner_rolls_encounter": ("joiner_rolls", 3, 25000, lambda: [
+        {"t": quarter(500), "op": "move", "m": 0, "c": 1},
+        {"t": 1500, "op": "move", "m": 0, "c": 2, "a": 1000, "b": 0}]),
+    # a joiner levels up and leaves: the host closes its character screen for everyone when it notices (15 s)
+    "leveller_leaves": ("no_abandoned_level", 3, 35000, lambda: [
+        {"t": quarter(500), "op": "drop", "m": 1, "a": 0, "b": 1, "c": 9},
+        {"t": quarter(2500), "op": "leave", "m": 1},
+        {"t": quarter(26000), "op": "hit", "m": 0, "a": 3, "b": 5}]),
+    # a joiner recruits (browse, 8 s) and the host quick-loads in the middle: the load closes the screens made for it (else the next visit's done frees them in the new world)
+    "reload_during_recruit": ("no_recruit_drop_on_load", 3, 20000, lambda: [
+        {"t": quarter(500), "op": "hit", "m": 1, "a": 3, "b": 7},
+        {"t": quarter(3500), "op": "load", "m": 0},
+        {"t": quarter(9000), "op": "hit", "m": 0, "a": 3, "b": 1}]),
+    # a joiner's talk to a trader is passed by the host, then the joiner leaves; the host recruits for 15 s, and the gone
+    # talker's done comes (at the notice) in the middle of the visit: it must not close the visit's screen
+    "done_during_recruit": ("any_done_closes_recruit", 3, 25000, lambda: [
+        {"t": quarter(100), "op": "hit", "m": 1, "a": 1, "b": 1},
+        {"t": quarter(quarter(100) + 100), "op": "leave", "m": 1},
+        {"t": quarter(300), "op": "hit", "m": 0, "a": 3, "b": 14}]),
+    # a joiner opens a shop (or a conversation) and leaves, then comes back within the 15 s: the host takes it as a leave
+    "shopper_rejoins": ("no_rejoin_as_leave", 3, 20000, lambda: [
+        {"t": quarter(500), "op": "activate", "m": 1, "a": 0, "b": 9},
+        {"t": quarter(2500), "op": "leave", "m": 1},
+        {"t": quarter(5000), "op": "join", "m": 1, "a": 1}]),
+    # a joiner leaves, comes back inside the delay, plays, then talks to a story NPC: its conversation opens and ends normally
+    "rejoin_then_talk": ("no_forget_gone", 3, 30000, lambda: [
+        {"t": quarter(500), "op": "leave", "m": 1},
+        {"t": quarter(2500), "op": "join", "m": 1, "a": 1},
+        {"t": quarter(14000), "op": "hit", "m": 1, "a": 0, "b": 3}]),
+    "talker_rejoins": ("no_rejoin_as_leave", 3, 20000, lambda: [
+        {"t": quarter(500), "op": "hit", "m": 1, "a": 0, "b": 12},
+        {"t": quarter(2500), "op": "leave", "m": 1},
+        {"t": quarter(5000), "op": "join", "m": 1, "a": 1}]),
 }
-
-
 def run_fixtures(exe, only=None):
     """Returns (failed, the twins some fixture caught)."""
     failed = False

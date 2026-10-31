@@ -99,6 +99,7 @@ void InstallRecruitHooks() {
 // (who joined, who left, where they stand), and every copy runs the screen's destructor before applying it.
 bool g_recruit_mine_sent = false;   // this copy's screen is up and its record went out
 uint8_t* g_headless_recruit = nullptr;  // another player's screen, made here without a window
+uint16_t g_headless_recruit_npc = 0;    // the recruiter whose visit it belongs to (the record's NPC, r+5: the sender's g_private_npc)
 
 void RetakeSnapshotKeepVars() {
     static uint32_t var_h[2][kMaxVars];
@@ -121,7 +122,7 @@ void SendRecruitOpen() {
 }
 
 // Another player's recruit screen: the same constructor, the same arguments as SetMode passes, never shown.
-void HandleRecruitOpen(const uint8_t* /*r*/) {
+void HandleRecruitOpen(const uint8_t* r) {
     if (g_recruit_mine_sent) {
         Log("co-op: our recruit screen's record went round");
         return;
@@ -161,6 +162,7 @@ void HandleRecruitOpen(const uint8_t* /*r*/) {
         Log("co-op: the recruit screen made here is not in the mission screen's children (parent %p, found %d)", link(w, 0x14), found);
     }
     g_headless_recruit = static_cast<uint8_t*>(obj);
+    memcpy(&g_headless_recruit_npc, r + 5, 2);  // only this recruiter's done closes it (fuzzer: any other conversation's done did)
     g_recruit_synced = true;
     if (g_test.enabled) LogTableChange(world, "another player's recruit screen, made here");
     Log("co-op: another player's recruit screen made here without a window at frame %d", *reinterpret_cast<int*>(world + kWorldFrame));
@@ -171,11 +173,17 @@ void CloseHeadlessRecruit() {
     if (g_headless_recruit) {
         uint8_t* obj = g_headless_recruit;
         g_headless_recruit = nullptr;
+        g_headless_recruit_npc = 0;
         reinterpret_cast<void*(__thiscall*)(void*, unsigned)>((*reinterpret_cast<void***>(obj))[0])(obj, 1);
         Log("co-op: the other player's recruit screen closed here too");
     }
     g_recruit_mine_sent = false;
     g_recruit_synced = false;
+}
+
+void CloseHeadlessRecruitFor(uint16_t npc) {
+    // With no screen up this still resets the visit's flags, as every done did before.
+    if (!g_headless_recruit || npc == g_headless_recruit_npc) CloseHeadlessRecruit();
 }
 
 // ---- Level-ups (QuestBarter.sav): the Level effect button opens mission-screen mode 3, the character screen
@@ -208,7 +216,7 @@ int __fastcall PickPerkModalHook(uint8_t* self, void* edx) {
 // every copy sees the records in the host's relay order, so the first open for a character wins everywhere. A copy
 // whose own open comes back second closes its screen (its changes never reach the character: the screen keeps its own
 // copy until Done) and says so. A close carries its claim too, so a loser's close leaves the winner's lock alone.
-struct LevelLock { bool open; uint16_t who; uint32_t claim; };
+struct LevelLock { bool open; uint16_t who; uint32_t claim; uint32_t owner; };  // owner: the leveller's joiner id, 0 the host
 LevelLock g_level_locks[4] = {};  // other players' open character screens
 bool g_level_mine_sent = false;
 bool g_level_mine_won = false;  // our open came back first for its character
@@ -255,11 +263,12 @@ uint16_t CharacterOfScreen(uint8_t* w) {
     return first;
 }
 
-void SendLevelRecord(uint8_t kind, uint16_t who, uint32_t claim) {
+void SendLevelRecord(uint8_t kind, uint16_t who, uint32_t claim, uint32_t owner) {
     uint8_t r[27];
     CoopRecord(r, kind, 0);
     memcpy(r + 5, &who, 2);
     memcpy(r + 7, &claim, 4);
+    memcpy(r + 11, &owner, 4);  // whose screen: the host closes it if this player goes (CloseAbandonedLevel)
     SendCoopRecords(reinterpret_cast<const uint8_t(*)[27]>(r), 1);
 }
 
@@ -277,13 +286,15 @@ void LevelScreenOpened(uint8_t* w) {
     g_level_my_who = who;
     g_level_mine_sent = true;
     g_level_mine_won = false;
-    SendLevelRecord(kLevelOpen, who, g_level_my_claim);
+    extern unsigned g_joiner_id;
+    SendLevelRecord(kLevelOpen, who, g_level_my_claim, g_coop_join ? g_joiner_id : 0);
     Log("co-op: character screen of %u open here (claim %08x): the others wait for it", who, g_level_my_claim);
 }
 void LevelScreenClosed() {
     if (!g_level_mine_sent) return;
     g_level_mine_sent = false;
-    SendLevelRecord(kLevelClose, g_level_my_who, g_level_my_claim);
+    extern unsigned g_joiner_id;
+    SendLevelRecord(kLevelClose, g_level_my_who, g_level_my_claim, g_coop_join ? g_joiner_id : 0);
 }
 
 void HandleLevelRecord(const uint8_t* r) {
@@ -291,6 +302,8 @@ void HandleLevelRecord(const uint8_t* r) {
     uint32_t claim;
     memcpy(&who, r + 5, 2);
     memcpy(&claim, r + 7, 4);
+    uint32_t owner;
+    memcpy(&owner, r + 11, 4);
     bool mine = g_level_mine_sent && claim == g_level_my_claim;
     if (r[3] == kLevelOpen && mine) {
         if (LevelLockOf(who)) {  // another player's open for this character came first: theirs
@@ -307,7 +320,7 @@ void HandleLevelRecord(const uint8_t* r) {
         if (!ours_first)
             for (LevelLock& l : g_level_locks)
                 if (!l.open) {
-                    l = {true, who, claim};
+                    l = {true, who, claim, owner};
                     Log("co-op: another player's character screen of %u is open (claim %08x)", who, claim);
                     break;
                 }
@@ -318,6 +331,22 @@ void HandleLevelRecord(const uint8_t* r) {
                 Log("co-op: the other player's character screen of %u closed", who);
             }
     }
+}
+
+// Host, a joiner is gone (NoticeLeftJoiners): the character screens it had open are closed on its behalf, with the close
+// it would have sent, so every copy clears the lock as from a normal close. Nothing else did: a leveller who left kept
+// its lock on every copy until the next session start, and every recruiter talk was refused meanwhile (the fuzzer's
+// leveller_leaves).
+void CloseAbandonedLevel(unsigned joiner, const char* who) {
+    if (!g_coop_host || !joiner) return;
+    for (LevelLock& l : g_level_locks)
+        if (l.open && l.owner == joiner) {
+            uint16_t slot = l.who;
+            uint32_t claim = l.claim;
+            SendLevelRecord(kLevelClose, slot, claim, joiner);
+            Log("co-op: %s left with the character screen of %u open: it closes for everyone", who, slot);
+            Notice("Co-op: %s left while levelling up - their character is free again", who);
+        }
 }
 
 // Another player's character screen of this character is open: ours closes (netlog.cpp, as it opens).

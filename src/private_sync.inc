@@ -45,6 +45,7 @@ void HandleLevelRecord(const uint8_t* r);  // recruit_sync.inc  // 5, 6: shop_sy
 bool g_recruit_synced = false;  // a recruit screen is up and every copy made its candidates (recruit_sync.inc)
 void HandleRecruitOpen(const uint8_t* r);  // recruit_sync.inc
 void CloseHeadlessRecruit();
+void CloseHeadlessRecruitFor(uint16_t npc);  // a done: closes the screen only if it is that recruiter's
 uint16_t g_shop_new[16];  // test mode: a shop deal's new stacks, followed through the close (shop_sync.inc)
 int g_shop_new_n = 0;
 bool g_applying_at_frame = false;  // ApplyDelta from a delta at its frame: no second write of the bookkeeping
@@ -1758,7 +1759,9 @@ void HandleCoopCommand(const uint8_t* r) {
         HandleLevelRecord(r);
         return;
     }
-    if (kind == kSyncDone) CloseHeadlessRecruit();  // the recruiter's screen closed before its diff: ours too, first
+    // The recruiter's screen closed before its diff: ours too, first. Only that recruiter's done: another conversation's
+    // (a gone talker's, a trader's) closed a visit's screen early, and the entity tables went apart (the fuzzer).
+    if (kind == kSyncDone) CloseHeadlessRecruitFor(npc);
     if (kind == kSyncChunk) {
         if (n <= kChunk && g_rx_len + n <= kMaxDelta) {
             memcpy(g_rx_delta + g_rx_len, r + 5, n);
@@ -2095,6 +2098,11 @@ void CloseTalkOfGone(uint16_t npc) {
                 return;
             }
     }
+}
+
+void ForgetGoneJoiner(unsigned joiner) {  // host: it is playing again (it came back with the same id)
+    for (unsigned& g : g_gone_joiners)
+        if (g == joiner) g = 0;
 }
 
 void CloseAbandonedTalks(unsigned joiner, const char* who) {  // host, main thread: that joiner is gone
