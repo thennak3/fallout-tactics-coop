@@ -881,6 +881,13 @@ int ConversationOpened(uint8_t* w);  // private_sync.inc
 void PrivateScreenTick(uint8_t* w) {  // window-tick hook
     if (!g_coop_host && !g_coop_join) return;
     HostHoldTimeout();
+    // A joiner that left while everyone holds (its conversation, its save): no frames run, and the frame hook's check
+    // never saw it go, so nothing ended the hold (the game run: talk_join --leave-in-shop). From the window ticks too.
+    static DWORD next_left_check = 0;
+    if (g_coop_host && GetTickCount() >= next_left_check) {
+        next_left_check = GetTickCount() + 250;
+        NoticeLeftJoiners();
+    }
     if (g_end_game_mode && *reinterpret_cast<uintptr_t*>(w) == kGameMainVtable) {
         g_end_game_mode = false;
         Log("co-op: ending mission-screen mode %d", *reinterpret_cast<int*>(w + 0x156));

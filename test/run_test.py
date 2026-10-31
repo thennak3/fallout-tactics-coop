@@ -286,8 +286,9 @@ def main():
         if LEAVE_IN_SHOP and any(name.startswith(p) for p in (
                 "both copies exited cleanly", "the trader's", "the shopper's own pauses", "the other copy set the same quest",
                 "barter closed", "the delta went through", "the other copy applied the delta", "the other copy created",
-                "at least 4 shared frames after the delta", "joiner 2: applied the delta")):
-            name, ok, detail = name + " (not checked: --leave-in-shop kills the trader before its deal)", True, ""
+                "at least 4 shared frames after the delta", "joiner 2: applied the delta",
+                "conversation ended, the talker brought", "after the conversation both copies carry")):
+            name, ok, detail = name + " (not checked: --leave-in-shop kills the trader or talker before it is done)", True, ""
         if GAMBLE and name.startswith("the shopper's own pauses were swallowed and balanced"):
             # Gamble switches from the conversation straight to the gamble screen (0x4d0090: SetMode 7): the game pauses
             # twice and resumes once. Swallowed, the world's own counter never moved (the checks after the close ran).
