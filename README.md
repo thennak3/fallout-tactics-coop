@@ -105,6 +105,8 @@ Checked by the automated tests in `test/`:
   earlier everyone waited up to 10 minutes).
 - The quartermaster's stock is part of the check that the games are in step: if one game's differs, the host sends
   its stock again, without stopping anyone. Every player needs 0.10.9 or later to play together.
+- Each player keeps their selected squad members across a save-and-reload and a move to the next map (in 0.11.0
+  and earlier everyone went back to the game's default selection). `[coop] keep_selection=0` turns it off.
 - A player who leaves with a level-up screen open, during another player's recruit visit, or who leaves and comes
   back within 15 seconds: no lock or hidden screen stays behind (in 0.10.9 and earlier the character stayed locked,
   recruiters refused everyone, and a reload during a recruit visit could crash).
