@@ -1,36 +1,59 @@
 # Fallout Tactics co-op
 
-Play the Fallout Tactics: Brotherhood of Steel single-player campaign with friends. 2 to 4 players
-share one squad: everyone can order every squad member, and the host's campaign is the one being played.
+Play the Fallout Tactics: Brotherhood of Steel single-player campaign with friends. 2 to 4 players share one squad:
+everyone can order every squad member, and the host's campaign is the one being played.
 
-**Status: beta.** The campaign is playable in co-op; expect bugs. Every feature is covered by automated tests with
-several copies of the game on one PC, and it has been played on two PCs on one home network. See
-[What works](#what-works) and [Known issues](#known-issues).
+**Status: beta.** The campaign is playable in co-op and has been played by 3 players on one home network; expect
+bugs. Every feature below is covered by automated tests. See [Known issues](#known-issues), and the
+[Releases page](https://github.com/thennak3/fallout-tactics-coop/releases) for what changed in each version.
+
+## Co-op features
+
+**Playing together**
+- **Start Co-op** in the Multiplayer menu: the host loads a save or starts a new campaign; friends pick
+  **[Co-op] <host name>** from the session list and join.
+- **Join at any time:** friends can join a game already in progress, and leave again.
+- **One shared squad:** every player can order every squad member, in real time and in turn-based combat (on the
+  squad's turn everyone can act, and anyone can end the turn).
+- **Selection dots:** coloured dots above each name tab show who has which character selected, and each player's
+  selection is kept across reloads and map changes.
+- **Pings:** right-click the world map or middle-click in a mission to drop a flag in your colour that everyone sees.
+  A mission flag stays on its spot of the ground as you scroll.
+- **On-screen notices** when something needs another player: who's trading, who got to a character first, who left.
+
+**The campaign, shared**
+- **Shops, traders and gambling pause nobody:** the others keep playing while one player trades, and what was bought,
+  sold or won reaches everyone.
+- **Conversations, quests, recruiting and level-ups** carry over to every player's game.
+- **The world map:** the host moves the party and picks where to go; everyone travels along, sees the same uncovered
+  ground, and follows into random encounters and the next mission.
+- **Saving** (quick-save or the game menu's Save) is written on every player's game in step; the game menu itself
+  pauses nobody.
+- **The host's settings** (difficulty, turn-based mode, combat speed, friendly fire, violence) count for everyone.
+
+**Staying in step**
+- The games run in lockstep, and the host checks every second that they still match. Small differences are put
+  right on the fly; only a real split ends in a short save-and-reload for everyone.
+- A player who leaves or loses their connection in the middle of a shop, conversation, save or level-up doesn't leave
+  the others stuck: the game goes on once the host notices.
 
 ## 1. Check your game version
 
 Every player needs their own copy of **Fallout Tactics from GOG**: https://www.gog.com/en/game/fallout_tactics
 
-The mod changes the game in memory at fixed places, so it only works with the exact game build it was made for:
-**GOG, version 1.27**. That is the version GOG sells, already patched. Other copies (the Steam version, an old CD
-with or without patches) are untested; if their `BOS.exe` differs, the mod won't work with them.
+The mod changes the game in memory at fixed places, so it only works with the exact build it was made for: **GOG,
+version 1.27** (the version GOG sells, already patched). Other copies (Steam, an old CD with or without patches) are
+untested and almost certainly won't work.
 
-To check, open PowerShell in your game folder (Shift + right-click in the folder, "Open PowerShell window here") and run:
-
-```
-Get-FileHash BOS.exe
-```
-
-The hash must be exactly:
+To check, open PowerShell in your game folder (Shift + right-click in the folder, "Open PowerShell window here") and
+run `Get-FileHash BOS.exe`. The hash must be exactly:
 
 ```
 C5B91FE56EF8DE118CE22CCD5E6512F217CA16C8B8758EA14C626229EB5A4E40
 ```
 
-If it's different, the mod won't work with your copy. Please open an issue with the hash and where you bought the game.
-
-Nothing else in the game folder needs changing: the mod was tested on a plain GOG install with only FTSE and the mod
-added. It doesn't modify `BOS.exe` or any game file on disk.
+If it's different, please open an issue with the hash and where you bought the game. The mod doesn't change
+`BOS.exe` or any game file on disk.
 
 ## 2. Install FTSE
 
@@ -43,13 +66,13 @@ The mod is loaded by [FTSE](https://github.com/melindil/FTSE) (Fallout Tactics S
 
 ## 3. Install the mod
 
-1. Download `fallout-tactics-coop-<version>.zip` from the
+1. Download the latest `fallout-tactics-coop-<version>.zip` from the
    [Releases page](https://github.com/thennak3/fallout-tactics-coop/releases).
-2. Extract it into your game folder, next to `BOS.exe`. It adds two files:
-   - `netlog.dll` (the mod)
-   - `core\FTSE\ftse.lua` (loads the mod, and makes FTSE's burst rolls the same on every copy). If you already have
-     an `ftse.lua` from another FTSE mod, copy the whole of ours into yours instead of replacing it: without the
-     `OnBurstAttack` part, NPC bursts land differently on each copy and the game drifts apart.
+2. Extract it into your game folder, next to `BOS.exe`. It adds `netlog.dll` (the mod) and `core\FTSE\ftse.lua`
+   (loads the mod and makes FTSE's burst rolls the same on every player's game). If you already have an `ftse.lua`
+   from another FTSE mod, copy the whole of ours into yours instead of replacing it.
+
+**Every player must run the same version.** Different versions won't play together.
 
 To uninstall, delete those two files. To remove FTSE as well, delete `realBinkw32.dll` and `core\FTSE`, and put back
 your original `binkw32.dll`.
@@ -57,146 +80,68 @@ your original `binkw32.dll`.
 ## 4. Play
 
 - **Host:** Multiplayer, then **Start Co-op**, then load a save or start a new campaign. You play straight away.
-- **Friends:** Multiplayer, select **[Co-op] <host name>** in the session list, then **Join**. A message shows
-  while you wait. Your game then copies the host's save and loads it.
-- Friends can join a game already in progress. The host's game saves and reloads once to bring them in (about 9
-  seconds; the joining player loads the save while the host's game reloads).
-- Everyone controls the whole squad. Agree among yourselves who moves whom. Coloured dots above each name tab
-  show which players have that character selected: the host is red, then blue, yellow and green in the order
-  players joined.
-- On the world map, only the host moves the party and chooses where to go; everyone else watches it travel.
-  Right-click the map to ping a spot in your colour and show where you'd like to go.
-- In a mission, middle-click to ping a spot in your colour: everyone sees a flag there for 8 seconds.
+- **Friends:** Multiplayer, select **[Co-op] <host name>** in the session list, then **Join**. Your game copies the
+  host's save and loads it.
+- Friends can join a game already in progress: the host's game saves and reloads once to bring them in (about 9
+  seconds).
+- Everyone controls the whole squad; agree among yourselves who moves whom. Coloured dots above each name tab show
+  which players have that character selected (the host is red, then blue, yellow and green in the order players
+  joined). Your selection is kept across reloads and map changes.
+- On the world map only the host moves the party and chooses where to go. Right-click the map to ping a spot in your
+  colour; in a mission, middle-click. Everyone sees the flag for 8 seconds.
 
 ### Networking
 
-All players must be able to reach the host's PC. On the same home network this just works. For friends elsewhere,
-the simplest way is a virtual LAN such as Tailscale or ZeroTier, then join as if on one network. The mod uses port **47701** (TCP for the save copy, UDP to find the host) on top of the
-game's own multiplayer ports. Windows Firewall may ask to allow the game the first time: allow it.
+All players must be able to reach the host's PC. On a home network this just works. For friends elsewhere, the
+simplest way is a virtual LAN such as Tailscale or ZeroTier. The mod uses port **47701** (TCP for the save copy, UDP
+to find the host) on top of the game's own multiplayer ports. Windows Firewall may ask to allow the game the first
+time: allow it.
 
-## What works
+### Options
 
-Checked by the automated tests in `test/`:
+Optional settings go in a file `ftcoop.ini` next to `BOS.exe`, under a `[coop]` line:
 
-- Moving and fighting with the shared squad, with every copy in step, for 2 to 4 players.
-- Joining from the Multiplayer menu, and joining a game already in progress.
-- Saving and reloading mid-mission (the others follow), and mission → world map → next mission.
-- In the bunker, without any reload: buying and selling (new items included) and quest variables a conversation
-  changes. Tested with 2, 3 and 4 players.
-- Shopping pauses nobody: the other players keep playing while one shops. While a shop is open, the shopper's
-  character can't be ordered by the others, and the recruiter waits until the shop closes. Item moves by the others
-  meanwhile (giving, equipping, taking, dropping) take effect when the shop closes, so the games stay the same.
-- A re-sync while a player is shopping: afterwards everyone can talk to the merchant and order that character again,
-  with no extra reloads. (In 0.10.3 and earlier the merchant and the shopper's character stayed refused, "a player
-  is trading", in every later session, even after going back to the menu.)
-- A co-op host playing alone, before anyone joins: after a conversation or a shop the squad moves again (in 0.10.4
-  and earlier, the host's game stayed paused after it closed and nothing could move).
-- Shops without drifts afterwards, with 2 and 3 players, also when a shop stays open a long time and others move
-  items meanwhile: the drift check waits for the shop, and every copy has the host's quartermaster stock from the
-  start of every session (in 0.10.5 and earlier, a joiner could have none, and nearly every shop ended in a
-  save-and-reload). A save-and-reload asked for during a shop waits until it closes.
-- No drift after loads between copies that have been running for a long time, and one correction (no reload) when
-  several joiners report the same drift at once (in 0.10.5 and earlier, everyone could wait 10 s and then reload).
-- A player who leaves (or loses their connection) in the middle of trading: the shop closes for everyone else, without
-  their purchases, and the merchant and item moves are free again (in 0.10.7 and earlier the shop stayed open on the
-  other games until the next reload).
-- A player who leaves (or loses their connection) in the middle of a conversation everyone waits for, or while
-  saving: the game goes on for everyone once the host notices they are gone, about 15 seconds later (in 0.10.8 and
-  earlier everyone waited up to 10 minutes).
-- The quartermaster's stock is part of the check that the games are in step: if one game's differs, the host sends
-  its stock again, without stopping anyone. Every player needs 0.10.9 or later to play together.
-- Each player keeps their selected squad members across a save-and-reload and a move to the next map (in 0.11.0
-  and earlier everyone went back to the game's default selection). `[coop] keep_selection=0` turns it off.
-- A player who leaves with a level-up screen open, during another player's recruit visit, or who leaves and comes
-  back within 15 seconds: no lock or hidden screen stays behind (in 0.10.9 and earlier the character stayed locked,
-  recruiters refused everyone, and a reload during a recruit visit could crash).
-- Every trader pauses nobody, as the quartermaster: those who barter, and those who gamble too (the mechanic). A
-  gamble's result reaches everyone as a trade's does (tested with the mechanic, the host and a joiner gambling).
-- The selection dots, with 2 and 4 players.
-- Recruiting and dismissing squad members, without a reload (the game pauses for everyone while the recruit screen
-  is up, since it changes the squad everyone plays).
-- One player at a time per merchant or recruiter: if several click the same one at once, exactly one gets it and the
-  others are told someone got there first.
-- The world map: only the host moves the party and picks where to go. The others see the host's party travel on
-  their own map.
-- Pings: right-click the world map (a joiner can also left-click), or middle-click in a mission, to mark a spot with
-  a flag in your colour. Everyone sees it for 8 seconds, fading out over the last 3. A mission flag stays on its spot
-  of the ground as anyone scrolls, and comes into sight when a view scrolls onto it (tested by scrolling a little, far
-  off and back). In 0.10.3 and earlier a mission flag stayed put on the screen while the ground moved under it. (A
-  real right click never pinged in 0.10.1 and earlier.)
-- Fog of war on the world map: everyone uncovers the same ground (joiners start from the host's save and follow
-  the host's party).
-- Turn-based combat, Individual and Squad, with 2 to 4 players, including combat that starts by itself. On the squad's turn every player can order the squad
-  (in Individual mode, the character whose turn it is), and any player can press End Turn or switch turn-based off.
-- The host's game settings count for everyone: difficulty, turn-based mode, CTB speed, friendly fire, violence and
-  fast turn-based come from the host's options. Changing them on another player's PC has no effect while you play
-  together. (In 0.10.1 and earlier, a joiner's own turn-based option counted for the first frames of a session,
-  which could split the games from the start.)
-- Random encounters on the world map: the host's game rolls and enters them, and the others follow into the
-  encounter.
-- Long fights with every player acting at once (moving, swapping characters, giving items, opening containers): the
-  games stay identical, with no corrections or reloads, for 2 and 3 players.
-- Joining by the host's network address (tested on one PC through its LAN address).
-- Equipping and swapping weapons and armour between squad members. If hands or armour ever differ between the
-  games, the host's drift check puts them right without a reload.
-- Leaving a co-op session to the main menu (it crashed in 0.9.2 and earlier).
-- Saving during a co-op mission, by quick-save or from the game menu's Save. Every player's game holds for a
-  moment while the save is written, and writes the same save in step, so nobody drifts afterwards (in 0.10.2 and
-  earlier a save was usually followed by a drift and a save-and-reload). A save screen opened another way, such as
-  by a keyboard shortcut, still saves alone; any drift after it is corrected as before.
-- The game menu (Escape) no longer pauses anyone's game in co-op: the game carries on behind it for everyone, as it
-  does in a shop. The save screen itself still stops everyone while it is open, as before.
+- `keep_selection=0`: don't restore each player's selection after a reload or map change.
+- `shop_no_pause=0`: the old way, a shop pauses every player while it is open (set it on every player's PC).
 
 ## Known issues
 
-- While one player talks to anyone other than a merchant, or uses the recruiter, the other players' games pause until
-  the conversation closes. Shops don't pause anyone (for the old behaviour, put the lines `[coop]` and
-  `shop_no_pause=0` in a file `ftcoop.ini` next to `BOS.exe`, on every player's PC).
-- A character who joins the squad through a story conversation (not the recruiter) still means a save and reload
-  for everyone.
-- Played on two PCs on one home network; not tested over the internet yet.
+- While one player talks to a story character or uses the recruiter, the other players' games pause until that
+  conversation closes. Shops and traders don't pause anyone.
+- A character who joins the squad through a story conversation (not the recruiter), or hiring at the recruiter,
+  means a save-and-reload for everyone.
+- Joining a game in progress takes about 9 seconds, most of it the game's own network set-up.
+- When a player leaves, the host notices only after about 15 seconds; until then anything that player had open
+  (a shop, a conversation everyone waits for) stays open.
+- A save screen opened by a keyboard shortcut saves on that player's game alone; any difference it causes is put
+  right afterwards.
+- Tested on one home network; not yet over the internet.
 
 ## Build from source
 
-Needs the Visual Studio 2022 Build Tools (x86 C++). Run `src\build.bat`; it writes `src\netlog.dll`.
+Needs the Visual Studio 2022 Build Tools (x86 C++). Run `src\build.bat`; it writes `src\netlog.dll`. The source is in
+`src/`; `netlog.cpp` lists which file holds what.
 
 ## Tests
 
-The tests start 2 to 4 copies of the game on one PC, with an in-game bot driving each one, and compare every copy's
-state frame by frame. They need your own test copies of the game (never your real install), each with FTSE and the
-mod, in `test-install`, `test-install-2`, ... under one folder. Set `FTCOOP_TEST_ROOT` to that folder. The test
-copies also use [cnc-ddraw](https://github.com/FunkyFr3sh/cnc-ddraw) so several windows fit on one screen; it isn't
-needed to play.
-
-```
-python -I test/run_test.py trade_host                  # one test
-python -I test/run_test.py trade_host --inv-chaos      # with the other player moving items meanwhile
-python -I test/run_test.py trade_host --empty-stock --hold-frames 10   # a joiner without the stock, a 10 s shop
-python -I test/run_test.py chaos --save user/save/containers.sav --hold-frames 2000
-python -I test/run_suite.py                            # every test (slow)
-```
-
-`python -I test/fuzz/run_fuzz.py` fuzzes the sync decisions on a fake world (the hub's fuzzer, coop-anything
-`tools/fuzz`): random 2 to 4 player sessions with desyncs forced on purpose, plus fixed fixtures, and every bug fixed
-so far switched back on to show it is caught. No game needed; 2000 sessions take a few minutes.
-
-`test\sim\run_sim.bat` runs the drift check's decisions (`src/drift_judge.h`) against simulated copies, without the
-game, in under a second.
-
-The tests load saves from the host copy's `core/user/save`: `New Save Game.sav` and `QuickSave.sav` (two different
-mission saves), `bunker.sav` (made in the bunker, with the merchant and the recruiter nearby) for the bunker tests,
-`QuestBarter.sav` (in the bunker, squad member 1 next to General Barnaky, member 2 next to the quartermaster, a
-level-up pending) for the quest, level-up and shop-and-talk tests, and `containers.sav` (containers to loot nearby)
-for the loot and chaos tests. The list of tests and their options is in `test/run_test.py`.
+- **Game tests** (`test/run_test.py`): start 2 to 4 copies of the game on one PC, with an in-game bot driving each,
+  and compare every copy's state. They need your own test copies of the game (never your real install), each with
+  FTSE and the mod, in `test-install`, `test-install-2`, ... under one folder (`FTCOOP_TEST_ROOT`), and use saves
+  in the host copy's `core/user/save` (listed in `test/run_test.py`). The test copies use
+  [cnc-ddraw](https://github.com/FunkyFr3sh/cnc-ddraw) so several windows fit on one screen.
+  `python -I test/run_test.py trade_host` runs one test; `python -I test/run_suite.py` runs them all (slow).
+- **Fuzzer** (`python -I test/fuzz/run_fuzz.py`): plays thousands of random 2 to 4 player sessions on a fake world,
+  without the game, with desyncs and bad timings forced on purpose, and checks that every past bug, switched back
+  on, is caught. It uses the fuzzer from [coop-anything](https://github.com/cranebeaker/coop-anything)
+  (`tools/fuzz`).
+- **Log checker** (`python -I test/netlog_tool.py summary <netlog.txt> ...`): turns one or several players'
+  `netlog.txt` into a timeline and flags known problems.
 
 ## How it works
 
 The game already has a lockstep multiplayer layer: every player's orders go to the host and come back to everyone
 on the same frame. The mod runs the campaign inside a multiplayer session, shares the squad, copies the host's save to
-joiners, and syncs the single-player screens that the multiplayer code never sent. The source is in `src/`
-(`netlog.cpp` lists which file holds what). The full write-up, with the reverse engineering notes, is in the
-[coop-anything](https://github.com/cranebeaker/coop-anything) playbook under `games/fallout-tactics` (in review:
-[pull request #240](https://github.com/cranebeaker/coop-anything/pull/240)).
+joiners, and syncs the single-player screens (shops, conversations, level-ups) that the multiplayer code never sent.
 
 ## License
 
