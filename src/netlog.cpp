@@ -135,6 +135,7 @@ struct TestConfig {
     bool no_serial_sync;  // mutation, host: the entity serial is not sent at session start (0.10.5)
     bool resync_in_shop;  // host, trades: a re-sync asked for 3 s into its own shop (it must wait for the close)
     int merchant;         // trades: the trader's NPC id (0: the quartermaster, 96)
+    bool select_some;     // resync / transition / dropin: session 1 selects only squad members 1 and 2 (--select-some)
     bool gamble;          // trades: Gamble instead of Barter, and the screen's Gamble button instead of Offer
 };
 TestConfig g_test = {};
@@ -1894,6 +1895,7 @@ void Init() {
     g_file_port = GetPrivateProfileIntA("coop", "file_port", 47701, ".\\ftcoop.ini");
     g_fetch_save = GetPrivateProfileIntA("coop", "fetch_save", 1, ".\\ftcoop.ini") != 0;
     g_follow = GetPrivateProfileIntA("coop", "follow", 1, ".\\ftcoop.ini") != 0;
+    g_keep_selection = GetPrivateProfileIntA("coop", "keep_selection", 1, ".\\ftcoop.ini") != 0;
     GetPrivateProfileStringA("coop", "host", "127.0.0.1", g_host_address, sizeof(g_host_address), ".\\ftcoop.ini");
     GetPrivateProfileStringA("coop", "name", "", g_player_name, sizeof(g_player_name), ".\\ftcoop.ini");
     if (!g_player_name[0]) strcpy_s(g_player_name, "Player");
@@ -2026,6 +2028,7 @@ void Init() {
         g_test.resync_in_shop = GetPrivateProfileIntA("test", "resync_in_shop", 0, ".\\ftcoop.ini") != 0;
         g_test.merchant = GetPrivateProfileIntA("test", "merchant", 0, ".\\ftcoop.ini");
         g_test.gamble = GetPrivateProfileIntA("test", "gamble", 0, ".\\ftcoop.ini") != 0;
+        g_test.select_some = GetPrivateProfileIntA("test", "select_some", 0, ".\\ftcoop.ini") != 0;
         Log("bot: TEST MODE save=\"%s\" actor=%s joiners=%d timeout=%ds scenario=%s menu=%s", g_test.save, g_test.actor,
             g_test.joiners, g_test.timeout_s, g_test.scenario, g_test.menu[0] ? g_test.menu : "-");
         CreateThread(nullptr, 0, TestWatchdog, nullptr, 0, nullptr);

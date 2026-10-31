@@ -105,6 +105,7 @@ CHAOS_NO_SELECT = False  # --chaos-no-select: the chaos bots never change their 
 MERCHANT = 0  # --merchant N: trades with this NPC (bunker: 349 the mechanic barters and gambles, 104/274/288 barter)
 GAMBLE = False  # --gamble: trades: Gamble instead of Barter
 NO_SERIAL_SYNC = False  # --no-serial-sync: mutation, the host sends no entity serial at session start (0.10.5)
+SELECT_SOME = False  # --select-some: resync / transition: session 1 selects only squad members 1 and 2 on every copy, session 2 must keep that
 LEAVE_IN_SHOP = False  # --leave-in-shop: trade_join / talk_join: the joiner's game is killed 2 s into its shop or conversation
 RESYNC_IN_SHOP = False  # --resync-in-shop: trades: the host asks for a re-sync 3 s into its own shop
 EMPTY_STOCK = False  # --empty-stock: every joiner's quartermaster stock emptied at each session start
@@ -145,6 +146,8 @@ def write_ini(folder, mode, scenario, actor, timeout, share_squad, soak_frames, 
             f.write("entity_log=1\n")
         if INV_CHAOS:
             f.write("inv_chaos=1\n")
+        if SELECT_SOME:
+            f.write("select_some=1\n")
         if GROW_TABLE:
             f.write("grow_table=1\n")
         if MERCHANT:
@@ -235,6 +238,8 @@ def main():
     ap.add_argument("--merchant", type=int, default=0, help="trades: the trader's NPC id (default the quartermaster, 96)")
     ap.add_argument("--gamble", action="store_true", help="trades: Gamble instead of Barter")
     ap.add_argument("--no-serial-sync", action="store_true", help="mutation: the host sends no entity serial at session start")
+    ap.add_argument("--select-some", action="store_true",
+                    help="resync / transition: every copy selects only squad members 1 and 2 before the reload; session 2 must keep it")
     ap.add_argument("--leave-in-shop", action="store_true", help="trade_join: kill the trading joiner's game 2 s into its shop")
     ap.add_argument("--resync-in-shop", action="store_true", help="trades: the host asks for a re-sync 3 s into its own shop")
     ap.add_argument("--empty-stock", action="store_true", help="joiners' quartermaster stock emptied at each session start")
@@ -254,7 +259,8 @@ def main():
     MERCHANT = args.merchant
     GAMBLE = args.gamble
     RESYNC_IN_SHOP = args.resync_in_shop
-    global LEAVE_IN_SHOP
+    global LEAVE_IN_SHOP, SELECT_SOME
+    SELECT_SOME = args.select_some
     LEAVE_IN_SHOP = args.leave_in_shop
     EMPTY_STOCK = args.empty_stock
     SERIAL_SKEW = args.serial_skew
@@ -1286,6 +1292,27 @@ def main():
         check("session 2: every copy has the host's quartermaster stock, and it is not empty",
               len(hs) >= 2 and " 0 items" not in hs[-1] and all(stock(l)[-1:] == hs[-1:] for l in [join] + list(extra_logs)),
               f"host {hs[-1:]}, joiner {stock(join)[-1:]}")
+    if SELECT_SOME and scenario in ("resync", "transition", "encounter", "worldmap"):
+        # keep_selection: each copy selected squad members 1 and 2 in session 1; after the reload or map change it must
+        # have selected the same two again (a resync reloads the same save: matched by entity id; a map change: by name
+        # or place), and its squad bar (the dots) must list exactly those two for it.
+        for who, log in [("host", host), ("joiner", join)] + [(f"joiner {n}", l) for n, l in enumerate(extra_logs, start=2)]:
+            sel = re.search(r"bot: selection set to ([\d ]+) \(of (\d+)\)", log)
+            ids = ",".join(sel.group(1).split()) if sel else None
+            check(f"{who}: selected only squad members 1 and 2 before the reload", bool(sel), sel.group(0) if sel else "no line")
+            kept = re.search(r"selection kept: 2 of 2 selected again \(squad (\d+) -> (\d+)\):(.*)", log)
+            how = re.findall(r"\((id|name|index) ", kept.group(3)) if kept else []
+            want = ["id"] if scenario == "resync" else ["id", "name", "index"]
+            check(f"{who}: 'selection kept: 2 of 2' ({'id' if scenario == 'resync' else 'id, name or index'}-matched)",
+                  bool(kept) and len(how) == 2 and all(h in want for h in how), kept.group(0) if kept else "no line")
+            after = log.split("selection kept:", 1)[1] if kept else ""
+            dots_re = r"dots: ((?:red|blue|yellow|green) .*)"  # not "none" or the window capture line
+            dots = re.findall(dots_re, after) or re.findall(dots_re, log)[-1:]  # an unchanged table prints nothing
+            entries = re.findall(r"(?:^|\| )(\w+) ([\d,]+)", dots[0]) if dots else []
+            ids = ",".join(re.findall(r"(\d+)\((?:id|name|index) ", kept.group(3))) if kept else ids  # a new map: new ids
+            own = [e for e in entries if e[0] == "red"] if who == "host" else entries
+            check(f"{who}: the squad bar's dots list exactly those two members", bool(ids) and any(e[1] == ids for e in own),
+                  f"want {ids}, dots {dots[:1]}")
     if extra_logs:  # selection dots with 3-4 players: a colour each, and every copy shows every player
         colours = ["red", "blue", "yellow", "green"][:2 + len(extra_logs)]
         given = re.findall(r"host: .*'s colour is (\w+)", host)

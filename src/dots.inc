@@ -168,9 +168,115 @@ void StartSelectionPoller() {
     CloseHandle(CreateThread(nullptr, 0, SelectionPoller, nullptr, 0, nullptr));
 }
 
+// Keep the selection across a re-sync, a drop-in, a save and reload and a map change (owner: the selected units reset
+// each time). The selection is each player's own (flag +0xb2 bit 0x40 on the squad members, read above for the dots), so
+// every copy keeps its own. The last selection of a live session is remembered every frame: that covers every way a
+// session ends (LoadCheckHook loads, the joiner's follow, world map <-> mission, which load nothing), and it stops when
+// the teardown starts (g_world_closing, set by LoadCheckHook) so a half-gone squad never overwrites it. In the first
+// frames of the next session, once its squad exists, the same characters are selected again: the same entity id with
+// the same name (a reload of the same save), else the same name, else the same place in the squad. Setting the bit
+// sends nothing: a selection reaches the others only inside a command's own parameters, and the dots poll reads it.
+// A selection the player made in those first frames is left alone (only a still-default selection is replaced).
+struct KeptMember {
+    uint16_t id;
+    int index;
+    char name[64];
+};
+bool g_keep_selection = true;  // [coop] keep_selection
+KeptMember g_kept[16];
+int g_kept_n = 0;       // the selected members at the last frame of the previous session
+int g_kept_squad = 0;   // how many were in the squad then
+LONG g_kept_session = 0;  // the session the memory above was taken in; 0 = nothing remembered
+bool g_kept_pending = false;
+LONG g_kept_seen = 0;
+DWORD g_kept_armed = 0;  // GetTickCount when the restore was armed (the session's own clock, see below)
+
+void MemberName(uint8_t* e, char* out, int cap) {  // the template name, Entity +0x199 (private_sync.inc)
+    out[0] = 0;
+    __try {
+        const wchar_t* nm = *reinterpret_cast<wchar_t**>(e + 0x199);
+        int len = 0;
+        for (; nm && nm[len] && len < cap - 1; len++) out[len] = nm[len] < 0x80 ? static_cast<char>(nm[len]) : '?';
+        out[len] = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = 0;
+    }
+}
+
+void KeepSelectionFrame(uint8_t* world) {
+    if (!g_keep_selection || !world || !(g_coop_host || g_coop_join)) return;
+    LONG session = g_sessions_started;
+    if (session != g_kept_seen) {  // a new session: restore once its squad exists
+        g_kept_seen = session;
+        g_kept_pending = g_kept_session != 0;
+        g_kept_armed = GetTickCount();
+    }
+    uint16_t squad[16];
+    int n = GetSquad(world, squad, 16);
+    if (n <= 0 || g_world_closing) return;
+    if (g_kept_pending) {
+        g_kept_pending = false;  // once per session
+        // Only in the session's first moments, while nobody can have clicked yet. Timed from the session's own start
+        // (a new mission's world frame does not begin at 0: seen 10354 after a map change), by wall clock.
+        DWORD since = GetTickCount() - g_kept_armed;
+        if (since > 20000) {
+            Log("selection kept: not applied, %lu ms into the session (the player's own selection stays)", since);
+        } else if (g_kept_n > 0) {
+            char names[16][64];
+            for (int k = 0; k < n; k++) MemberName(EntityById(world, squad[k]), names[k], 64);
+            bool want[16] = {};
+            bool used[16] = {};
+            char how[300];
+            int hl = 0;
+            how[0] = 0;
+            for (int m = 0; m < g_kept_n; m++) {
+                int hit = -1;
+                const char* kind = "";
+                for (int k = 0; k < n && hit < 0; k++)
+                    if (!used[k] && squad[k] == g_kept[m].id && strcmp(names[k], g_kept[m].name) == 0) hit = k, kind = "id";
+                for (int k = 0; k < n && hit < 0; k++)
+                    if (!used[k] && g_kept[m].name[0] && strcmp(names[k], g_kept[m].name) == 0) hit = k, kind = "name";
+                if (hit < 0 && g_kept[m].index < n && !used[g_kept[m].index]) hit = g_kept[m].index, kind = "index";
+                if (hit < 0) continue;
+                used[hit] = want[hit] = true;
+                hl += sprintf_s(how + hl, sizeof(how) - hl, " %u(%s %s)", squad[hit], kind, names[hit]);
+            }
+            int wanted = 0;
+            for (int k = 0; k < n; k++) wanted += want[k];
+            if (wanted > 0) {
+                for (int k = 0; k < n; k++) {
+                    uint8_t* e = EntityById(world, squad[k]);
+                    e[0xb2] = want[k] ? (e[0xb2] | 0x40) : (e[0xb2] & ~0x40);
+                }
+                Log("selection kept: %d of %d selected again (squad %d -> %d):%s", wanted, g_kept_n, g_kept_squad, n, how);
+            } else Log("selection kept: nothing matched (%d remembered, squad %d)", g_kept_n, n);
+        }
+    }
+    if (g_kept_pending) return;
+    // Remember this frame's selection (cheap: at most 16 flag reads and names only when it changed).
+    KeptMember now[16];
+    int nn = 0;
+    for (int k = 0; k < n; k++) {
+        uint8_t* e = EntityById(world, squad[k]);
+        if (!(e[0xb2] & 0x40)) continue;
+        now[nn].id = squad[k];
+        now[nn].index = k;
+        MemberName(e, now[nn].name, 64);
+        nn++;
+    }
+    bool same = nn == g_kept_n && g_kept_squad == n && g_kept_session == session;
+    for (int m = 0; same && m < nn; m++) same = now[m].id == g_kept[m].id && now[m].index == g_kept[m].index;
+    if (same) return;
+    memcpy(g_kept, now, sizeof(KeptMember) * nn);
+    g_kept_n = nn;
+    g_kept_squad = n;
+    g_kept_session = session;
+}
+
 // Main thread, every client tick: read this player's selection; the host keeps the table; repaint on a change.
 void DotsFrame() {
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
+    KeepSelectionFrame(world);
     PlayerSel mine = {};
     if (world) {
         uint16_t squad[16];

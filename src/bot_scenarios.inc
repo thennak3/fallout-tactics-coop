@@ -1961,6 +1961,25 @@ void BotStep(uint8_t* client, uint8_t* world, int frame) {
         g_bot_last_snap = rel_s;
         SnapshotAll(world, frame);
     }
+    // keep_selection test: before the reload or map change, each copy selects only squad members 1 and 2 (its own
+    // selection: the flag every click sets), so the kept selection can be told from the game's default (all selected).
+    if (g_test.select_some && g_snap_tag == 1 && rel_s >= 40) {
+        static bool done = false;
+        uint16_t squad[16];
+        int n = done ? 0 : GetSquad(world, squad, 16);
+        if (n >= 3) {
+            done = true;
+            char who[120] = "";
+            int wl = 0;
+            for (int k = 0; k < n; k++) {
+                uint8_t* e = EntityById(world, squad[k]);
+                bool pick = k == 1 || k == 2;
+                e[0xb2] = pick ? (e[0xb2] | 0x40) : (e[0xb2] & ~0x40);
+                if (pick) wl += sprintf_s(who + wl, sizeof(who) - wl, " %u", squad[k]);
+            }
+            Log("bot: selection set to%s (of %d)", who, n);
+        }
+    }
     bool host_acts = _stricmp(g_test.actor, "host") == 0;
     // [test] actor: host, join (the first joiner only) or all (every joiner: the race for one merchant).
     bool i_act = _stricmp(g_test.actor, "all") == 0 ? g_coop_join
