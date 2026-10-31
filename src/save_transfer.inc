@@ -46,6 +46,11 @@ volatile LONG g_host_gen = 0;       // joiner: latest generation the host announ
 LONG g_loaded_gen = 0;              // joiner: generation of the save it is playing from
 bool g_load_pending = false;        // host: a load is under way (its session lobby is a co-op lobby)
 bool g_file_server_started = false;
+// Host: a re-sync published its generation (the copy of the quick-save, served as ftcoop_resync.sav) when the
+// quick-save was written, ahead of its quick-load. g_gen_pending tells joiners in GEN that a new save is ready to
+// fetch though no lobby is open yet; the session start (0xce) clears both.
+bool g_resync_published = false;
+volatile LONG g_gen_pending = 0;
 volatile LONG g_lobby_open = 0;     // host: a co-op lobby is holding the start (answered in GEN)
 DWORD g_session_start_tick = 0;     // host: GetTickCount() at the current session's start (0xce)
 // The host's game settings as " SET ..." (settings_sync.inc): the host's GEN replies carry them, so a joiner has them
@@ -75,7 +80,8 @@ int g_joiner_count = 0;
 // Joiner: who we are to the host.
 unsigned g_joiner_id = 0;
 char g_player_name[32] = "Player";
-volatile LONG g_host_lobby_open = 0;  // joiner: the host's latest GEN said a co-op lobby is open
+volatile LONG g_host_lobby_open = 0;  // joiner: the host's latest GEN said a co-op lobby is open (the DirectPlay join waits for it)
+volatile LONG g_host_gen_pending = 0; // joiner: the host's latest GEN said a new save is ready to fetch (re-sync, lobby not yet open)
 volatile char g_join_state = 'W';     // joiner: W, L or P, reported in every poll
 
 void NoteJoiner(unsigned id, const char* name, char state, long gen) {  // file server thread, under g_serve_lock
@@ -307,7 +313,9 @@ void ServeOne(SOCKET c) {
         WorldMapLine(wmap, sizeof(wmap));  // the host's party on the world map, if it is there
         char set[96];
         HostSettingsLine(set, sizeof(set));
-        int n = sprintf_s(line, "GEN %ld %d %s%s%s\n", gen, g_lobby_open ? 1 : 0, name, wmap, set);
+        // Field 2 is a bit set: 1 = a co-op lobby is open, 2 = a re-sync's new generation is published and its file
+        // can be fetched now (the joiner waited for the host's reload and network before it fetched: 9.4 s).
+        int n = sprintf_s(line, "GEN %ld %d %s%s%s\n", gen, (g_lobby_open ? 1 : 0) | (g_gen_pending ? 2 : 0), name, wmap, set);
         SendAll(c, line, n);
         return;
     }
@@ -329,6 +337,16 @@ void ServeOne(SOCKET c) {
     char* data = static_cast<char*>(malloc(size > 0 ? size : 1));
     size_t got = fread(data, 1, size, f);
     fclose(f);
+    // Only a complete file of the generation announced: if a re-sync replaced the file or the generation while it was
+    // read, send nothing (the joiner asks again) rather than a mix of two saves.
+    EnterCriticalSection(&g_serve_lock);
+    bool same = g_serve_gen == gen && strcmp(g_serve_name, name) == 0;
+    LeaveCriticalSection(&g_serve_lock);
+    if (!same || size <= 0 || static_cast<long>(got) != size) {
+        free(data);
+        Log("host: file server: the save changed while it was read (generation %ld): sending nothing", gen);
+        return;
+    }
     char header[400];
     int hl = sprintf_s(header, "FTCOOP1 %ld %ld %s\n", gen, size, name);
     bool ok = static_cast<long>(got) == size && SendAll(c, header, hl) && SendAll(c, data, size);
@@ -420,12 +438,21 @@ char __fastcall LoadCheckHook(void* self, void* /*edx*/, void** file) {
         // new world (the fuzzer's reload_during_recruit).
         CloseHeadlessRecruit();
     }
+    bool published = false;  // this load is the re-sync generation already served (PublishResyncGeneration)
     if (g_coop_host && g_quicksave_guard && _stricmp(name, kQuickSaveName) == 0) {
-        // Serve a copy: the player's own QuickSave.sav goes back in place once this session starts.
-        if (CopyFileA(kQuickSavePath, kResyncPath, FALSE)) strcpy_s(name, kResyncName);
-        else Log("host: could not copy the re-sync save (error %lu), serving QuickSave.sav", GetLastError());
+        if (g_resync_published) {
+            strcpy_s(name, kResyncName);  // same file, same generation: no second increment
+            published = true;
+        } else if (CopyFileA(kQuickSavePath, kResyncPath, FALSE)) {
+            // Serve a copy: the player's own QuickSave.sav goes back in place once this session starts.
+            strcpy_s(name, kResyncName);
+        } else Log("host: could not copy the re-sync save (error %lu), serving QuickSave.sav", GetLastError());
     }
-    if (g_coop_host) {
+    g_resync_published = false;  // any other load than the published one leaves it behind: that load gets its own generation
+    if (g_coop_host && published) {
+        g_load_pending = true;
+        Log("host: loading save \"%s\", serving it to joiners as generation %ld (published at the quick-save)", name, static_cast<long>(g_serve_gen));
+    } else if (g_coop_host) {
         EnterCriticalSection(&g_serve_lock);
         strcpy_s(g_serve_name, name);
         LONG gen = ++g_serve_gen;
@@ -484,7 +511,7 @@ SOCKET ConnectHost() {
 
 // Joiner, main thread. Blocking with 10 s timeouts (loopback / LAN for now). On success g_loaded_gen is the
 // generation of the file now at kReceivedPath.
-bool FetchSave() {
+bool FetchSave(long min_gen = 0) {
     bool ok = false;
     SOCKET s = ConnectHost();
     char header[400];
@@ -492,7 +519,7 @@ bool FetchSave() {
         long gen = 0, size = -1;
         char name[260] = "";
         if (sscanf_s(header, "FTCOOP1 %ld %ld %259[^\n]", &gen, &size, name, static_cast<unsigned>(sizeof(name))) == 3 &&
-            size > 0 && size < 64 * 1024 * 1024) {
+            size > 0 && size < 64 * 1024 * 1024 && gen >= min_gen) {  // never an older generation than announced
             char* data = static_cast<char*>(malloc(size));
             FILE* f = nullptr;
             if (RecvAll(s, data, size) && fopen_s(&f, kReceivedPath, "wb") == 0 && f) {
@@ -559,9 +586,18 @@ DWORD WINAPI GenerationPoller(LPVOID) {
                 InterlockedExchange(&g_host_gen, gen);
                 Log("join: host announced generation %ld (%s)", gen, line);
             }
-            if (got == 2 && lobby != g_host_lobby_open) {
-                InterlockedExchange(&g_host_lobby_open, lobby);
-                Log("join: host's co-op lobby is %s", lobby ? "open" : "closed");
+            if (got == 2) {
+                // After the generation above: a joiner that sees "pending" reads the generation it must fetch.
+                LONG pending = (lobby & 2) ? 1 : 0;
+                lobby &= 1;
+                if (pending != g_host_gen_pending) {
+                    InterlockedExchange(&g_host_gen_pending, pending);
+                    Log("join: host's new save is %s", pending ? "ready to fetch" : "no longer pending");
+                }
+                if (lobby != g_host_lobby_open) {
+                    InterlockedExchange(&g_host_lobby_open, lobby);
+                    Log("join: host's co-op lobby is %s", lobby ? "open" : "closed");
+                }
             }
         }
         if (s != INVALID_SOCKET) closesocket(s);
@@ -717,6 +753,28 @@ void LocalServerTicksToFrame() {
 bool ShopBusy();  // shop_sync.inc
 bool g_resync_now = false;  // test (shopresync): this re-sync goes ahead with a shop open, as one after the wait does
 
+// Host, main thread, when the re-sync's quick-save is written: serve it as the next generation now. The joiner used to
+// fetch only once the host's lobby was open, i.e. after the host's quick-load (3 s) and AddNetwork (2.5 s), although the
+// save existed from the quick-save on. LoadCheckHook recognises this load (g_resync_published) and adds nothing.
+bool PublishResyncGeneration() {
+    if (g_resync_published) return true;  // quick-load asked again after a refusal: same save, same generation
+    EnterCriticalSection(&g_serve_lock);
+    g_serve_name[0] = 0;  // while the file is replaced the server has nothing to send (a joiner never gets half of it)
+    LeaveCriticalSection(&g_serve_lock);
+    if (!CopyFileA(kQuickSavePath, kResyncPath, FALSE)) {
+        Log("host: could not copy the re-sync save (error %lu): it is served when it loads", GetLastError());
+        return false;
+    }
+    EnterCriticalSection(&g_serve_lock);
+    strcpy_s(g_serve_name, kResyncName);
+    LONG gen = ++g_serve_gen;
+    LeaveCriticalSection(&g_serve_lock);
+    g_resync_published = true;
+    InterlockedExchange(&g_gen_pending, 1);
+    Log("host: re-sync save \"%s\" published as generation %ld before the quick-load", kResyncName, gen);
+    return true;
+}
+
 void HostResyncStep() {
     if (!g_coop_host || g_resync_state == 0) return;
     uint8_t* game_main = *reinterpret_cast<uint8_t**>(kGameMainPtr);
@@ -759,6 +817,7 @@ void HostResyncStep() {
             Log("host: re-sync: quick-save written, pop-up gone after %d frames, quick-load", waited);
             g_resync_state = 3;
             waited = 0;
+            PublishResyncGeneration();
             g_world_closing = true;
             reinterpret_cast<void(__fastcall*)(void*)>(kQuickLoad)(game_main);
         } else if (QuickSaveRetry(game_main, waited, "host"), ++waited > 1200) {

@@ -543,13 +543,17 @@ bool JoinHost(uint8_t* client) {
             void* address = MakeFOTString(g_host_address);
             void* net = reinterpret_cast<void*(__cdecl*)()>(kNewDPTCPNetwork)();
             Log("join: client %p, switching to DPTCPNetwork %p for host %s", client, net, g_host_address);
+            DWORD t1 = GetTickCount();
             reinterpret_cast<void(__thiscall*)(void*, void*, void**)>(kClientSetNetwork)(client, net, &address);
             g_join_network_set = true;
+            Log("join: SetNetwork took %lu ms", GetTickCount() - t1);
         }
         GameVector sessions = {};
+        DWORD t0 = GetTickCount();
         reinterpret_cast<void(__thiscall*)(void*, GameVector*)>(kClientGetSessions)(client, &sessions);
         int count = sessions.begin ? static_cast<int>(sessions.end - sessions.begin) : 0;
-        Log("join: %d session(s) found", count);
+        Log("join: %d session(s) found (the search took %lu ms, host lobby %s)", count, GetTickCount() - t0,
+            g_host_lobby_open ? "open" : "not open");
         if (count == 0) return false;
         void* password = MakeFOTString("");
         reinterpret_cast<void(__thiscall*)(void*, void**, void*)>(kClientConnect)(client, &password, sessions.begin[0]);
@@ -1016,7 +1020,10 @@ void WaitPopupTick(uint8_t* w) {
     static DWORD next = 0;
     if (GetTickCount() < next) return;
     next = GetTickCount() + kJoinPollMs;
-    if (!g_have_received && g_host_lobby_open) g_have_received = FetchSave();
+    // A re-sync's save is fetched as soon as the host has published it, not when its lobby opens (the joiner waited for
+    // the host's reload and network before fetching: 9.4 s from joining to the new session). A lobby open for a load
+    // other than a re-sync still gates it as before.
+    if (!g_have_received && (g_host_lobby_open || g_host_gen_pending)) g_have_received = FetchSave(g_host_gen);
     if (g_have_received) {
         Log("co-op: the host's game is ready: closing the waiting message");
         reinterpret_cast<void(__thiscall*)(void*, int)>((*reinterpret_cast<void***>(w))[0x34 / 4])(w, 4);
@@ -1112,9 +1119,9 @@ void __fastcall MainMenuUpdateHook(void* self, void* /*edx*/) {
             static DWORD next_fetch = 0;
             if (g_wait_popup_up) {
                 // the waiting message fetches and loads
-            } else if (!g_have_received && g_host_lobby_open && GetTickCount() >= next_fetch) {
-                next_fetch = GetTickCount() + kJoinPollMs;
-                g_have_received = FetchSave();
+            } else if (!g_have_received && (g_host_lobby_open || g_host_gen_pending) && GetTickCount() >= next_fetch) {
+                next_fetch = GetTickCount() + kJoinPollMs;  // (a published re-sync save is fetched before its lobby is open)
+                g_have_received = FetchSave(g_host_gen);
             }
             if (g_have_received && !g_wait_popup_up) load = kReceivedName;  // the host's save, not our own choice
         } else if (g_test.enabled && _stricmp(g_test.scenario, "watch") != 0 && (!g_test.menu[0] || g_menu_role_chosen)) {
@@ -1634,7 +1641,9 @@ void __fastcall DummyUpdateHook(void* self, void* /*edx*/) {
             g_next_join_try = 0;
             Log("join: single-player lobby is up, joining %s", g_host_address);
         }
-        if (!g_joined && GetTickCount() >= g_next_join_try) {
+        // The save is loaded as soon as it is fetched, but the DirectPlay join waits for the host's lobby: before it, the
+        // host's old session may still be the one listed.
+        if (!g_joined && g_host_lobby_open && GetTickCount() >= g_next_join_try) {
             g_joined = JoinHost(client);
             if (g_joined) g_join_pending = false;
             g_next_join_try = GetTickCount() + kJoinPollMs;  // "0 session(s) found": the host's session shows a moment later
@@ -1728,6 +1737,8 @@ void __fastcall ClientRecvHook(void* self, void* /*edx*/, const uint8_t* msg, in
         g_snap_tag = g_coop_host ? (g_session_coop ? g_serve_gen : 0) : g_loaded_gen;
         g_resync_state = 0;  // a quick-load ends the old session: never carry a re-sync step into the new one
         InterlockedExchange(&g_lobby_open, 0);
+        InterlockedExchange(&g_gen_pending, 0);
+        g_resync_published = false;
         g_session_start_tick = GetTickCount();
         if (g_coop_host) RestoreQuickSave();  // the re-sync load has read QuickSave.sav: put the player's back
         if (g_coop_host && g_session_coop) Notice("Co-op: %d player(s) in this game", 1 + LiveJoiners());
