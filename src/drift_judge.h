@@ -10,7 +10,7 @@
 
 namespace drift {
 
-enum : uint8_t { kPos = 1, kTable = 2, kInv = 4, kAttr = 8, kEntities = 16 };
+enum : uint8_t { kPos = 1, kTable = 2, kInv = 4, kAttr = 8, kEntities = 16, kStock = 32 };
 const uint32_t kFixWindowMs = 10000;  // a drift back within this of a correction: a reload
 const uint32_t kSpacingMs = 60000;    // reloads at most this often
 const int kEvery = 25;                // a check every 25 frames
@@ -23,12 +23,13 @@ struct Rec {
     uint32_t used;   // which slots hold an entity, and their seq numbers: two copies that differ here made other things
     uint32_t inv;    // every inventory (actors and containers)
     uint32_t attr;   // every character's attributes (stats, skills, perks)
+    uint32_t stock;  // the quartermasters' stock list (a shop of theirs is made from it on every copy)
     bool shop;       // host: a shop was open (ShopBusy): this frame is not compared
 };
 
 inline uint8_t Kinds(const Rec& m, const Rec& j) {
     return (m.pos != j.pos ? kPos : 0) | (m.table != j.table ? kTable : 0) | (m.used != j.used ? kEntities : 0) |
-           (m.inv != j.inv ? kInv : 0) | (m.attr != j.attr ? kAttr : 0);
+           (m.inv != j.inv ? kInv : 0) | (m.attr != j.attr ? kAttr : 0) | (m.stock != j.stock ? kStock : 0);
 }
 
 enum class Verdict {
@@ -39,7 +40,7 @@ enum class Verdict {
     Drifted,  // the second in a row: the host acts (Decide)
 };
 
-enum class Action { None, Wait, Correct, Resync, Drop };
+enum class Action { None, Wait, Correct, Resync, Drop, Restock };
 
 struct Judge {
     // What can be turned off, for the simulator's mutations (the bugs of 0.10.5).
@@ -110,6 +111,10 @@ struct Judge {
         uint8_t k = reason_kinds;
         reason = false;
         reason_kinds = 0;
+        // Only the quartermasters' stock: the host sends its list again, at a frame (no hold; a stock apart in the middle
+        // of a session was mended only by the next session's start, and every shop until then was made apart).
+        if (k == kStock) return Action::Restock;
+        k &= static_cast<uint8_t>(~kStock);  // with other things: those decide, and the stock comes next time if still apart
         // The correction, unless other entities exist on that copy (it can't make or destroy them) or the same drift
         // is back soon after one.
         if (!(k & kEntities) && (!fix_tick || now - fix_tick > kFixWindowMs)) {

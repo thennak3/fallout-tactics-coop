@@ -902,22 +902,31 @@ bool JoinerLive(unsigned id) {  // host, main thread
 }
 
 void CloseAbandonedShop(const char* who);  // shop_sync.inc
+void CloseAbandonedTalks(unsigned joiner, const char* who);  // private_sync.inc
 uint32_t OpenShopOwner();                  // shop_sync.inc
 
 void NoticeLeftJoiners() {
     static bool was_live[8] = {};
     char gone[32] = "";
+    unsigned left[8];
+    char left_name[8][32];
+    int nleft = 0;
     uint32_t owner = OpenShopOwner();
     EnterCriticalSection(&g_serve_lock);
     DWORD now = GetTickCount();
     for (int i = 0; i < g_joiner_count; i++) {
         bool live = now - g_joiners[i].last_seen <= kJoinerTimeoutMs;
-        if (was_live[i] && !live) Notice("Co-op: %s left", g_joiners[i].name);
+        if (was_live[i] && !live) {
+            Notice("Co-op: %s left", g_joiners[i].name);
+            left[nleft] = g_joiners[i].id;
+            strcpy_s(left_name[nleft++], g_joiners[i].name);
+        }
         if (owner && g_joiners[i].id == owner && !live) strcpy_s(gone, g_joiners[i].name);  // even gone before it opened
         was_live[i] = live;
     }
     LeaveCriticalSection(&g_serve_lock);
     if (gone[0]) CloseAbandonedShop(gone);
+    for (int i = 0; i < nleft; i++) CloseAbandonedTalks(left[i], left_name[i]);
 }
 
 // Runtime roles, chosen in the Multiplayer menu (or by ftcoop.ini [coop] mode= for the tests).

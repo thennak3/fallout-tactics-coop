@@ -97,9 +97,9 @@ void LogShopState(uint8_t* world, const char* when) {  // test mode
 
 // The quartermasters' stock (the campaign's list, +0x151 templates, +0x161 counts): what a shop of theirs is made
 // from on every copy. One line at each session start, so the copies' logs say whether they had the same.
-void LogStockSummary(const char* when) {
+uint32_t StockHash(int* kinds_out = nullptr, int* items_out = nullptr) {  // the drift check's, and the log's
     uint8_t* campaign = *reinterpret_cast<uint8_t**>(0x8bdd2c);
-    if (!campaign) return;
+    if (!campaign) return 0;
     wchar_t** tb = *reinterpret_cast<wchar_t***>(campaign + 0x151);
     wchar_t** te = *reinterpret_cast<wchar_t***>(campaign + 0x155);
     int* cnt = *reinterpret_cast<int**>(campaign + 0x161);
@@ -113,6 +113,14 @@ void LogStockSummary(const char* when) {
         if (tb[i]) h = Fnv(h, tb[i], wcslen(tb[i]) * sizeof(wchar_t));
         h = Fnv(h, &c, sizeof(c));
     }
+    if (kinds_out) *kinds_out = kinds;
+    if (items_out) *items_out = items;
+    return h;
+}
+
+void LogStockSummary(const char* when) {
+    int kinds = 0, items = 0;
+    uint32_t h = StockHash(&kinds, &items);
     Log("co-op: quartermaster stock %s: %d kinds, %d items, hash %08x", when, kinds, items, h);
 }
 

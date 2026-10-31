@@ -33,9 +33,14 @@ TWINS = {
     "no_shop_skip": "needless_repair",        # checks during a shop counted: a reload after the shop
     "no_drop_before_fix": "needless_repair",  # a second joiner's old report reloads after the correction mended it
     "no_serial_sync": "apart_after_load",     # copies apart from the first frame of every session
-    "no_stock_sync": "converge",              # the quartermaster's stock never comes back together
+    "no_stock_sync": "apart_after_load",      # a joiner's own (empty) stock after a session's start: her night
+    "no_stock_check": "shop_stock_apart",     # a stock apart mid-session is never mended until the next session
     "no_resync_gate": "saved_during_shop",    # a re-sync's save in the middle of a shop
     "no_abandoned_close": "stuck",            # a shopper that left: its shop open everywhere, a reload waits for it
+    "no_host_filter": "two_talkers",          # two players clicking one NPC at once both get the conversation
+    "no_lock_clear": "lock_leak",             # 0.10.3: an NPC stays locked after a reload
+    "no_solo_release": "stuck",               # 0.10.5: a host on its own can't move after its conversation
+    "no_abandoned_talk": "waits_for_gone",    # a talker that left: its NPC locked and everyone waiting
 }
 # Fixtures: one exact situation each, written out and replayed over 20 seeds (the seed decides latencies and the joiners'
 # poll clocks). Clean, every seed must pass; with its twin, at least one seed must break the twin's invariant. Random
@@ -52,6 +57,23 @@ FIXTURES = {
     # asked for the correction the first one's started
     "two_joiners_same_drift": ("no_drop_before_fix", 3, 9000, lambda: [
         {"t": 600, "op": "spawn", "m": 1, "a": 4}]),
+    # two players click the same story NPC at the same moment: one gets the conversation, the other is told
+    "two_click_one_npc": ("no_host_filter", 3, 9000, lambda: [
+        {"t": quarter(800), "op": "hit", "m": 1, "a": 0, "b": 5},
+        {"t": quarter(800), "op": "hit", "m": 2, "a": 0, "b": 5}]),
+    # the owner's wife's night: a joiner comes back without the quartermaster's stock, then the host shops
+    "joiner_without_stock": ("no_stock_sync", 3, 12000, lambda: [
+        {"t": quarter(300), "op": "leave", "m": 2},
+        {"t": quarter(1500), "op": "join", "m": 2, "a": 1},
+        {"t": quarter(7000), "op": "activate", "m": 0, "a": 0, "b": 4}]),
+    # a joiner's stock goes wrong in the middle of a session, and the host shops 12 s later: the drift check mends it
+    "stock_lost_mid_session": ("no_stock_check", 3, 18000, lambda: [
+        {"t": quarter(1000), "op": "spawn", "m": 2, "a": 1},
+        {"t": quarter(13000), "op": "activate", "m": 0, "a": 0, "b": 4}]),
+    # a joiner talks to a story NPC (everyone waits) and leaves in the middle of it
+    "talker_leaves": ("no_abandoned_talk", 3, 12000, lambda: [
+        {"t": quarter(500), "op": "hit", "m": 1, "a": 0, "b": 12},
+        {"t": quarter(2500), "op": "leave", "m": 1}]),
     # a joiner opens a shop for 10 s and leaves in the middle of it
     "shopper_leaves": ("no_abandoned_close", 3, 9000, lambda: [
         {"t": quarter(500), "op": "activate", "m": 1, "a": 0, "b": 9},

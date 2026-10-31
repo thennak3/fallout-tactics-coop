@@ -23,6 +23,16 @@
 //     inventories; a copy goes on when it has them, or gives up after 8 s. It cannot make or destroy entities.
 //   - Reload: everyone waits for every copy to load the host's save; a new generation from frame 0.
 //
+// Conversations (the fuzzer's Hit op: copy m talks to NPC 300 + a % 3 for 1 to 15 s): 300 and 302 are story NPCs
+// (held: from the talk's frame every copy waits until the talker is done, the talker's own world too), 301 a trader
+// (nobody waits). The talk goes to the host, which passes the first on an NPC and drops the others (talk_locks.h);
+// every copy marks the NPC busy at the talk's frame and refuses its own player's talk to a busy NPC. The talker's done
+// frees the NPC (a held one: on arrival, nobody runs frames meanwhile; a trader: at its frame). The host stops waiting
+// for a joiner's conversation when it is done, when every joiner is gone, or after 10 minutes (HostHoldTimeout). A
+// session's start clears every lock (ClearNpcLocks, ClearHostLocks). A talker that leaves in the middle: the host
+// ends its conversation for everyone (CloseAbandonedTalks). One talk at a time per player (a second order replaces the
+// first in the game: ReleaseSupersededTalk; here it is not sent).
+//
 // Faults (the fuzzer's Spawn op, a % 5, on a joiner): 0 its serial runs ahead, 1 its stock is emptied, 2 it makes an
 // entity the others don't (only a reload mends it), 3 its free list's first two slots swap (a correction mends it),
 // 4 every joiner's serial runs ahead at once (copies that ran other sessions: their reports race each other).
@@ -34,7 +44,10 @@
 // frames into a session, with no fault since it started), saved_during_shop (a re-sync's save while a shop is open).
 //
 // Mutation twins, the bugs of 0.10.5 to 0.10.7: no_shop_skip, no_drop_before_fix, no_serial_sync, no_stock_sync,
-// no_resync_gate, no_abandoned_close (found by this fuzzer: a shopper that left kept the shop open everywhere).
+// no_resync_gate, no_abandoned_close (found by this fuzzer: a shopper that left kept the shop open everywhere),
+// no_host_filter (the host passes every talk), no_lock_clear (0.10.3: locks kept across a session start),
+// no_solo_release (0.10.5: a host on its own stays held after its conversation), no_abandoned_talk (found by this
+// fuzzer: a talker that left kept the NPC locked and everyone waiting).
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -45,6 +58,7 @@
 #include "coopfuzz/rng.h"
 #include "../../src/drift_judge.h"
 #include "../../src/session_sync.h"
+#include "../../src/talk_locks.h"
 
 namespace coopfuzz {
 namespace {
@@ -58,7 +72,7 @@ const uint32_t kFixGiveUpMs = 8000;
 const uint32_t kLoadMs = 3000;
 const int kExecDelay = 2;  // a command acts this many frames after the host has it
 
-enum CmdType : uint8_t { CMove, CGive, CShopOpen, CShopClose, CFixHold, CSerial, CStock, CJoinersApart };
+enum CmdType : uint8_t { CMove, CGive, CShopOpen, CShopClose, CFixHold, CSerial, CStock, CJoinersApart, CTalk, CTalkDone };
 
 struct Cmd {
     CmdType type = CMove;
@@ -181,6 +195,17 @@ struct Copy {
     bool loading = false;
     bool held = false;            // held for a correction
     bool loaded = false;          // took the save of the reload under way
+    std::map<int, int> npc_lock;  // NPC -> the copy talking to it (NpcLock)
+    bool conv_wait = false;       // held for another copy's conversation
+    bool talking = false;         // this copy's player is in a conversation
+    bool talk_pending = false;    // ... asked for, not opened (or dropped) yet
+    int pending_npc = 0;
+    uint64_t gone_wait_since = 0;
+    uint64_t stock_apart_since = 0;
+    bool gone_wait_said = false;
+    bool talk_held = false;       // ... a held one: its own world waits too (g_talker_hold)
+    int talk_npc = 0;
+    uint64_t talk_until = 0;
     std::map<int, Hashes> frames;  // this copy's hashes at each frame of this session
     std::map<int, World> worlds;   // and its world, for the reports (what differed, from when)
     uint64_t held_since = 0;
@@ -252,6 +277,26 @@ public:
                 Trace("copy %d asks for a shop (%d s)", m, c.c);
                 break;
             }
+            case OpKind::Hit: {  // a conversation: copy m talks to NPC 300 + a % 3
+                if (!Quarter(op) || !copies_[m].connected || copies_[m].loading || copies_[m].talking || copies_[m].talk_pending) break;
+                Copy& c = copies_[m];
+                int npc = 300 + op.a % 3;
+                auto l = c.npc_lock.find(npc);
+                if (l != c.npc_lock.end() && l->second != m) {  // RefuseLockedTalk
+                    Trace("copy %d's talk to NPC %d refused here: copy %d is talking to them", m, npc, l->second);
+                    if (!TalkTaken(npc))
+                        Violate("refused_free_npc", "copy " + std::to_string(m) + "'s talk to NPC " + std::to_string(npc) +
+                                                        " refused while nobody is talking to them");
+                    break;
+                }
+                Cmd t;
+                t.type = CTalk, t.a = npc, t.b = m, t.c = 1 + op.b % 15;
+                Request(m, t);
+                c.talk_pending = true, c.pending_npc = npc;
+                counters_["op_talk"]++;
+                Trace("copy %d talks to NPC %d (%d s)", m, npc, t.c);
+                break;
+            }
             case OpKind::Spawn: {  // a forced desync on a joiner's copy
                 // a quarter of them too: with every Spawn a fault, a split was nearly always among them, and the drifts
                 // a correction mends (the owner's) were never alone
@@ -266,7 +311,7 @@ public:
                     c.connected = true;
                     c.loading = true;  // in the lobby until it has loaded a save of the host's (a reload brings it in)
                     c.w.serial += 5000 + rng_.range(0, 5000);  // its own game ran meanwhile
-                    if (rng_.range(0, 1)) for (int& k : c.w.stock) k = 0;  // and may have no stock at all
+                    if (op.a == 1 || rng_.range(0, 1)) for (int& k : c.w.stock) k = 0;  // and may have no stock at all
                     counters_["op_join"]++;
                     Trace("copy %d joins", m);
                     if (reload_pending_ || loading_until_) join_again_ = true;  // that reload's save is already made
@@ -274,12 +319,21 @@ public:
                 }
                 break;
             case OpKind::Leave:
-                if (Quarter(op) && m != 0 && copies_[m].connected && connectedCount() > 2) {
+                if (Quarter(op) && m != 0 && copies_[m].connected && connectedCount() > 1) {  // down to a host alone
                     copies_[m].connected = false;
                     copies_[m].held = false;
                     counters_["op_leave"]++;
                     Trace("copy %d leaves%s", m, copies_[m].my_shop ? " in the middle of its own shop" : copies_[m].shop ? " with a shop open" : "");
                     if (copies_[0].shop && copies_[0].shop_shopper == m) CloseAbandoned();
+                    copies_[m].talking = copies_[m].talk_pending = copies_[m].talk_held = false;
+                    if (!bugs_.count("no_abandoned_talk"))  // CloseAbandonedTalks: its NPCs' done, for everyone
+                        for (int npc = 300; npc < 303; npc++)
+                            if (host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_)) && TalkOwner(npc) == m) {
+                                host_locks_.Free(static_cast<uint16_t>(npc));
+                                Trace("the host ends copy %d's conversation with NPC %d for everyone", m, npc);
+                                for (int j = 0; j < n_; j++)
+                                    if (copies_[j].connected) done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, npc, m});
+                            }
                 }
                 break;
             case OpKind::Load:
@@ -308,11 +362,11 @@ public:
 
     bool quiescent() const override {
         if (!frozen_ || final_reload_ || reload_pending_ || loading_until_ || resync_wait_) return false;
-        if (any_shop_ || judge_.reason || fix_pending_) return false;
+        if (any_shop_ || judge_.reason || fix_pending_ || host_hold_npc_ || !done_due_.empty()) return false;
         // Lockstep frames and polls never stop: quiet is the drift machinery idle with every copy 160 frames (six checks)
         // into the session that heal() started.
         for (const Copy& c : copies_)
-            if (c.connected && (c.held || c.loading || c.frame < 160)) return false;
+            if (c.connected && (c.held || c.loading || c.frame < 160 || c.talking || c.conv_wait || c.talk_held)) return false;
         return true;
     }
 
@@ -351,6 +405,18 @@ public:
 
     std::vector<Violation> nativeViolations() override {
         std::vector<Violation> v = violations_;
+        if (frozen_ && quiescent()) {  // nothing talks: every lock must be free (0.10.3: one survived a reload)
+            for (int m = 0; m < n_; m++)
+                for (auto& l : copies_[m].npc_lock)
+                    if (copies_[m].connected) {
+                        v.push_back({"lock_leak", "copy " + std::to_string(m) + " still has NPC " + std::to_string(l.first) +
+                                                      " locked for copy " + std::to_string(l.second) + " || trace" + Recent(), now_});
+                        break;
+                    }
+            for (int npc = 300; npc < 303; npc++)
+                if (host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_)))
+                    v.push_back({"lock_leak", "the host still holds NPC " + std::to_string(npc) + " || trace" + Recent(), now_});
+        }
         if (frozen_ && !quiescent()) {  // what keeps it busy, for the report
             std::string d = "busy:";
             if (final_reload_) d += " final_reload";
@@ -359,6 +425,7 @@ public:
             if (resync_wait_) d += " resync_waiting_for_shop";
             if (any_shop_) d += " shop";
             if (judge_.reason) d += " drift_reason";
+            if (host_hold_npc_) d += " host_waits_for_conversation";
             if (fix_pending_) d += " fix_pending";
             for (int m = 0; m < n_; m++) {
                 const Copy& c = copies_[m];
@@ -367,6 +434,9 @@ public:
                 if (c.loading) d += " loading" + std::to_string(m);
                 if (c.frame < 160) d += " frame" + std::to_string(m) + "=" + std::to_string(c.frame);
                 if (c.shop) d += " shop_on" + std::to_string(m);
+                if (c.talking) d += " talking" + std::to_string(m);
+                if (c.conv_wait) d += " conv_wait" + std::to_string(m);
+                if (c.talk_held) d += " talk_held" + std::to_string(m);
             }
             v.push_back({"stuck", d + " || trace" + Recent(), now_});
         }
@@ -417,6 +487,24 @@ private:
     }
     void HostCommand(Cmd c) {
         if (!c.id) c.id = ++next_id_;  // the host's own commands too: every message its own id
+        if (c.type == CTalk) {  // HostFilterTalks (talk_locks.h); no_host_filter: the host passes every talk anyway
+            int holder = -1;
+            bool pass = host_locks_.Pass(static_cast<uint16_t>(c.a), c.b, static_cast<uint32_t>(now_), &holder);
+            if (pass || bugs_.count("no_host_filter")) {
+                if (pass) talk_owner_[c.a] = c.b;
+            } else {
+                Trace("host dropped copy %d's talk to NPC %d: copy %d has them", c.b, c.a, holder);
+                copies_[c.b].talk_pending = false;  // the winner's claim tells it: someone got there first
+                counters_["talk_dropped"]++;
+                return;
+            }
+        }
+        if (c.type == CTalkDone) host_locks_.Done(static_cast<uint16_t>(c.a), c.b);
+        if (c.type == CTalkDone && Held(c.a)) {  // a held conversation's done: on arrival (nobody runs frames)
+            for (int m = 0; m < n_; m++)
+                if (copies_[m].connected) done_due_.push_back({m == 0 ? now_ : now_ + Latency(), m, c.a, c.b});
+            return;
+        }
         schedule_[copies_[0].frame + kExecDelay].push_back(c);
     }
 
@@ -475,6 +563,15 @@ private:
         fix_pending_ = false;
         judge_.NewSession();
         host_frames_.clear();
+        // A load closes every screen (DropPrivateScreens); a session's start clears every lock (ClearNpcLocks)
+        talk_owner_.clear();
+        for (Copy& c : copies_) {
+            c.talking = c.talk_held = c.conv_wait = c.talk_pending = false;
+            if (!bugs_.count("no_lock_clear")) c.npc_lock.clear();
+        }
+        if (!bugs_.count("no_lock_clear")) host_locks_.Clear();
+        host_hold_npc_ = 0;
+        done_due_.clear();
         // What the host sends at every session's start (settings_sync.inc), acting at the same frame everywhere.
         if (!bugs_.count("no_serial_sync")) {
             Cmd c;
@@ -482,17 +579,7 @@ private:
             c.value = session::SessionSerial(copies_[0].w.serial);
             schedule_[3].push_back(c);
         }
-        if (!bugs_.count("no_stock_sync")) {
-            char text[session::kStockMaxText + 1];
-            int n = copies_[0].w.StockText(text, sizeof(text));
-            int chunks = session::StockChunks(n);
-            for (int i = 0; i < chunks; i++) {
-                Cmd c;
-                c.type = CStock, c.a = i, c.b = chunks;
-                session::StockChunk(text, n, i, c.payload);
-                schedule_[3].push_back(c);
-            }
-        }
+        if (!bugs_.count("no_stock_sync")) SendStock(3);
         (void)first;
     }
 
@@ -554,6 +641,14 @@ private:
                 break;
             case CShopOpen: {
                 if (m == 0) Trace("shop of copy %d opens at frame %d", c.b, cp.frame);
+                if (m != 0) {  // made from this copy's own list: it must be the host's (her night: 0 items, the host's N)
+                    auto hw = copies_[0].worlds.find(cp.frame - 1);   // apart 10 s or more: the drift check had time
+                    if (hw != copies_[0].worlds.end() && hw->second.StockHash() != w.StockHash() && cp.stock_apart_since &&
+                        now_ - cp.stock_apart_since >= 10000)
+                        Violate("shop_stock_apart", "copy " + std::to_string(m) + " makes the shop from another stock than the host's (" +
+                                                        std::to_string(StockItems(w)) + " items here, " +
+                                                        std::to_string(StockItems(hw->second)) + " on the host)");
+                }
                 if (m == 0 && !copies_[c.b].connected) pending_abandon_ = true;  // gone before its shop opened
                 cp.shop = true;
                 cp.shop_shopper = c.b;
@@ -619,6 +714,27 @@ private:
             case CSerial:
                 w.serial = c.value;
                 break;
+            case CTalk: {
+                cp.npc_lock[c.a] = c.b;
+                if (m == c.b) cp.talk_pending = false;
+                if (m == c.b && cp.connected) {
+                    for (int j = 0; j < n_; j++)  // the talker's own conversation opens: nobody else may be in one with them
+                        if (j != m && TalkActiveBy(c.a, j))
+                            Violate("two_talkers", "NPC " + std::to_string(c.a) + ": copies " + std::to_string(j) + " and " +
+                                                       std::to_string(m) + " both talk to them");
+                    cp.talking = true, cp.talk_npc = c.a, cp.talk_until = now_ + static_cast<uint64_t>(c.c) * 1000;
+                    cp.talk_held = Held(c.a);
+                } else if (Held(c.a)) {
+                    cp.conv_wait = true;
+                    if (m == 0) host_hold_npc_ = c.a, host_hold_since_ = now_;
+                }
+                if (m == 0)
+                    Trace("copy %d's conversation with NPC %d opens at frame %d%s", c.b, c.a, cp.frame, Held(c.a) ? " (everyone waits)" : "");
+                break;
+            }
+            case CTalkDone:  // a trader's: at its frame
+                FreeNpc(m, c.a, c.b);
+                break;
             case CJoinersApart:
                 if (m != 0) w.serial += 700;
                 if (m == 0) {
@@ -634,6 +750,58 @@ private:
                     });
                 }
                 break;
+        }
+    }
+
+    static bool Held(int npc) { return npc != 301; }
+    static int StockItems(const World& w) {
+        int n = 0;
+        for (int k = 0; k < kKinds; k++) n += w.stock[k] > 0 ? w.stock[k] : 0;
+        return n;
+    }
+    int TalkOwner(int npc) const {  // the host's note of who claimed it (NoteTalkOwner)
+        auto it = talk_owner_.find(npc);
+        return it == talk_owner_.end() ? -1 : it->second;
+    }
+    bool TalkActiveBy(int npc, int talker) const {
+        return talker >= 0 && talker < n_ && copies_[talker].connected && copies_[talker].talking && copies_[talker].talk_npc == npc;
+    }
+    bool TalkActive(int npc) const {
+        for (int m = 0; m < n_; m++)
+            if (TalkActiveBy(npc, m)) return true;
+        return false;
+    }
+    // Taken: someone talks to it on some copy, or the host has passed someone's talk to it (it opens a little later on
+    // the copies that lag behind).
+    bool TalkTaken(int npc) const {
+        for (const Copy& c : copies_)
+            if (c.connected && c.talk_pending && c.pending_npc == npc) return true;  // a talk on its way
+        return TalkActive(npc) || host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_));
+    }
+    void FreeNpc(int m, int npc, int talker) {  // the talker's done reached copy m
+        Copy& c = copies_[m];
+        auto l = c.npc_lock.find(npc);
+        if (l != c.npc_lock.end() && l->second == talker) c.npc_lock.erase(l);
+        if (c.conv_wait) c.conv_wait = false;
+        if (m == 0 && host_hold_npc_ == npc) host_hold_npc_ = 0;
+    }
+    struct DoneDue {
+        uint64_t at;
+        int m, npc, talker;
+    };
+
+    // SendStock: the host's list in records, acting at one frame on every copy (at a session's start, and on a drift of
+    // the stock alone: Action::Restock)
+    void SendStock(int at_frame) {
+        char text[session::kStockMaxText + 1];
+        int n = copies_[0].w.StockText(text, sizeof(text));
+        int chunks = session::StockChunks(n);
+        for (int i = 0; i < chunks; i++) {
+            Cmd c;
+            c.type = CStock, c.a = i, c.b = chunks;
+            session::StockChunk(text, n, i, c.payload);
+            c.id = ++next_id_;
+            schedule_[at_frame].push_back(c);
         }
     }
 
@@ -669,6 +837,12 @@ private:
             host_frames_[c.frame] = HashesOf(c.w, HostShopBusy() || c.shop);
             if (host_frames_.size() > 600) host_frames_.erase(host_frames_.begin());
         } else {
+            auto hw = copies_[0].worlds.find(c.frame);  // since when this copy's stock is not the host's
+            if (hw != copies_[0].worlds.end() && hw->second.StockHash() != c.w.StockHash()) {
+                if (!c.stock_apart_since) c.stock_apart_since = now_;
+            } else if (hw != copies_[0].worlds.end()) {
+                c.stock_apart_since = 0;
+            }
             c.frames[c.frame] = HashesOf(c.w, false);
             if (c.frames.size() > 600) c.frames.erase(c.frames.begin());
         }
@@ -680,7 +854,7 @@ private:
         }
         if (c.frame % drift::kEvery == 0) {
             drift::Rec r = {gen_, c.frame, c.w.PosHash(), c.w.TableHash(), c.w.UsedHash(), c.w.InvHash(), 1,
-                            m == 0 && HostShopBusy()};
+                            bugs_.count("no_stock_check") ? 0u : c.w.StockHash(), m == 0 && HostShopBusy()};
             c.ring.push_back(r);
             if (c.ring.size() > 8) c.ring.erase(c.ring.begin());
         }
@@ -801,6 +975,54 @@ private:
                 Request(m, d);
             }
         }
+        // conversations: the talker is done
+        for (int m = 0; m < n_; m++) {
+            Copy& c = copies_[m];
+            if (!c.connected || !c.talking || now_ < c.talk_until) continue;
+            c.talking = false;
+            bool alone = m == 0 && connectedCount() == 1;
+            if (!(alone && bugs_.count("no_solo_release"))) c.talk_held = false;  // ReleaseTalkerHold (0.10.5: not alone)
+            Trace("copy %d is done talking to NPC %d", m, c.talk_npc);
+            Cmd d;
+            d.type = CTalkDone, d.a = c.talk_npc, d.b = m;
+            Request(m, d);
+        }
+        for (size_t i = 0; i < done_due_.size();) {
+            if (done_due_[i].at > now_) {
+                ++i;
+                continue;
+            }
+            DoneDue d = done_due_[i];
+            done_due_.erase(done_due_.begin() + i);
+            if (copies_[d.m].connected) FreeNpc(d.m, d.npc, d.talker);
+        }
+        // A copy waiting for a conversation whose talker is gone: nothing but 10 minutes would end it (a reload hides it)
+        for (int m = 0; m < n_; m++) {
+            Copy& c = copies_[m];
+            int talker = -1;
+            if (c.connected && c.conv_wait)
+                for (auto& l : c.npc_lock)
+                    if (Held(l.first) && l.second != m) talker = l.second;
+            if (talker >= 0 && !copies_[talker].connected) {
+                if (!c.gone_wait_since) c.gone_wait_since = now_;
+                if (now_ - c.gone_wait_since > 5000 && !c.gone_wait_said) {
+                    c.gone_wait_said = true;
+                    Violate("waits_for_gone", "copy " + std::to_string(m) + " has waited 5 s for the conversation of copy " +
+                                                  std::to_string(talker) + ", which is gone");
+                }
+            } else {
+                c.gone_wait_since = 0, c.gone_wait_said = false;
+            }
+        }
+        if (host_hold_npc_) {  // HostHoldTimeout: every joiner gone, or 10 minutes
+            bool alone = connectedCount() == 1;
+            if (alone || now_ - host_hold_since_ > talk::kLockMaxMs) {
+                Trace("the host stops waiting for NPC %d's conversation (%s)", host_hold_npc_,
+                      alone ? "the other player left" : "waited too long");
+                copies_[0].conv_wait = false;
+                host_hold_npc_ = 0;
+            }
+        }
         // the host: a frame every kFrameMs unless held
         Copy& h = copies_[0];
         if (h.held && fix_release_host_at_ && now_ >= fix_release_host_at_) {
@@ -808,7 +1030,7 @@ private:
             fix_release_host_at_ = 0;
             judge_.CorrectionDone(gen_, fix_frame_);
         }
-        if (!h.held && now_ >= next_host_frame_) {
+        if (!h.held && !h.conv_wait && !h.talk_held && now_ >= next_host_frame_) {
             next_host_frame_ = now_ + kFrameMs;
             std::vector<Cmd> cmds;
             auto it = schedule_.find(h.frame + 1);
@@ -853,7 +1075,7 @@ private:
                 }
                 if (c.held) continue;
             }
-            while (!c.stream.empty() && c.stream.front().at <= now_ && !c.held) {
+            while (!c.stream.empty() && c.stream.front().at <= now_ && !c.held && !c.conv_wait && !c.talk_held) {
                 Delivery d = c.stream.front();
                 c.stream.pop_front();
                 if (d.gen != gen_) continue;
@@ -945,6 +1167,10 @@ private:
             if (needless) Violate("needless_repair", "a drift reload while every copy was the same as the host");
             counters_["drift_reloads"]++;
             StartReload(true, "a drift");
+        } else if (a == drift::Action::Restock) {
+            Trace("drift (copy %d, frame %d): the stock only: the host's list again", drift_from_, drift_frame_);
+            counters_["restocks"]++;
+            SendStock(copies_[0].frame + kExecDelay);
         } else if (a == drift::Action::Drop) {
             counters_["drift_dropped"]++;
         }
@@ -969,6 +1195,11 @@ private:
     long fault_gen_ = -1;
     int drift_from_ = -1, drift_frame_ = 0;
     bool pending_abandon_ = false;
+    talk::HostLocks host_locks_;
+    int host_hold_npc_ = 0;
+    uint64_t host_hold_since_ = 0;
+    std::vector<DoneDue> done_due_;
+    std::map<int, int> talk_owner_;  // the host: NPC -> who claimed it
     bool late_drift_ = false;
     bool fix_snapshot_ = false;
     uint64_t race_at_ = 0, apart_watch_ = 0;
@@ -990,7 +1221,8 @@ private:
 // probe_late_report is no bug: it reports the moment a differing check reaches the host during a correction, so the
 // triage shows how that comes about.
 const char* kBugs[] = {"no_shop_skip", "no_drop_before_fix", "no_serial_sync", "no_stock_sync", "no_resync_gate", "no_abandoned_close",
-                       "probe_late_report", "probe_race", "probe_undetected"};
+                       "probe_late_report", "probe_race", "probe_undetected",
+                       "no_host_filter", "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check"};
 
 std::unique_ptr<ITarget> makeFt(const Scenario& s, std::string* err) {
     std::set<std::string> bugs;
@@ -1008,7 +1240,8 @@ std::unique_ptr<ITarget> makeFt(const Scenario& s, std::string* err) {
 
 const TargetRegistrar kRegisterFt(TargetInfo{
     "ftcoop", "Fallout Tactics co-op on a fake world: lockstep, shops, drift checks, corrections, reloads, forced desyncs",
-    {"no_shop_skip", "no_drop_before_fix", "no_serial_sync", "no_stock_sync", "no_resync_gate", "no_abandoned_close", "probe_late_report", "probe_race", "probe_undetected"}, makeFt});
+    {"no_shop_skip", "no_drop_before_fix", "no_serial_sync", "no_stock_sync", "no_resync_gate", "no_abandoned_close", "probe_late_report", "probe_race", "probe_undetected", "no_host_filter",
+     "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check"}, makeFt});
 
 }  // namespace
 }  // namespace coopfuzz

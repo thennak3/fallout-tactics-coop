@@ -1120,7 +1120,15 @@ void BotSpeechTick(uint8_t* w) {
             BotChangeQuestVar(*reinterpret_cast<uint8_t**>(kWorldPtr));  // what a story conversation changes
         }
     }
-    if (++ticks == 60) {
+    // [test] hold on a talk: the conversation stays up that many seconds (a player reading it; --leave-in-shop kills the
+    // talker's game in the middle of it)
+    static DWORD opened = 0;
+    static bool ended = false;
+    if (ticks == 0) opened = GetTickCount();
+    bool talk_hold = g_test.hold > 0 && _stricmp(g_test.scenario, "talk") == 0;
+    DWORD hold_ms = talk_hold ? static_cast<DWORD>(g_test.hold) * 1000 : 0;
+    if (++ticks >= 60 && !ended && GetTickCount() - opened >= hold_ms) {
+        ended = true;
         Log("bot: ending the conversation");
         g_end_game_mode = true;  // as leaving the conversation does: the mission screen back to mode 0
     }

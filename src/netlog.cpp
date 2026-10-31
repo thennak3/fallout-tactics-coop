@@ -26,6 +26,7 @@
 #include <string.h>
 #include <algorithm>
 #include "session_sync.h"  // what every copy takes from the host at a session start (settings_sync.inc)
+#include "talk_locks.h"  // the host's say over who talks to an NPC (private_sync.inc)
 #include "drift_judge.h"  // the drift check's decisions (drift.inc)
 
 namespace {

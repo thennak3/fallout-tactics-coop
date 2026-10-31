@@ -93,7 +93,7 @@ void DriftFrame(uint8_t* world) {
     if (frame == last || frame % kDriftEvery) return;
     last = frame;
     DriftRec r = {g_coop_host ? static_cast<long>(g_serve_gen) : g_loaded_gen, frame, PosHash(world), TableHash(world),
-                  UsedHash(world), InvHash(world), AttrHash(world), ShopBusy()};
+                  UsedHash(world), InvHash(world), AttrHash(world), StockHash(), ShopBusy()};
     AcquireSRWLockExclusive(&g_drift_lock);
     g_drift_ring[g_drift_next] = r;
     g_drift_next = (g_drift_next + 1) % kDriftRing;
@@ -106,16 +106,16 @@ int FormatDrift(char* out, size_t cap) {
     AcquireSRWLockShared(&g_drift_lock);
     for (const DriftRec& r : g_drift_ring)
         if (r.frame)
-            n += sprintf_s(out + n, cap - n, "%ld:%d:%x:%x:%x:%x:%x,", r.gen, r.frame, r.pos, r.table, r.used, r.inv,
-                           r.attr);
+            n += sprintf_s(out + n, cap - n, "%ld:%d:%x:%x:%x:%x:%x:%x,", r.gen, r.frame, r.pos, r.table, r.used, r.inv,
+                           r.attr, r.stock);
     ReleaseSRWLockShared(&g_drift_lock);
     return n;
 }
 
 void KindsText(uint8_t k, char* out, size_t cap) {
     out[0] = 0;
-    const char* names[] = {"positions/HP", "free list", "inventories", "attributes", "entities"};
-    for (int i = 0; i < 5; i++)
+    const char* names[] = {"positions/HP", "free list", "inventories", "attributes", "entities", "quartermaster stock"};
+    for (int i = 0; i < 6; i++)
         if (k & (1 << i)) {
             if (out[0]) strcat_s(out, cap, ", ");
             strcat_s(out, cap, names[i]);
@@ -141,7 +141,8 @@ void DriftFromJoiner(unsigned id, const char* name, const char* p) {
     if (*p) p++;
     int used;
     DriftRec j = {};
-    while (sscanf_s(p, "%ld:%d:%x:%x:%x:%x:%x,%n", &j.gen, &j.frame, &j.pos, &j.table, &j.used, &j.inv, &j.attr, &used) == 7) {
+    while (sscanf_s(p, "%ld:%d:%x:%x:%x:%x:%x:%x,%n", &j.gen, &j.frame, &j.pos, &j.table, &j.used, &j.inv, &j.attr, &j.stock,
+                    &used) == 8) {
         p += used;
         bool mine = false;
         DriftRec m = {};
@@ -183,6 +184,10 @@ void DriftCheckHost() {
     drift::Action a = g_judge.Decide(GetTickCount(), busy || !world);
     if (a == drift::Action::Correct) {
         StartWorldFix(world, kinds);
+    } else if (a == drift::Action::Restock) {
+        Log("co-op: drift: %s: only the quartermasters' stock: the host's list goes out again", g_drift_reason);
+        void SendStock();  // settings_sync.inc
+        SendStock();
     } else if (a == drift::Action::Resync) {
         static char reason[96];
         strcpy_s(reason, g_drift_reason);

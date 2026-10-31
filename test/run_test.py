@@ -105,7 +105,7 @@ CHAOS_NO_SELECT = False  # --chaos-no-select: the chaos bots never change their 
 MERCHANT = 0  # --merchant N: trades with this NPC (bunker: 349 the mechanic barters and gambles, 104/274/288 barter)
 GAMBLE = False  # --gamble: trades: Gamble instead of Barter
 NO_SERIAL_SYNC = False  # --no-serial-sync: mutation, the host sends no entity serial at session start (0.10.5)
-LEAVE_IN_SHOP = False  # --leave-in-shop: trade_join: the trading joiner's game is killed 2 s into its shop
+LEAVE_IN_SHOP = False  # --leave-in-shop: trade_join / talk_join: the joiner's game is killed 2 s into its shop or conversation
 RESYNC_IN_SHOP = False  # --resync-in-shop: trades: the host asks for a re-sync 3 s into its own shop
 EMPTY_STOCK = False  # --empty-stock: every joiner's quartermaster stock emptied at each session start
 SERIAL_SKEW = 0  # --serial-skew N: every joiner's entity serial counter N ahead at each session start
@@ -376,7 +376,8 @@ def main():
             if LEAVE_IN_SHOP and killed_in_shop is None and procs[1].poll() is None:
                 # the trading joiner's game goes away mid-shop (a crash, a lost connection, alt-F4)
                 trader_log = read(os.path.join(JOIN_DIR, "netlog.txt"))
-                if re.search(r"co-op: (shop|gamble) of NPC \d+ open for this player", trader_log):
+                if re.search(r"co-op: (shop|gamble) of NPC \d+ open for this player", trader_log) or (
+                        scenario == "talk" and "co-op: .?AVWSpeech@@ opened for this player" in trader_log):
                     time.sleep(2)
                     procs[1].kill()
                     procs[1].wait()
@@ -1243,7 +1244,20 @@ def main():
               len(after) >= 12 * (1 + len(extra_logs)), f"{len(after)} matching checks after frame {closed}")
         check("no drift reported at all (during the shop or after it)", not differs, differs[:3])
         check("no re-sync", RESYNC_IN_SHOP or "host: re-sync (" not in host, re.findall(r"host: re-sync \(.*", host)[:1])
-    if LEAVE_IN_SHOP:
+    if LEAVE_IN_SHOP and scenario == "talk":
+        # The talker is gone in the middle of a held conversation: the host ends it for everyone (CloseAbandonedTalks).
+        check("the talking joiner's game was killed during its conversation", killed_in_shop is not None)
+        gone = re.search(r"co-op: .* left during their conversation with NPC (\d+): it ends for everyone", host)
+        check("the host ended the gone talker's conversation for everyone", bool(gone), gone.group(0) if gone else "")
+        npc = gone.group(1) if gone else "?"
+        after = host[gone.end():] if gone else ""
+        check("the host's NPC is free again and its game goes on", f"co-op: NPC {npc} is free again" in after
+              and re.search(r"SNAP s=\d+ f=\d+", after) is not None)
+        if extra_logs:
+            other = extra_logs[0]
+            check("the other joiner's NPC is free again and its game goes on",
+                  f"co-op: NPC {npc} is free again" in other and re.search(r"SNAP s=\d+ f=\d+", other.split(f"NPC {npc} is free again", 1)[-1]) is not None)
+    elif LEAVE_IN_SHOP:
         # The shopper is gone with its shop open on the others: the host closes it for everyone (CloseAbandonedShop),
         # and the copies left go on together.
         check("the trading joiner's game was killed during its shop", killed_in_shop is not None)

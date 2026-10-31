@@ -1,0 +1,6 @@
+   10.000 co-op: quartermaster stock at the session start: 24 kinds, 1783 items, hash 1a1779e0
+   10.000 session 1 started (co-op lobby)
+   40.000 co-op: shop of NPC 96 open for this player at frame 2309
+   60.797 co-op: shop closed at frame 2597 (ours)
+   61.000 co-op: drift: Player2's game matches ours (31 checks, last at frame 2600, generation 1)
+  120.000 notice: Co-op: Player2 left

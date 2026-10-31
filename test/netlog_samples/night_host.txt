@@ -1,0 +1,22 @@
+    0.000 co-op: barter hook ok, shop close hook ok
+  374.375 co-op: shop of NPC 96 open for this player at frame 26183
+  377.453 co-op: drift: Player3's game differs from ours at frame 26225 (generation 4): free list, inventories, entities
+  388.813 co-op: the light conversation is over: pause changes go through again (balance 1, NOT ZERO)
+  414.891 session 5 started (co-op lobby)
+  660.406 session 9 started (alone)
+  660.422 host: re-sync (session started without a co-op lobby): quick-save
+  674.344 session 10 started (co-op lobby)
+  676.016 co-op: drift: Player2's game differs from ours at frame 75 (generation 9): free list
+  677.906 co-op: drift: Player2's game differs from ours at frame 100 (generation 9): free list
+  677.969 co-op: drift: asking every copy to hold for a correction (free list) at frame 103
+  678.047 co-op: drift: Player3's game differs from ours at frame 100 (generation 9): free list
+  678.110 notice: Co-op: Player3's game drifted out of step - saving and reloading to bring everyone back together
+  678.110 host: re-sync (Player3's game drifted out of step): quick-save
+ 1050.063 co-op: shop of NPC 99 open for this player at frame 1645
+ 1054.828 co-op: shop closed at frame 1713 (the others' deal applied here)
+ 1055.719 co-op: drift: Player2's game differs from ours at frame 1725 (generation 14): free list, inventories, entities
+ 1057.485 host: re-sync (Player2's game drifted out of step): quick-save
+ 1100.000 co-op: shop of NPC 96 open for another player at frame 2000: stock made here without a window (29 items)
+ 1105.000 notice: Co-op: Player2 left
+ 1200.000 co-op: quartermaster stock at the session start: 24 kinds, 1783 items, hash 1a1779e0
+ 1200.000 session 20 started (co-op lobby)

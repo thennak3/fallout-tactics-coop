@@ -1,0 +1,6 @@
+   73.562 session 1 started
+   81.656 co-op: shop of NPC 96 open for another player at frame 28395: stock made here without a window (0 items)
+  296.609 co-op: drift: holding after frame 105 for the host's correction
+  305.609 co-op: drift: going on (waited too long for the correction, held 9000 ms)
+ 1180.000 co-op: quartermaster stock at the session start: 0 kinds, 0 items, hash 811c9dc5
+ 1180.000 session 20 started

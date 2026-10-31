@@ -71,13 +71,13 @@ Result Run(const Scenario& sc, bool mutated) {
             if (sc.back_after) back_at = t + sc.back_after;
         }
         if (f > 0 && f % drift::kEvery == 0) {
-            drift::Rec host = {gen, f, uint32_t(f * 7), uint32_t(f * 11), uint32_t(f * 13), uint32_t(f * 17), 1, shop};
+            drift::Rec host = {gen, f, uint32_t(f * 7), uint32_t(f * 11), uint32_t(f * 13), uint32_t(f * 17), 1, 0, shop};
             if (shop) host.table ^= 1, host.used ^= 1, host.inv ^= 1;  // the shop's stock and offers, the shopper's only
             ring[ring_next] = host;
             ring_next = (ring_next + 1) % 8;
             for (int i = 0; i < sc.joiners; i++) {
                 drift::Rec j = {gen, f, uint32_t(f * 7), uint32_t(f * 11) ^ copies[i].table, uint32_t(f * 13) ^ copies[i].used,
-                                uint32_t(f * 17) ^ copies[i].inv, 1, false};
+                                uint32_t(f * 17) ^ copies[i].inv, 1, 0, false};
                 pending.push_back({t + copies[i].delay, i, j});
             }
         }

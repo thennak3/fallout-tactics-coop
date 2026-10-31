@@ -1688,6 +1688,9 @@ void SendTalkClaim(void* client, const uint8_t* msg, int len) {
         r[3] = kTalkClaim;
         memcpy(r + 5, &npc, 2);
         memcpy(r + 7, &g_my_claim, 4);
+        extern unsigned g_joiner_id;
+        uint32_t owner = g_coop_join ? g_joiner_id : 0;  // who talks: the host closes it if this player goes
+        memcpy(r + 11, &owner, 4);
         reinterpret_cast<void(__thiscall*)(void*, void*, int, int)>(kClientSend)(client, m, sizeof(m), 1);
         Log("co-op: claim %08x sent for NPC %u", g_my_claim, npc);
         return;
@@ -1695,6 +1698,7 @@ void SendTalkClaim(void* client, const uint8_t* msg, int len) {
 }
 
 void QueueFrameDelta(uint8_t kind, bool ok, bool mine, const uint8_t* data, int len);  // shop_sync.inc
+void NoteTalkOwner(uint16_t npc, const uint8_t* owner_bytes);  // below
 void CoopCommandAtFrame(const uint8_t* r);                                              // shop_sync.inc
 
 void ReleaseFixHold(const char* why);  // drift.inc
@@ -1712,6 +1716,7 @@ void HandleCoopCommand(const uint8_t* r) {
     if (kind == kTalkClaim) {
         uint32_t claim;
         memcpy(&claim, r + 7, 4);
+        if (g_coop_host) NoteTalkOwner(npc, r + 11);
         g_claim_npc = npc;
         g_claim_mine = claim == g_my_claim && npc == g_my_claim_npc;
         g_claim_tick = GetTickCount();
@@ -2017,16 +2022,42 @@ bool RefuseLockedTalk(uint8_t* msg, int len) {
 
 // Host, server receive: two players talking to the same NPC at the same moment. The first talk relayed wins until
 // its talker's kSyncDone comes through; a talk from anyone else to that NPC is dropped from the message.
-struct HostLock { uint16_t npc; int sender; DWORD since; };
-HostLock g_host_locks[16];
+talk::HostLocks g_host_locks;  // talk_locks.h
+
+// Host: who each claimed NPC's talker is (its joiner id, 0 the host), from the claim. A talker that leaves (or is lost)
+// in the middle of a conversation never sends its kSyncDone: every copy kept the NPC locked and held its game for it
+// for 10 minutes (the fuzzer, test/fuzz: a joiner talked to a story NPC and left). The host sends that done for it.
+struct TalkOwner { uint16_t npc; uint32_t owner; };
+TalkOwner g_talk_owners[16];
+
+void NoteTalkOwner(uint16_t npc, const uint8_t* owner_bytes) {
+    uint32_t owner;
+    memcpy(&owner, owner_bytes, 4);
+    TalkOwner* slot = nullptr;
+    for (auto& t : g_talk_owners)
+        if (t.npc == npc || (!slot && !t.npc)) slot = &t;
+    if (slot) slot->npc = npc, slot->owner = owner;
+}
+
+void CloseAbandonedTalks(unsigned joiner, const char* who) {  // host, main thread: that joiner is gone
+    for (auto& t : g_talk_owners) {
+        if (!t.npc || t.owner != joiner) continue;
+        uint16_t npc = t.npc;
+        t.npc = 0;
+        if (!g_host_locks.Held(npc, GetTickCount())) continue;  // that conversation is over
+        g_host_locks.Free(npc);
+        uint8_t r[27];
+        CoopRecord(r, kSyncDone, 0);
+        memcpy(r + 5, &npc, 2);
+        r[7] = kDiffNone;  // nothing to apply: every copy frees the NPC and stops waiting, on arrival
+        SendCoopRecords(reinterpret_cast<const uint8_t(*)[27]>(r), 1);
+        Log("co-op: %s left during their conversation with NPC %u: it ends for everyone", who, npc);
+        Notice("Co-op: %s left in the middle of a conversation - the game goes on", who);
+    }
+}
 
 void ClearHostLocks() {
-    int n = 0;
-    for (auto& l : g_host_locks)
-        if (l.npc) {
-            n++;
-            l.npc = 0;
-        }
+    int n = g_host_locks.Clear();
     if (n) Log("host: new session: %d talk lock(s) cleared", n);
 }
 
@@ -2038,31 +2069,17 @@ int HostFilterTalks(uint8_t* msg, int len, int sender) {
         uint16_t npc;
         memcpy(&npc, r + 5, 2);
         if (r[0] == kCoopCmd && r[3] == kSyncDone) {
-            for (auto& l : g_host_locks)
-                if (l.npc == npc && l.sender == sender) l.npc = 0;
+            g_host_locks.Done(npc, sender);
         } else if (r[0] == 0x17 || (r[0] == kCoopCmd && r[3] == kTalkClaim)) {
-            HostLock* held = nullptr;
-            for (auto& l : g_host_locks)
-                if (l.npc == npc && GetTickCount() - l.since < kLockMaxMs) held = &l;
-            if (held && held->sender != sender) {
+            int holder = -1;
+            if (!g_host_locks.Pass(npc, sender, GetTickCount(), &holder)) {
                 Log("host: dropped player %d's %s NPC %u: player %d is talking to them", sender,
-                    r[0] == 0x17 ? "talk to" : "claim on", npc, held->sender);
+                    r[0] == 0x17 ? "talk to" : "claim on", npc, holder);
                 memmove(r, r + 27, len - (r + 27 - msg));
                 len -= 27;
                 count--;
                 *reinterpret_cast<uint16_t*>(msg + 4) = static_cast<uint16_t>(count);
                 continue;
-            }
-            if (!held)
-                for (auto& l : g_host_locks)
-                    if (!l.npc || GetTickCount() - l.since >= kLockMaxMs) {
-                        held = &l;
-                        break;
-                    }
-            if (held) {
-                held->npc = npc;
-                held->sender = sender;
-                held->since = GetTickCount();
             }
         }
         i++;
