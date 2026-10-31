@@ -117,13 +117,12 @@ void SettingsAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, every copy, the
 // frame, and every load was followed by a drift check failing on the free list's hash and a correction, or, with two
 // joiners reporting it, a reload. At the start of every session every copy takes one number at the same frame: the
 // host's own, well past anything any copy has handed out yet.
-const uint32_t kSerialMargin = 0x100000;
 
 void SendSerial() {
     if (g_test.enabled && g_test.no_serial_sync) return;  // mutation: each copy keeps its own count (0.10.5)
     uint8_t rec[1][27];
     CoopRecord(rec[0], kSerialSync, 0);
-    uint32_t v = *reinterpret_cast<uint32_t*>(kEntitySerial) + kSerialMargin;
+    uint32_t v = session::SessionSerial(*reinterpret_cast<uint32_t*>(kEntitySerial));
     memcpy(rec[0] + 7, &v, 4);
     SendCoopRecords(rec, 1);
 }
@@ -141,8 +140,7 @@ void SerialAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, every copy, the s
 // joiner made every one of the host's quartermaster shops with 0 items, its free list and inventories went their own
 // way from there, and on its screen the quartermaster had nothing to sell), so at the start of every session the
 // host sends its list and every copy puts it in at the same frame: "name<TAB>count<LF>..." in kStockSync records of
-// 20 bytes each ([4] index, [5] count of records).
-const int kStockChunk = 20;
+// 20 bytes each (session_sync.h).
 void LogStockSummary(const char* when);  // shop_sync.inc
 
 int StockText(char* out, int cap) {
@@ -163,34 +161,27 @@ int StockText(char* out, int cap) {
 }
 
 void SendStock() {
-    static char text[255 * kStockChunk + 1];
+    static char text[session::kStockMaxText + 1];
     int n = StockText(text, sizeof(text));
     if (n < 0) {
-        Log("co-op: the quartermaster stock list is too long to send (more than %d bytes)", 255 * kStockChunk);
+        Log("co-op: the quartermaster stock list is too long to send (more than %d bytes)", session::kStockMaxText);
         return;
     }
-    int chunks = n / kStockChunk + 1;  // the last one ends with the text's 0
-    static uint8_t recs[255][27];
+    int chunks = session::StockChunks(n);
+    static uint8_t recs[session::kStockMaxChunks][27];
     for (int i = 0; i < chunks; i++) {
         CoopRecord(recs[i], kStockSync, static_cast<uint8_t>(i));
         recs[i][5] = static_cast<uint8_t>(chunks);
-        int len = min(kStockChunk, n + 1 - i * kStockChunk);
-        memcpy(recs[i] + 7, text + i * kStockChunk, len);
+        session::StockChunk(text, n, i, recs[i] + 7);
     }
     SendCoopRecords(recs, chunks);
 }
 
 void StockAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, every copy, the same frame
-    static char text[255 * kStockChunk + 1];
-    static int got = 0;
-    int i = r[4], chunks = r[5];
-    if (i == 0) got = 0;
-    if (i != got || chunks == 0) return;  // a record lost or out of order: this session keeps its own list
-    memcpy(text + i * kStockChunk, r + 7, kStockChunk);
-    if (++got < chunks) return;
-    text[chunks * kStockChunk] = 0;
-    static char mine[255 * kStockChunk + 1];
-    if (StockText(mine, sizeof(mine)) >= 0 && strcmp(mine, text) == 0) {
+    static session::StockAssembler in;
+    if (!in.Feed(r[4], r[5], r + 7)) return;
+    static char mine[session::kStockMaxText + 1];
+    if (StockText(mine, sizeof(mine)) >= 0 && strcmp(mine, in.text) == 0) {
         LogStockSummary("is the host's");
         return;
     }
@@ -203,17 +194,12 @@ void StockAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, every copy, the sa
         campaign + 0x14d, *reinterpret_cast<void**>(campaign + 0x151), *reinterpret_cast<void**>(campaign + 0x155));
     reinterpret_cast<void(__thiscall*)(void*, void*, void*)>(0x458760)(
         campaign + 0x15d, *reinterpret_cast<void**>(campaign + 0x161), *reinterpret_cast<void**>(campaign + 0x165));
-    for (char* line = text; *line;) {
-        char* tab = strchr(line, '\t');
-        char* end = strchr(line, '\n');
-        if (!tab || !end || tab > end) break;
-        *tab = 0;
+    session::ForEachStockLine(in.text, [campaign](const char* name_text, int count) {
         void* name = nullptr;  // the game's string, made from the name (0x6c8bf0: thiscall(str*, const char*, max))
-        reinterpret_cast<void(__thiscall*)(void**, const char*, int)>(0x6c8bf0)(&name, line, 0x7fffffff);
+        reinterpret_cast<void(__thiscall*)(void**, const char*, int)>(0x6c8bf0)(&name, name_text, 0x7fffffff);
         // kept: the list holds its own reference; one string per entry per session is all this leaks
-        reinterpret_cast<void(__thiscall*)(void*, void**, int)>(0x6a6550)(campaign, &name, atoi(tab + 1));
-        line = end + 1;
-    }
+        reinterpret_cast<void(__thiscall*)(void*, void**, int)>(0x6a6550)(campaign, &name, count);
+    });
     LogStockSummary("now the host's");
 }
 

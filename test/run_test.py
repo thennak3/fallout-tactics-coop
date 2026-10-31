@@ -105,6 +105,7 @@ CHAOS_NO_SELECT = False  # --chaos-no-select: the chaos bots never change their 
 MERCHANT = 0  # --merchant N: trades with this NPC (bunker: 349 the mechanic barters and gambles, 104/274/288 barter)
 GAMBLE = False  # --gamble: trades: Gamble instead of Barter
 NO_SERIAL_SYNC = False  # --no-serial-sync: mutation, the host sends no entity serial at session start (0.10.5)
+LEAVE_IN_SHOP = False  # --leave-in-shop: trade_join: the trading joiner's game is killed 2 s into its shop
 RESYNC_IN_SHOP = False  # --resync-in-shop: trades: the host asks for a re-sync 3 s into its own shop
 EMPTY_STOCK = False  # --empty-stock: every joiner's quartermaster stock emptied at each session start
 SERIAL_SKEW = 0  # --serial-skew N: every joiner's entity serial counter N ahead at each session start
@@ -234,6 +235,7 @@ def main():
     ap.add_argument("--merchant", type=int, default=0, help="trades: the trader's NPC id (default the quartermaster, 96)")
     ap.add_argument("--gamble", action="store_true", help="trades: Gamble instead of Barter")
     ap.add_argument("--no-serial-sync", action="store_true", help="mutation: the host sends no entity serial at session start")
+    ap.add_argument("--leave-in-shop", action="store_true", help="trade_join: kill the trading joiner's game 2 s into its shop")
     ap.add_argument("--resync-in-shop", action="store_true", help="trades: the host asks for a re-sync 3 s into its own shop")
     ap.add_argument("--empty-stock", action="store_true", help="joiners' quartermaster stock emptied at each session start")
     ap.add_argument("--serial-skew", type=int, default=0, help="joiners' entity serial counters this far ahead at each session start")
@@ -252,6 +254,8 @@ def main():
     MERCHANT = args.merchant
     GAMBLE = args.gamble
     RESYNC_IN_SHOP = args.resync_in_shop
+    global LEAVE_IN_SHOP
+    LEAVE_IN_SHOP = args.leave_in_shop
     EMPTY_STOCK = args.empty_stock
     SERIAL_SKEW = args.serial_skew
     HOST_IP = args.host_ip
@@ -279,6 +283,11 @@ def main():
     def check(name, ok, detail=""):
         if RESYNC_IN_SHOP and name.startswith("no reload"):  # the test's own re-sync, asked for on purpose
             name, ok, detail = name + " (not checked: --resync-in-shop reloads on purpose)", True, ""
+        if LEAVE_IN_SHOP and any(name.startswith(p) for p in (
+                "both copies exited cleanly", "the trader's", "the shopper's own pauses", "the other copy set the same quest",
+                "barter closed", "the delta went through", "the other copy applied the delta", "the other copy created",
+                "at least 4 shared frames after the delta", "joiner 2: applied the delta")):
+            name, ok, detail = name + " (not checked: --leave-in-shop kills the trader before its deal)", True, ""
         if GAMBLE and name.startswith("the shopper's own pauses were swallowed and balanced"):
             # Gamble switches from the conversation straight to the gamble screen (0x4d0090: SetMode 7): the game pauses
             # twice and resumes once. Swallowed, the world's own counter never moved (the checks after the close ran).
@@ -361,8 +370,17 @@ def main():
             time.sleep(2)
             procs.append(subprocess.Popen([os.path.join(d, "BOS.exe")], cwd=d))
         deadline = time.time() + args.timeout + 30 + 2 * len(extras)
+        killed_in_shop = None
         while time.time() < deadline and any(p.poll() is None for p in procs):
             time.sleep(1)
+            if LEAVE_IN_SHOP and killed_in_shop is None and procs[1].poll() is None:
+                # the trading joiner's game goes away mid-shop (a crash, a lost connection, alt-F4)
+                trader_log = read(os.path.join(JOIN_DIR, "netlog.txt"))
+                if re.search(r"co-op: (shop|gamble) of NPC \d+ open for this player", trader_log):
+                    time.sleep(2)
+                    procs[1].kill()
+                    procs[1].wait()
+                    killed_in_shop = time.time()
         codes = []
         for p in procs:
             if p.poll() is None:
@@ -1225,6 +1243,19 @@ def main():
               len(after) >= 12 * (1 + len(extra_logs)), f"{len(after)} matching checks after frame {closed}")
         check("no drift reported at all (during the shop or after it)", not differs, differs[:3])
         check("no re-sync", RESYNC_IN_SHOP or "host: re-sync (" not in host, re.findall(r"host: re-sync \(.*", host)[:1])
+    if LEAVE_IN_SHOP:
+        # The shopper is gone with its shop open on the others: the host closes it for everyone (CloseAbandonedShop),
+        # and the copies left go on together.
+        check("the trading joiner's game was killed during its shop", killed_in_shop is not None)
+        gone = re.search(r"co-op: .* left during their shop of NPC \d+: it closes for everyone", host)
+        check("the host closed the gone shopper's shop for everyone", bool(gone), gone.group(0) if gone else "")
+        after = host[gone.end():] if gone else ""
+        check("the shop closed on the host after that", "co-op: shop closed at frame" in after)
+        if extra_logs:
+            check("the shop closed on the other joiner too", "co-op: shop closed at frame" in extra_logs[0].split("left in the middle of trading", 1)[-1]
+                  or "co-op: shop closed at frame" in extra_logs[0])
+        diffs = re.findall(r"co-op: drift: .*differs from ours at frame (\d+)", after)
+        check("no drift reported after the shop closed", not diffs, diffs[:3])
     if RESYNC_IN_SHOP:
         # The save waits for the shop: asked for during it, written only once it closed, and every copy has the same
         # quartermaster stock in the reloaded session.

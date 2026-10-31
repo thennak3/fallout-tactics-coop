@@ -15,6 +15,7 @@ struct ShopState {
     bool open, mine;
     uint32_t buyer, merchant;  // EntityIDs
     uint32_t orig_inventory;   // the merchant's own inventory, back at close
+    uint32_t owner;            // the shopper's joiner id (0: the host's shop)
 };
 ShopState g_shop = {};
 
@@ -263,6 +264,9 @@ void ShopButton(uint8_t* speech, void* button, bool gamble) {
     memcpy(r + 11, &merchant, 4);
     memcpy(r + 15, &g_my_claim, 4);
     r[19] = gamble ? 1 : 0;
+    extern unsigned g_joiner_id;
+    uint32_t owner = g_coop_join ? g_joiner_id : 0;
+    memcpy(r + 20, &owner, 4);
     SendCoopRecords(reinterpret_cast<const uint8_t(*)[27]>(r), 1);
     g_shop_requested = true;
     g_shop_gamble = gamble;
@@ -270,6 +274,23 @@ void ShopButton(uint8_t* speech, void* button, bool gamble) {
     g_shop_button = button;
     Log("co-op: %s pressed: shop of NPC %u for squad member %u goes out (claim %08x)", gamble ? "Gamble" : "Barter",
         SlotOf(merchant), SlotOf(buyer), g_my_claim);
+}
+
+// Host: the shopper is gone (left, or lost) with its shop open on the other copies: no window there, but the stock
+// made without one, the merchant's lock and every item move waiting for the close (HoldForShop). Nothing would ever
+// close it, and a re-sync then waited for it (the fuzzer, test/fuzz: a joiner asked for a shop and left). An empty
+// close goes out instead of its deal: every copy closes the shop at its frame, without the gone player's purchases.
+void CloseAbandonedShop(const char* who) {
+    if (!g_coop_host || !g_shop.open || g_shop.mine || !g_shop.owner || g_shop_close_waits) return;
+    uint8_t r[27];
+    CoopRecord(r, kShopClose, 0);
+    r[7] = kDiffNone;
+    r[8] = 4;  // at its frame, as a deal's close
+    SendCoopRecords(reinterpret_cast<const uint8_t(*)[27]>(r), 1);
+    Log("co-op: %s left during their shop of NPC %u: it closes for everyone, without their purchases", who,
+        SlotOf(g_shop.merchant));
+    Notice("Co-op: %s left in the middle of trading - the shop is closed", who);
+    g_shop.owner = 0;  // sent once
 }
 
 void __fastcall BarterButtonHook(uint8_t* speech, void* /*edx*/, void* button) { ShopButton(speech, button, false); }
@@ -287,6 +308,7 @@ void ExecuteShopOpen(const uint8_t* r) {
     g_shop_hold = true;  // item moves wait from this frame (RunHeldCommands)
     g_shop.buyer = buyer;
     g_shop.merchant = merchant;
+    memcpy(&g_shop.owner, r + 20, 4);
     g_shop.mine = g_shop_requested && claim && claim == g_my_claim;
     int frame = *reinterpret_cast<int*>(world + kWorldFrame);
     bool gamble = r[19] != 0;
@@ -536,6 +558,7 @@ bool g_shop_hold = false;  // from a shop's open frame until its held commands r
 // changes the others get only at the close.
 bool ShopBusy() { return g_shop.open || g_shop_close_waits || g_shop_hold; }
 bool MyShopOpen() { return g_shop.open && g_shop.mine; }
+uint32_t OpenShopOwner() { return g_shop.open && !g_shop.mine ? g_shop.owner : 0; }
 
 bool MakesOrDestroysEntities(uint8_t c) {  // use, drop, equip, unequip, give, take one stack, take all
     return c == 0x04 || c == 0x05 || c == 0x06 || c == 0x07 || c == 0x13 || c == 0x14 || c == 0x15;

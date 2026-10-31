@@ -703,7 +703,6 @@ void LocalServerTicksToFrame() {
 }
 
 bool ShopBusy();  // shop_sync.inc
-const DWORD kResyncShopWaitMs = 120000;
 bool g_resync_now = false;  // test (shopresync): this re-sync goes ahead with a shop open, as one after the wait does
 
 void HostResyncStep() {
@@ -712,16 +711,19 @@ void HostResyncStep() {
     if (!game_main || *reinterpret_cast<uintptr_t*>(game_main) != kGameMainVtable) return;
     static int waited = 0;
     static DWORD shop_wait = 0;
-    if (g_resync_state == 1 && ShopBusy() && !g_resync_now) {
-        // The save waits for the shop to close: saved meanwhile, the merchant's own inventory is put aside for the
-        // shop's stock (the owner's night: a re-sync quick-saved while the host's shop closed, and the merchant had
-        // nothing left after). A player's shop may stay open for a long time, so not for ever.
-        if (!shop_wait) {
-            shop_wait = GetTickCount();
-            Log("host: re-sync (%s): waiting for the shop to close", g_resync_reason);
+    if (g_resync_state == 1) {
+        // The save waits for the shop to close (session_sync.h; the owner's night: a re-sync quick-saved while the
+        // host's shop closed, and the merchant had nothing left after).
+        session::Gate gate = session::ResyncGate(ShopBusy(), g_resync_now, shop_wait ? GetTickCount() - shop_wait : 0);
+        if (gate == session::Gate::Wait) {
+            if (!shop_wait) {
+                shop_wait = GetTickCount();
+                Log("host: re-sync (%s): waiting for the shop to close", g_resync_reason);
+            }
+            return;
         }
-        if (GetTickCount() - shop_wait < kResyncShopWaitMs) return;
-        Log("host: re-sync: the shop is still open after %lu s: saving anyway", kResyncShopWaitMs / 1000);
+        if (gate == session::Gate::SaveAfterWaiting)
+            Log("host: re-sync: the shop is still open after %lu s: saving anyway", session::kResyncShopWaitMs / 1000);
     }
     if (g_resync_state == 1) {
         shop_wait = 0;
@@ -890,16 +892,32 @@ void ShowQueuedNotices(uint8_t* client) {  // main thread, in a mission
 }
 
 // Host, main thread: notice joiners whose polls stopped (left or lost), once each.
+bool JoinerLive(unsigned id) {  // host, main thread
+    bool live = false;
+    EnterCriticalSection(&g_serve_lock);
+    for (int i = 0; i < g_joiner_count; i++)
+        if (g_joiners[i].id == id) live = GetTickCount() - g_joiners[i].last_seen <= kJoinerTimeoutMs;
+    LeaveCriticalSection(&g_serve_lock);
+    return live;
+}
+
+void CloseAbandonedShop(const char* who);  // shop_sync.inc
+uint32_t OpenShopOwner();                  // shop_sync.inc
+
 void NoticeLeftJoiners() {
     static bool was_live[8] = {};
+    char gone[32] = "";
+    uint32_t owner = OpenShopOwner();
     EnterCriticalSection(&g_serve_lock);
     DWORD now = GetTickCount();
     for (int i = 0; i < g_joiner_count; i++) {
         bool live = now - g_joiners[i].last_seen <= kJoinerTimeoutMs;
         if (was_live[i] && !live) Notice("Co-op: %s left", g_joiners[i].name);
+        if (owner && g_joiners[i].id == owner && !live) strcpy_s(gone, g_joiners[i].name);  // even gone before it opened
         was_live[i] = live;
     }
     LeaveCriticalSection(&g_serve_lock);
+    if (gone[0]) CloseAbandonedShop(gone);
 }
 
 // Runtime roles, chosen in the Multiplayer menu (or by ftcoop.ini [coop] mode= for the tests).

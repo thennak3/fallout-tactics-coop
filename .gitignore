@@ -13,3 +13,5 @@ __pycache__/
 *.log
 test/sim/*.exe
 test/sim/*.obj
+test/fuzz/build/
+test/fuzz/out/
