@@ -96,6 +96,9 @@ Checked by the automated tests in `test/`:
   save-and-reload). A save-and-reload asked for during a shop waits until it closes.
 - No drift after loads between copies that have been running for a long time, and one correction (no reload) when
   several joiners report the same drift at once (in 0.10.5 and earlier, everyone could wait 10 s and then reload).
+- A player who leaves (or loses their connection) in the middle of trading: the shop closes for everyone else, without
+  their purchases, and the merchant and item moves are free again (in 0.10.7 and earlier the shop stayed open on the
+  other games until the next reload).
 - Every trader pauses nobody, as the quartermaster: those who barter, and those who gamble too (the mechanic). A
   gamble's result reaches everyone as a trade's does (tested with the mechanic, the host and a joiner gambling).
 - The selection dots, with 2 and 4 players.
@@ -161,6 +164,10 @@ python -I test/run_test.py trade_host --empty-stock --hold-frames 10   # a joine
 python -I test/run_test.py chaos --save user/save/containers.sav --hold-frames 2000
 python -I test/run_suite.py                            # every test (slow)
 ```
+
+`python -I test/fuzz/run_fuzz.py` fuzzes the sync decisions on a fake world (the hub's fuzzer, coop-anything
+`tools/fuzz`): random 2 to 4 player sessions with desyncs forced on purpose, plus fixed fixtures, and every bug fixed
+so far switched back on to show it is caught. No game needed; 2000 sessions take a few minutes.
 
 `test\sim\run_sim.bat` runs the drift check's decisions (`src/drift_judge.h`) against simulated copies, without the
 game, in under a second.
