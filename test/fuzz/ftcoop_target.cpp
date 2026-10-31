@@ -696,10 +696,6 @@ private:
         return d.empty() ? "" : ":" + d;
     }
 
-    // At the host's decision, from the drift that led to it (the joiner and frame of its second differing check): needless if
-    // that check came from a shop's frames (the shopper's own split stack and purchase are its alone then), or if that
-    // copy is the same as the host again by now (a correction mended it). A copy inside a shop's frames now can't be
-    // judged: taken as apart.
     std::string DriftDiff() const {  // what really differed at the drift's frame, and whether that frame was a shop's
         if (drift_from_ < 0) return "";
         auto h = host_frames_.find(drift_frame_);
@@ -746,25 +742,16 @@ private:
         return " [" + what + ", since frame " + std::to_string(since) + "]";
     }
 
+    // At the host's decision, from the drift that led to it (the joiner and frame of its second differing check):
+    // needless when its evidence was bad: a check from a shop's frames (the shopper's own split stack and purchase are
+    // its alone then), or a report older than the correction already under way, of what a correction mends (the
+    // owner's night: the second joiner's report reloaded everyone). Something else mending the copy while the host
+    // waited (a shop's deal, a second fault undoing the first) is not the decision's fault: the host can't know.
     bool RepairNeeded(uint8_t kinds) const {
         if (drift_from_ < 0) return true;
-        // A report older than the correction already under way, of what a correction mends: that correction mends it
-        // (the owner's night: the second joiner's report reloaded everyone).
         if (fix_gen_seen_ == gen_ && drift_frame_ <= fix_start_frame_ && !(kinds & drift::kEntities)) return false;
-        const Copy& c = copies_[drift_from_];
         auto h = host_frames_.find(drift_frame_);
-        auto j = c.frames.find(drift_frame_);
-        if (h != host_frames_.end() && h->second.shop) return false;
-        if (h != host_frames_.end() && j != c.frames.end()) {
-            Hashes mine = j->second;
-            mine.stock = h->second.stock, mine.shop = h->second.shop;  // a drift check never looks at the stock
-            if (mine == h->second) return false;
-        }
-        auto now = host_frames_.find(c.frame);
-        if (!c.connected || c.loading || c.shop || now == host_frames_.end() || now->second.shop) return true;
-        Hashes mine = HashesOf(c.w, false);
-        mine.stock = now->second.stock;
-        return !(mine == now->second);
+        return h == host_frames_.end() || !h->second.shop;
     }
 
     void Step() {
