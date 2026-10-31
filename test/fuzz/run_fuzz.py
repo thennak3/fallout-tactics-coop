@@ -41,6 +41,11 @@ TWINS = {
     "no_lock_clear": "lock_leak",             # 0.10.3: an NPC stays locked after a reload
     "no_solo_release": "stuck",               # 0.10.5: a host on its own can't move after its conversation
     "no_abandoned_talk": "waits_for_gone",    # a talker that left: its NPC locked and everyone waiting
+    "save_alone": "apart_after_save",         # 0.10.2: a save written on the saver's copy only
+    "no_abandoned_save": "waits_for_gone",    # a saver that left mid-save: everyone holds for 10 minutes
+    "no_early_save_done": "save_hold_stuck",  # a done before a lagging copy's hold frame was dropped: held 10 minutes
+    "no_gone_saver_at_hold": "waits_for_gone",  # a saver gone before its hold acted: nobody ends the hold
+    "no_cancel_mark": "waits_for_gone",       # a talk relayed before its talker left reaches its frame afterwards
 }
 # Fixtures: one exact situation each, written out and replayed over 20 seeds (the seed decides latencies and the joiners'
 # poll clocks). Clean, every seed must pass; with its twin, at least one seed must break the twin's invariant. Random
@@ -74,6 +79,24 @@ FIXTURES = {
     "talker_leaves": ("no_abandoned_talk", 3, 12000, lambda: [
         {"t": quarter(500), "op": "hit", "m": 1, "a": 0, "b": 12},
         {"t": quarter(2500), "op": "leave", "m": 1}]),
+    # the host opens the save screen: every copy holds at one frame and writes the same save
+    "save_in_step": ("save_alone", 3, 12000, lambda: [
+        {"t": quarter(800), "op": "save", "m": 0, "a": 1, "b": 3}]),
+    # a joiner opens the save screen and leaves in the middle of it: the host ends the save for everyone, nothing saved
+    "saver_leaves": ("no_abandoned_save", 3, 12000, lambda: [
+        {"t": quarter(500), "op": "save", "m": 1, "a": 1, "b": 9},
+        {"t": quarter(2500), "op": "leave", "m": 1}]),
+    # a slow link, the host quick-saves: its done can reach a copy before that copy's hold frame
+    "save_done_early": ("no_early_save_done", 3, 45000, lambda: [
+        {"t": quarter(800), "op": "save", "m": 0, "a": 0, "b": 0}], {"maxLatencyMs": 2500}),
+    # a joiner talks to a story NPC and leaves a moment later: the talk reaches its frame after the talker is gone
+    "talk_then_leave": ("no_cancel_mark", 3, 20000, lambda: [
+        {"t": quarter(800), "op": "hit", "m": 1, "a": 0, "b": 5},
+        {"t": quarter(quarter(800) + 100), "op": "leave", "m": 1}]),
+    # a joiner asks to save and leaves before the hold acts (a slow link: the host has the ask, the frame is later)
+    "saver_leaves_before_hold": ("no_gone_saver_at_hold", 3, 15000, lambda: [
+        {"t": quarter(500), "op": "save", "m": 1, "a": 1, "b": 3},
+        {"t": quarter(quarter(500) + 130), "op": "leave", "m": 1}], {"minLatencyMs": 100, "maxLatencyMs": 100}),
     # a joiner opens a shop for 10 s and leaves in the middle of it
     "shopper_leaves": ("no_abandoned_close", 3, 9000, lambda: [
         {"t": quarter(500), "op": "activate", "m": 1, "a": 0, "b": 9},
@@ -87,7 +110,7 @@ def run_fixtures(exe, only=None):
     caught_by_fixture = set()
     folder = os.path.join(OUT, "fixtures")
     os.makedirs(folder, exist_ok=True)
-    for name, (twin, machines, duration, ops) in FIXTURES.items():
+    for name, (twin, machines, duration, ops, *extra) in FIXTURES.items():
         if only and twin not in only:
             continue
         results = {}
@@ -96,7 +119,8 @@ def run_fixtures(exe, only=None):
             for seed in range(1, 21):
                 ops_ = [dict({"b": 0, "c": 0, "d": 0, "a": 0}, **o) for o in ops()]
                 scen = {"format": "coopfuzz-1", "seed": seed, "machines": machines, "durationMs": duration,
-                        "link": {"minLatencyMs": 5, "maxLatencyMs": 60, "loss": 0, "duplicate": 0, "corrupt": 0},
+                        "link": dict({"minLatencyMs": 5, "maxLatencyMs": 60, "loss": 0, "duplicate": 0, "corrupt": 0},
+                                     **(extra[0] if extra else {})),
                         "target": "ftcoop", "mutations": [twin] if mutated else [], "ops": ops_}
                 path = os.path.join(folder, f"{name}{'_' + twin if mutated else ''}_seed{seed}.json")
                 with open(path, "w", encoding="utf-8") as f:

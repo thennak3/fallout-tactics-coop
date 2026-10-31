@@ -93,6 +93,13 @@ void __fastcall SaveButtonHook(void* menu, void* /*edx*/, void* button) {
     RequestSaveHold(kSaveScreen);
 }
 
+// A copy that lags can get the saver's done before its own hold frame has run (the fuzzer's report: it was dropped, and
+// that copy then held for 10 minutes). It is kept, and acts when the hold comes.
+unsigned g_save_early_saver = 0;
+bool g_save_early_shadow = false;
+DWORD g_save_early_tick = 0;
+
+void CloseAbandonedSave(unsigned joiner, const char* who);  // below
 void SaveHoldAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, the same frame on every copy
     uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
     unsigned saver;
@@ -115,6 +122,19 @@ void SaveHoldAtFrame(const uint8_t* r) {  // CoopCommandAtFrame, the same frame 
     g_save_done_due = g_save_shadow_due = false;
     g_save_hold_since = GetTickCount();
     g_save_hold_frame = *reinterpret_cast<int*>(world + kWorldFrame);
+    extern unsigned g_gone_joiners[16];
+    if (g_coop_host && saver)  // a saver that left after asking, before its hold acted: nobody else would end it
+        for (unsigned gone : g_gone_joiners)
+            if (gone == saver) {
+                Log("co-op: save: the saver of this hold is gone already: everyone goes on");
+                CloseAbandonedSave(saver, "the saver");
+                break;
+            }
+    if (!mine && g_save_early_saver == saver && GetTickCount() - g_save_early_tick < 30000) {  // its done came first
+        g_save_done_due = true;
+        g_save_shadow_due = g_save_early_shadow;
+        g_save_early_saver = 0;
+    }
     Log("co-op: save: every copy holds after frame %d (%s saves: %s)", g_save_hold_frame, mine ? "this copy" : "another copy",
         r[5] == kSaveQuick ? "a quick-save" : "the save screen");
 }
@@ -133,10 +153,29 @@ void ReleaseSaveHold(const char* why) {
 void SaveDoneArrived(const uint8_t* r) {  // HandleCoopCommand: kSaveDone, as it arrives
     unsigned saver;
     memcpy(&saver, r + 7, 4);
+    if (!g_save_hold && saver != MySaverId()) {
+        g_save_early_saver = saver, g_save_early_shadow = (r[5] & 1) != 0, g_save_early_tick = GetTickCount();
+        Log("co-op: save: the saver's done came before our hold: kept for it");
+        return;
+    }
     if (!g_save_hold || saver != g_save_saver || saver == MySaverId()) return;
     g_save_done_due = true;
     g_save_shadow_due = (r[5] & 1) != 0;
     Log("co-op: save: the saver is done (%s)", g_save_shadow_due ? "saved: our own save follows" : "nothing saved");
+}
+
+// Host, main thread: the saver is gone (left, or lost) during its save's hold. Every copy waited for its kSaveDone up
+// to kSaveHoldMaxMs, 10 minutes (the fuzzer, test/fuzz: a joiner opened the save screen and left). The host sends it
+// instead, as "nothing saved": every copy goes on, without a save, as when the saver cancels.
+void CloseAbandonedSave(unsigned joiner, const char* who) {
+    if (!g_coop_host || !g_save_hold || g_save_saver != joiner) return;
+    uint8_t rec[1][27];
+    CoopRecord(rec[0], kSaveDone, 0);
+    rec[0][5] = 0;  // nothing saved
+    memcpy(rec[0] + 7, &joiner, 4);
+    SendCoopRecords(rec, 1);
+    Log("co-op: save: %s left during their save: everyone goes on, nothing saved", who);
+    Notice("Co-op: %s left while saving - the game goes on", who);
 }
 
 // Main thread, from the application's input pump: outside the world's step, as a click is.

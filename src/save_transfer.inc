@@ -903,6 +903,7 @@ bool JoinerLive(unsigned id) {  // host, main thread
 
 void CloseAbandonedShop(const char* who);  // shop_sync.inc
 void CloseAbandonedTalks(unsigned joiner, const char* who);  // private_sync.inc
+void CloseAbandonedSave(unsigned joiner, const char* who);   // save_sync.inc
 uint32_t OpenShopOwner();                  // shop_sync.inc
 
 void NoticeLeftJoiners() {
@@ -926,7 +927,10 @@ void NoticeLeftJoiners() {
     }
     LeaveCriticalSection(&g_serve_lock);
     if (gone[0]) CloseAbandonedShop(gone);
-    for (int i = 0; i < nleft; i++) CloseAbandonedTalks(left[i], left_name[i]);
+    for (int i = 0; i < nleft; i++) {
+        CloseAbandonedTalks(left[i], left_name[i]);
+        CloseAbandonedSave(left[i], left_name[i]);
+    }
 }
 
 // Runtime roles, chosen in the Multiplayer menu (or by ftcoop.ini [coop] mode= for the tests).

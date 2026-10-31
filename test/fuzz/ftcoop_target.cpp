@@ -40,7 +40,7 @@
 // Load is the host's quick-load. heal() ends the session with one more reload, so what a session start mends is mended.
 //
 // Oracles beyond the fuzzer's own: frozen (a copy held for a correction that never came), needless_repair (a correction
-// or a drift reload while every copy was the same as the host), apart_after_load (a copy not the same as the host 10
+// or a drift reload while every copy was the same as the host), apart_after_save (a save's write on the saver's copy only), apart_after_load (a copy not the same as the host 10
 // frames into a session, with no fault since it started), saved_during_shop (a re-sync's save while a shop is open).
 //
 // Mutation twins, the bugs of 0.10.5 to 0.10.7: no_shop_skip, no_drop_before_fix, no_serial_sync, no_stock_sync,
@@ -70,9 +70,10 @@ const int kActors = 4;
 const uint32_t kPollMs = 250;
 const uint32_t kFixGiveUpMs = 8000;
 const uint32_t kLoadMs = 3000;
+const uint64_t kSaveHoldMaxMs = 600000;  // kSaveHoldMaxMs: a saver gone quiet, everyone goes on
 const int kExecDelay = 2;  // a command acts this many frames after the host has it
 
-enum CmdType : uint8_t { CMove, CGive, CShopOpen, CShopClose, CFixHold, CSerial, CStock, CJoinersApart, CTalk, CTalkDone };
+enum CmdType : uint8_t { CMove, CGive, CShopOpen, CShopClose, CFixHold, CSerial, CStock, CJoinersApart, CTalk, CTalkDone, CSaveHold };
 
 struct Cmd {
     CmdType type = CMove;
@@ -202,6 +203,7 @@ struct Copy {
     int pending_npc = 0;
     uint64_t gone_wait_since = 0;
     uint64_t stock_apart_since = 0;
+    int stock_apart_frames = 0;  // frames run while apart: the drift checks need frames, not time (a held conversation has none)
     bool gone_wait_said = false;
     bool talk_held = false;       // ... a held one: its own world waits too (g_talker_hold)
     int talk_npc = 0;
@@ -224,6 +226,24 @@ struct Copy {
     // shopper side
     uint64_t shop_close_at = 0;
     bool my_shop = false;
+    // saving in step (save_sync.inc)
+    bool save_requested = false;  // asked, the hold not acted yet
+    bool save_hold = false;       // held for a save: no frames
+    bool save_mine = false;       // this copy saves
+    int save_saver = -1;
+    int save_hold_frame = 0;
+    uint64_t save_hold_since = 0, save_done_at = 0;
+    uint64_t save_gone_since = 0;
+    bool save_gone_said = false;
+    bool save_stuck_said = false;
+    uint64_t save_done_sent = 0;  // when this copy (the saver) sent its done: the stuck oracle
+    // a saver's done that came before this copy's hold frame (g_save_early_*)
+    int early_saver = -1;
+    bool early_saved = false;
+    uint64_t early_tick = 0;
+    // NPCs whose gone talker's done came first (g_cancelled[8]), 10 s each; one_cancel_slot: only the last
+    std::vector<std::pair<int, uint64_t>> cancelled;
+    int cancelled_next = 0;
 };
 
 class FtTarget : public TargetBase {
@@ -284,7 +304,16 @@ public:
                 auto l = c.npc_lock.find(npc);
                 if (l != c.npc_lock.end() && l->second != m) {  // RefuseLockedTalk
                     Trace("copy %d's talk to NPC %d refused here: copy %d is talking to them", m, npc, l->second);
-                    if (!TalkTaken(npc))
+                    bool done_on_way = false;  // the talker's done is still on its way to this copy: it is told on arrival
+                    for (const DoneDue& d : done_due_) done_on_way |= d.m == m && d.npc == npc;
+                    // ... or its done is in the schedule, for a frame that does not run while another conversation holds the
+                    // game (a non-held talk's done acts at its frame): the click is refused until then (counted, no fault)
+                    for (auto& f : schedule_)
+                        for (const Cmd& sc : f.second) done_on_way |= sc.type == CTalkDone && sc.a == npc;
+                    for (const Delivery& dl : copies_[m].stream)  // ... or on its way to this copy in the frame stream
+                        for (const Cmd& sc : dl.cmds) done_on_way |= sc.type == CTalkDone && sc.a == npc;
+                    if (done_on_way) counters_["refused_while_done_waits"]++;
+                    if (!TalkTaken(npc) && !done_on_way)
                         Violate("refused_free_npc", "copy " + std::to_string(m) + "'s talk to NPC " + std::to_string(npc) +
                                                         " refused while nobody is talking to them");
                     break;
@@ -295,6 +324,19 @@ public:
                 c.talk_pending = true, c.pending_npc = npc;
                 counters_["op_talk"]++;
                 Trace("copy %d talks to NPC %d (%d s)", m, npc, t.c);
+                break;
+            }
+            case OpKind::Save: {  // a save: an even a is a quick-save (300 ms), else the save screen (1 to 10 s)
+                Copy& c = copies_[m];
+                if (!Quarter(op) || !c.connected || c.loading || c.save_requested || c.save_mine) break;
+                Cmd q;
+                q.type = CSaveHold, q.a = m, q.b = op.a % 2 == 0 ? 1 : 2;
+                q.c = q.b == 1 ? 300 : 1000 * (1 + op.b % 10);
+                q.value = static_cast<uint32_t>(faults_);  // faults so far: the watch ignores a save with another
+                Request(m, q);
+                c.save_requested = true;
+                counters_["op_save"]++;
+                Trace("copy %d asks to save (%s, %d ms)", m, q.b == 1 ? "quick-save" : "save screen", q.c);
                 break;
             }
             case OpKind::Spawn: {  // a forced desync on a joiner's copy
@@ -322,17 +364,26 @@ public:
                 if (Quarter(op) && m != 0 && copies_[m].connected && connectedCount() > 1) {  // down to a host alone
                     copies_[m].connected = false;
                     copies_[m].held = false;
+                    bool saver_mid_save = copies_[0].save_hold && copies_[0].save_saver == m && !copies_[0].save_mine;
+                    copies_[m].save_requested = copies_[m].save_mine = copies_[m].save_hold = false;  // the others' holds stay
+                    gone_.insert(m);
+                    if (saver_mid_save && !bugs_.count("no_abandoned_save")) {  // CloseAbandonedSave: nothing saved
+                        Trace("the host ends copy %d's save for everyone (nothing saved)", m);
+                        for (int j = 0; j < n_; j++)
+                            if (copies_[j].connected) save_done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, m, false});
+                    }
                     counters_["op_leave"]++;
                     Trace("copy %d leaves%s", m, copies_[m].my_shop ? " in the middle of its own shop" : copies_[m].shop ? " with a shop open" : "");
                     if (copies_[0].shop && copies_[0].shop_shopper == m) CloseAbandoned();
                     copies_[m].talking = copies_[m].talk_pending = copies_[m].talk_held = false;
+                    copies_[m].conv_wait = false, copies_[m].npc_lock.clear();  // a copy that comes back starts from nothing
                     if (!bugs_.count("no_abandoned_talk"))  // CloseAbandonedTalks: its NPCs' done, for everyone
                         for (int npc = 300; npc < 303; npc++)
                             if (host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_)) && TalkOwner(npc) == m) {
                                 host_locks_.Free(static_cast<uint16_t>(npc));
                                 Trace("the host ends copy %d's conversation with NPC %d for everyone", m, npc);
                                 for (int j = 0; j < n_; j++)
-                                    if (copies_[j].connected) done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, npc, m});
+                                    if (copies_[j].connected) done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, npc, m, true});
                             }
                 }
                 break;
@@ -362,11 +413,13 @@ public:
 
     bool quiescent() const override {
         if (!frozen_ || final_reload_ || reload_pending_ || loading_until_ || resync_wait_) return false;
-        if (any_shop_ || judge_.reason || fix_pending_ || host_hold_npc_ || !done_due_.empty()) return false;
+        if (any_shop_ || judge_.reason || fix_pending_ || host_hold_npc_ || !done_due_.empty() || !save_done_due_.empty()) return false;
         // Lockstep frames and polls never stop: quiet is the drift machinery idle with every copy 160 frames (six checks)
         // into the session that heal() started.
         for (const Copy& c : copies_)
-            if (c.connected && (c.held || c.loading || c.frame < 160 || c.talking || c.conv_wait || c.talk_held)) return false;
+            if (c.connected && (c.held || c.loading || c.frame < 160 || c.talking || c.conv_wait || c.talk_held ||
+                              c.save_hold || c.save_requested))
+                return false;
         return true;
     }
 
@@ -426,6 +479,7 @@ public:
             if (any_shop_) d += " shop";
             if (judge_.reason) d += " drift_reason";
             if (host_hold_npc_) d += " host_waits_for_conversation";
+            if (!save_done_due_.empty()) d += " save_done_on_its_way";
             if (fix_pending_) d += " fix_pending";
             for (int m = 0; m < n_; m++) {
                 const Copy& c = copies_[m];
@@ -437,6 +491,8 @@ public:
                 if (c.talking) d += " talking" + std::to_string(m);
                 if (c.conv_wait) d += " conv_wait" + std::to_string(m);
                 if (c.talk_held) d += " talk_held" + std::to_string(m);
+                if (c.save_hold) d += " save_hold" + std::to_string(m) + "(saver " + std::to_string(c.save_saver) + (c.save_mine ? ", mine" : "") + ")";
+                if (c.save_requested) d += " save_asked" + std::to_string(m);
             }
             v.push_back({"stuck", d + " || trace" + Recent(), now_});
         }
@@ -502,7 +558,7 @@ private:
         if (c.type == CTalkDone) host_locks_.Done(static_cast<uint16_t>(c.a), c.b);
         if (c.type == CTalkDone && Held(c.a)) {  // a held conversation's done: on arrival (nobody runs frames)
             for (int m = 0; m < n_; m++)
-                if (copies_[m].connected) done_due_.push_back({m == 0 ? now_ : now_ + Latency(), m, c.a, c.b});
+                if (copies_[m].connected) done_due_.push_back({m == 0 ? now_ : now_ + Latency(), m, c.a, c.b, false});
             return;
         }
         schedule_[copies_[0].frame + kExecDelay].push_back(c);
@@ -572,6 +628,15 @@ private:
         if (!bugs_.count("no_lock_clear")) host_locks_.Clear();
         host_hold_npc_ = 0;
         done_due_.clear();
+        save_done_due_.clear();
+        save_watches_.clear();
+        for (Copy& c : copies_) {
+            c.save_requested = c.save_hold = c.save_mine = false;
+            c.save_saver = -1;
+            c.save_gone_since = 0, c.save_gone_said = false;
+            c.save_done_sent = 0, c.early_saver = -1, c.cancelled.clear(), c.cancelled_next = 0, c.save_stuck_said = false;
+        }
+        gone_.clear();
         // What the host sends at every session's start (settings_sync.inc), acting at the same frame everywhere.
         if (!bugs_.count("no_serial_sync")) {
             Cmd c;
@@ -644,7 +709,7 @@ private:
                 if (m != 0) {  // made from this copy's own list: it must be the host's (her night: 0 items, the host's N)
                     auto hw = copies_[0].worlds.find(cp.frame - 1);   // apart 10 s or more: the drift check had time
                     if (hw != copies_[0].worlds.end() && hw->second.StockHash() != w.StockHash() && cp.stock_apart_since &&
-                        now_ - cp.stock_apart_since >= 10000)
+                        cp.stock_apart_frames >= 143)
                         Violate("shop_stock_apart", "copy " + std::to_string(m) + " makes the shop from another stock than the host's (" +
                                                         std::to_string(StockItems(w)) + " items here, " +
                                                         std::to_string(StockItems(hw->second)) + " on the host)");
@@ -715,6 +780,12 @@ private:
                 w.serial = c.value;
                 break;
             case CTalk: {
+                bool cancelled = false;
+                for (auto& e : cp.cancelled) cancelled |= e.first == c.a && now_ < e.second;
+                if (m != c.b && cancelled) {  // TalkCancelled: its talker is gone
+                    if (m == 0) Trace("copy %d's conversation with NPC %d is over already (its talker is gone)", c.b, c.a);
+                    break;
+                }
                 cp.npc_lock[c.a] = c.b;
                 if (m == c.b) cp.talk_pending = false;
                 if (m == c.b && cp.connected) {
@@ -730,6 +801,13 @@ private:
                 }
                 if (m == 0)
                     Trace("copy %d's conversation with NPC %d opens at frame %d%s", c.b, c.a, cp.frame, Held(c.a) ? " (everyone waits)" : "");
+                if (m == 0 && gone_.count(c.b) && !bugs_.count("no_cancel_mark") && TalkOwner(c.a) == c.b) {  // (a second done is harmless)  // CloseTalkOfGone
+                    host_locks_.Free(static_cast<uint16_t>(c.a));
+                    talk_owner_.erase(c.a);
+                    Trace("the talker of NPC %d is gone: the host ends its conversation at once", c.a);
+                    for (int j = 0; j < n_; j++)
+                        if (copies_[j].connected) done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, c.a, c.b, true});
+                }
                 break;
             }
             case CTalkDone:  // a trader's: at its frame
@@ -742,6 +820,37 @@ private:
                     apart_watch_ = now_, apart_gen_ = gen_;
                 }
                 break;
+            case CSaveHold:  // SaveHoldAtFrame, the same frame on every copy
+                if (cp.save_hold) {  // another save's hold acts already: this one is not served
+                    if (m == c.a && cp.save_requested) {
+                        cp.save_requested = false;
+                        Trace("copy %d: another player is saving", m);
+                    }
+                    break;
+                }
+                cp.save_hold = true;
+                cp.save_saver = c.a;
+                cp.save_mine = m == c.a && cp.save_requested;
+                if (cp.save_mine) cp.save_requested = false;
+                cp.save_hold_frame = cp.frame;
+                cp.save_hold_since = now_;
+                cp.save_gone_since = 0, cp.save_gone_said = false;
+                if (cp.save_mine) cp.save_done_at = now_ + static_cast<uint64_t>(c.c), cp.save_done_sent = 0;
+                if (m == 0) {
+                    save_watches_.push_back({gen_, cp.frame + 10, c.value});
+                    Trace("every copy holds after frame %d (copy %d saves: %s)", cp.frame, c.a, c.b == 1 ? "a quick-save" : "the save screen");
+                }
+                if (m == 0 && gone_.count(c.a) && !bugs_.count("no_gone_saver_at_hold")) {  // the saver left before this hold acted
+                    Trace("the saver of this hold is gone already: the host ends the save for everyone");
+                    for (int j = 0; j < n_; j++)
+                        if (copies_[j].connected) save_done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, c.a, false});
+                }
+                if (!cp.save_mine && cp.early_saver == c.a && now_ - cp.early_tick < 30000) {  // its done came first
+                    cp.early_saver = -1;
+                    if (cp.early_saved && !bugs_.count("save_alone")) WriteEffect(cp.w);
+                    ReleaseSave(m, "the saver's done came first");
+                }
+                break;
             case CStock:
                 if (cp.stock_in.Feed(c.a, c.b, c.payload)) {
                     int k = 0;
@@ -752,6 +861,30 @@ private:
                 break;
         }
     }
+
+    // What a save changes in the running game of the copy that writes it
+    static void WriteEffect(World& w) {
+        w.serial += 3;
+        w.Destroy(w.Make());
+    }
+    void ReleaseSave(int m, const char* why) {
+        Copy& c = copies_[m];
+        if (!c.save_hold) return;
+        c.save_hold = false;
+        c.save_mine = false;
+        if (m == 0) judge_.CorrectionDone(gen_, c.save_hold_frame);
+        Trace("copy %d goes on after the save (%s)", m, why);
+    }
+    struct SaveDone {
+        uint64_t at;
+        int m, saver;
+        bool saved;  // r[5] & 1: the saver wrote a save, ours follows
+    };
+    struct SaveWatch {
+        long gen;
+        int frame;
+        uint32_t faults;
+    };
 
     static bool Held(int npc) { return npc != 301; }
     static int StockItems(const World& w) {
@@ -778,16 +911,27 @@ private:
             if (c.connected && c.talk_pending && c.pending_npc == npc) return true;  // a talk on its way
         return TalkActive(npc) || host_locks_.Held(static_cast<uint16_t>(npc), static_cast<uint32_t>(now_));
     }
-    void FreeNpc(int m, int npc, int talker) {  // the talker's done reached copy m
+    void FreeNpc(int m, int npc, int talker, bool gone = false) {  // the talker's done reached copy m
         Copy& c = copies_[m];
+        if (gone && !bugs_.count("no_cancel_mark")) {
+            size_t slots = bugs_.count("one_cancel_slot") ? 1 : 8;
+            if (c.cancelled.size() < slots) c.cancelled.resize(slots, {0, 0});
+            c.cancelled[c.cancelled_next] = {npc, now_ + 10000};
+            c.cancelled_next = (c.cancelled_next + 1) % static_cast<int>(slots);
+        }
         auto l = c.npc_lock.find(npc);
         if (l != c.npc_lock.end() && l->second == talker) c.npc_lock.erase(l);
-        if (c.conv_wait) c.conv_wait = false;
+        if (c.conv_wait) {  // goes on once no held conversation of another copy is left
+            bool other = false;
+            for (auto& l : c.npc_lock) other |= Held(l.first) && l.second != m;
+            if (!other) c.conv_wait = false;
+        }
         if (m == 0 && host_hold_npc_ == npc) host_hold_npc_ = 0;
     }
     struct DoneDue {
         uint64_t at;
         int m, npc, talker;
+        bool gone;  // r[21] = kTalkerGone
     };
 
     // SendStock: the host's list in records, acting at one frame on every copy (at a session's start, and on a drift of
@@ -840,8 +984,9 @@ private:
             auto hw = copies_[0].worlds.find(c.frame);  // since when this copy's stock is not the host's
             if (hw != copies_[0].worlds.end() && hw->second.StockHash() != c.w.StockHash()) {
                 if (!c.stock_apart_since) c.stock_apart_since = now_;
+                c.stock_apart_frames++;
             } else if (hw != copies_[0].worlds.end()) {
-                c.stock_apart_since = 0;
+                c.stock_apart_since = 0, c.stock_apart_frames = 0;
             }
             c.frames[c.frame] = HashesOf(c.w, false);
             if (c.frames.size() > 600) c.frames.erase(c.frames.begin());
@@ -851,6 +996,17 @@ private:
             if (hf != host_frames_.end() && !hf->second.shop && !(HashesOf(c.w, false) == hf->second))
                 Violate("apart_after_load", "copy " + std::to_string(m) + " differs from the host 10 frames into a session" +
                                                 Diff(HashesOf(c.w, false), hf->second));
+        }
+        if (m != 0) {  // apart_after_save: 10 frames after a save's hold, the same as the host (no fault since it was asked)
+            for (const SaveWatch& sw : save_watches_) {
+                if (sw.gen != gen_ || sw.frame != c.frame || sw.faults != faults_) continue;
+                auto hf = host_frames_.find(c.frame);
+                auto h0 = host_frames_.find(sw.frame - 10), c0 = c.frames.find(sw.frame - 10);  // apart before the save: not its doing
+                if (h0 != host_frames_.end() && c0 != c.frames.end() && !(c0->second == h0->second)) continue;
+                if (hf != host_frames_.end() && !hf->second.shop && !(HashesOf(c.w, false) == hf->second))
+                    Violate("apart_after_save", "copy " + std::to_string(m) + " differs from the host 10 frames after a save's hold" +
+                                                    Diff(HashesOf(c.w, false), hf->second) + Detail(m, c.frame));
+            }
         }
         if (c.frame % drift::kEvery == 0) {
             drift::Rec r = {gen_, c.frame, c.w.PosHash(), c.w.TableHash(), c.w.UsedHash(), c.w.InvHash(), 1,
@@ -994,7 +1150,64 @@ private:
             }
             DoneDue d = done_due_[i];
             done_due_.erase(done_due_.begin() + i);
-            if (copies_[d.m].connected) FreeNpc(d.m, d.npc, d.talker);
+            if (copies_[d.m].connected) FreeNpc(d.m, d.npc, d.talker, d.gone);
+        }
+        // saves: the saver is done (the write changes its game); its done goes to everyone, as it arrives
+        for (int m = 0; m < n_; m++) {
+            Copy& c = copies_[m];
+            if (!c.connected || !c.save_hold || !c.save_mine || now_ < c.save_done_at) continue;
+            WriteEffect(c.w);
+            c.save_done_sent = now_;
+            Trace("copy %d's save is done", m);
+            for (int j = 0; j < n_; j++)
+                if (j != m && copies_[j].connected) save_done_due_.push_back({j == 0 ? now_ : now_ + Latency(), j, m, true});
+            ReleaseSave(m, "it saved");
+        }
+        for (size_t i = 0; i < save_done_due_.size();) {
+            if (save_done_due_[i].at > now_) {
+                ++i;
+                continue;
+            }
+            SaveDone d = save_done_due_[i];
+            save_done_due_.erase(save_done_due_.begin() + i);
+            Copy& c = copies_[d.m];
+            if (!c.connected || d.saver == d.m) continue;
+            if (!c.save_hold) {  // SaveDoneArrived: before this copy's hold frame, kept for it
+                if (!bugs_.count("no_early_save_done")) {
+                    c.early_saver = d.saver, c.early_saved = d.saved, c.early_tick = now_;
+                    Trace("copy %d: the saver's done came before its hold: kept", d.m);
+                }
+                continue;
+            }
+            if (c.save_saver != d.saver) continue;
+            if (d.saved && !bugs_.count("save_alone")) WriteEffect(c.w);  // save_alone: only the saver wrote
+            ReleaseSave(d.m, d.saved ? "the saver is done" : "the saver left: nothing saved");
+        }
+        for (int m = 0; m < n_; m++) {
+            Copy& c = copies_[m];
+            if (c.connected && c.save_hold && !c.save_mine && now_ - c.save_hold_since > kSaveHoldMaxMs) ReleaseSave(m, "the saver went quiet");
+            // the saver is gone: nothing but those 10 minutes ends the wait
+            if (c.connected && c.save_hold && !c.save_mine && c.save_saver >= 0 && !copies_[c.save_saver].connected) {
+                if (!c.save_gone_since) c.save_gone_since = now_;
+                if (now_ - c.save_gone_since > 5000 && !c.save_gone_said) {
+                    c.save_gone_said = true;
+                    Violate("waits_for_gone", "copy " + std::to_string(m) + " has waited 5 s for the save of copy " +
+                                                  std::to_string(c.save_saver) + ", which is gone");
+                }
+            } else {
+                c.save_gone_since = 0, c.save_gone_said = false;
+            }
+        }
+        // a save held 20 s after its saver (connected) has sent its done: the done was lost on the way
+        for (int m = 0; m < n_; m++) {
+            Copy& c = copies_[m];
+            if (!c.connected || !c.save_hold || c.save_mine || c.save_saver < 0 || !copies_[c.save_saver].connected) continue;
+            uint64_t done = copies_[c.save_saver].save_done_sent;
+            if (done && now_ - std::max(done, c.save_hold_since) > 20000 && !c.save_stuck_said) {
+                c.save_stuck_said = true;
+                Violate("save_hold_stuck", "copy " + std::to_string(m) + " holds 20 s for the save of copy " +
+                                               std::to_string(c.save_saver) + ", which is connected and done");
+            }
         }
         // A copy waiting for a conversation whose talker is gone: nothing but 10 minutes would end it (a reload hides it)
         for (int m = 0; m < n_; m++) {
@@ -1030,7 +1243,7 @@ private:
             fix_release_host_at_ = 0;
             judge_.CorrectionDone(gen_, fix_frame_);
         }
-        if (!h.held && !h.conv_wait && !h.talk_held && now_ >= next_host_frame_) {
+        if (!h.held && !h.conv_wait && !h.talk_held && !h.save_hold && now_ >= next_host_frame_) {
             next_host_frame_ = now_ + kFrameMs;
             std::vector<Cmd> cmds;
             auto it = schedule_.find(h.frame + 1);
@@ -1075,7 +1288,8 @@ private:
                 }
                 if (c.held) continue;
             }
-            while (!c.stream.empty() && c.stream.front().at <= now_ && !c.held && !c.conv_wait && !c.talk_held) {
+            while (!c.stream.empty() && c.stream.front().at <= now_ && !c.held && !c.conv_wait && !c.talk_held &&
+                   !c.save_hold) {
                 Delivery d = c.stream.front();
                 c.stream.pop_front();
                 if (d.gen != gen_) continue;
@@ -1195,10 +1409,13 @@ private:
     long fault_gen_ = -1;
     int drift_from_ = -1, drift_frame_ = 0;
     bool pending_abandon_ = false;
+    std::set<int> gone_;  // the host's note of the copies that left this session (g_gone_joiners)
     talk::HostLocks host_locks_;
     int host_hold_npc_ = 0;
     uint64_t host_hold_since_ = 0;
     std::vector<DoneDue> done_due_;
+    std::vector<SaveDone> save_done_due_;
+    std::vector<SaveWatch> save_watches_;
     std::map<int, int> talk_owner_;  // the host: NPC -> who claimed it
     bool late_drift_ = false;
     bool fix_snapshot_ = false;
@@ -1222,7 +1439,7 @@ private:
 // triage shows how that comes about.
 const char* kBugs[] = {"no_shop_skip", "no_drop_before_fix", "no_serial_sync", "no_stock_sync", "no_resync_gate", "no_abandoned_close",
                        "probe_late_report", "probe_race", "probe_undetected",
-                       "no_host_filter", "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check"};
+                       "no_host_filter", "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check", "save_alone", "no_abandoned_save", "no_early_save_done", "no_cancel_mark", "one_cancel_slot", "no_gone_saver_at_hold"};
 
 std::unique_ptr<ITarget> makeFt(const Scenario& s, std::string* err) {
     std::set<std::string> bugs;
@@ -1241,7 +1458,7 @@ std::unique_ptr<ITarget> makeFt(const Scenario& s, std::string* err) {
 const TargetRegistrar kRegisterFt(TargetInfo{
     "ftcoop", "Fallout Tactics co-op on a fake world: lockstep, shops, drift checks, corrections, reloads, forced desyncs",
     {"no_shop_skip", "no_drop_before_fix", "no_serial_sync", "no_stock_sync", "no_resync_gate", "no_abandoned_close", "probe_late_report", "probe_race", "probe_undetected", "no_host_filter",
-     "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check"}, makeFt});
+     "no_lock_clear", "no_solo_release", "no_abandoned_talk", "no_stock_check", "save_alone", "no_abandoned_save", "no_early_save_done", "no_cancel_mark", "one_cancel_slot", "no_gone_saver_at_hold"}, makeFt});
 
 }  // namespace
 }  // namespace coopfuzz

@@ -1572,6 +1572,23 @@ const uintptr_t kActorAct = 0x5747e0;
 typedef void(__fastcall* ActFn)(void*, void*, uint8_t*);
 ActFn g_actor_act = nullptr;
 
+// Every copy: a gone talker's done ([21] = kTalkerGone) arrives on arrival, and can reach a copy that lags before that
+// talk's frame has run there: the talk would then lock the NPC and hold the game after its done had passed. Such an NPC
+// is remembered for 10 s: its talk frees it at once, and no hold starts for it. Several at once (one slot: a second
+// talker leaving within 10 s wrote over the first's, and the first's late talk held everyone again; the fuzzer).
+const uint8_t kTalkerGone = 0xab;
+struct CancelledTalk { uint16_t npc; DWORD tick; };
+CancelledTalk g_cancelled[8];
+int g_cancelled_next = 0;
+void CancelTalk(uint16_t npc) {
+    g_cancelled[g_cancelled_next] = {npc, GetTickCount()};
+    g_cancelled_next = (g_cancelled_next + 1) % 8;
+}
+bool TalkCancelled(uint16_t npc) {
+    for (const CancelledTalk& c : g_cancelled)
+        if (npc && c.npc == npc && GetTickCount() - c.tick < 10000) return true;
+    return false;
+}
 struct NpcLock { uint16_t npc; bool mine; DWORD since; uint16_t talker; };  // talker: the squad member sent to talk
 const DWORD kLockMaxMs = 10 * 60 * 1000;
 uint16_t g_host_hold_npc = 0;  // host: the game is held for a joiner's conversation with this NPC
@@ -1586,6 +1603,10 @@ DWORD g_host_hold_since = 0;
 // and the joiner needs those frames. A host conversation already stops everyone: the ticks come from its world.
 void HostHoldForOther() {
     if (g_host_hold_npc || !g_last_other_npc) return;
+    if (TalkCancelled(g_last_other_npc)) {
+        Log("co-op: no hold for NPC %u: its talker is gone", g_last_other_npc);
+        return;
+    }
     LogAiFlags("holding");
     g_host_hold_npc = g_last_other_npc;
     g_host_hold_since = GetTickCount();
@@ -1698,6 +1719,7 @@ void SendTalkClaim(void* client, const uint8_t* msg, int len) {
 }
 
 void QueueFrameDelta(uint8_t kind, bool ok, bool mine, const uint8_t* data, int len);  // shop_sync.inc
+void CloseTalkOfGone(uint16_t npc);  // below
 void NoteTalkOwner(uint16_t npc, const uint8_t* owner_bytes);  // below
 void CoopCommandAtFrame(const uint8_t* r);                                              // shop_sync.inc
 
@@ -1792,6 +1814,7 @@ void HandleCoopCommand(const uint8_t* r) {
             uint8_t* w = *reinterpret_cast<uint8_t**>(kWorldPtr);
             g_dump_until = w ? *reinterpret_cast<int*>(w + kWorldFrame) + 250 : 0;
         }
+        if (r[21] == kTalkerGone) CancelTalk(npc);
         if (NpcLock* l = FindLock(npc)) l->npc = 0;
         if (npc == g_host_hold_npc) HostReleaseHold("the other player is done");
         uint8_t* world = *reinterpret_cast<uint8_t**>(kWorldPtr);
@@ -1981,6 +2004,11 @@ void __fastcall ActorActHook(void* actor, void* edx, uint8_t* cmd) {
                                           : barters ? (gambles ? "a trader who gambles" : "a trader") : "someone else",
             light ? "nobody waits" : "everyone waits while the conversation is up");
         if (!mine) g_last_other_npc = npc;
+        if (!mine && TalkCancelled(npc)) {  // its talker's done came first (a gone talker's, on a copy behind)
+            if (NpcLock* gone = FindLock(npc)) gone->npc = 0;
+            Log("co-op: NPC %u: its talker is gone, the conversation is over already", npc);
+        }
+        if (!mine) CloseTalkOfGone(npc);  // its talker may have left meanwhile
     }
     g_actor_act(actor, edx, cmd);
     if (cmd && (cmd[0] == 0x14 || cmd[0] == 0x15) && (g_coop_host || g_coop_join)) {
@@ -2039,18 +2067,45 @@ void NoteTalkOwner(uint16_t npc, const uint8_t* owner_bytes) {
     if (slot) slot->npc = npc, slot->owner = owner;
 }
 
+unsigned g_gone_joiners[16];  // host: joiners that left this session (their talks still in flight are theirs)
+int g_gone_next = 0;
+
+void SendTalkDoneFor(uint16_t npc) {  // host: the done of a gone talker's conversation, for every copy
+    uint8_t r[27];
+    CoopRecord(r, kSyncDone, 0);
+    memcpy(r + 5, &npc, 2);
+    r[7] = kDiffNone;  // nothing to apply: every copy frees the NPC and stops waiting, on arrival
+    r[21] = kTalkerGone;
+    SendCoopRecords(reinterpret_cast<const uint8_t(*)[27]>(r), 1);
+}
+
+// Host, at a talk's frame: a talk relayed before its talker left reaches its frame afterwards and opens the
+// conversation everywhere but on the gone copy; nothing would end it (the fuzzer: a joiner asked to talk and left
+// 100 ms later). Its done goes out at once.
+void CloseTalkOfGone(uint16_t npc) {
+    if (!g_coop_host) return;
+    for (auto& t : g_talk_owners) {
+        if (t.npc != npc || !t.owner) continue;
+        for (unsigned gone : g_gone_joiners)
+            if (gone && gone == t.owner) {
+                Log("co-op: the talker of NPC %u is gone: its conversation ends at once", npc);
+                g_host_locks.Free(npc);
+                t.npc = 0;
+                SendTalkDoneFor(npc);
+                return;
+            }
+    }
+}
+
 void CloseAbandonedTalks(unsigned joiner, const char* who) {  // host, main thread: that joiner is gone
+    g_gone_joiners[g_gone_next] = joiner;
+    g_gone_next = (g_gone_next + 1) % 16;
     for (auto& t : g_talk_owners) {
         if (!t.npc || t.owner != joiner) continue;
-        uint16_t npc = t.npc;
-        t.npc = 0;
-        if (!g_host_locks.Held(npc, GetTickCount())) continue;  // that conversation is over
+        uint16_t npc = t.npc;  // kept: a talk of theirs that acts later is closed at its frame too (CloseTalkOfGone)
+        if (!g_host_locks.Held(npc, GetTickCount())) continue;  // over, or its talk not acted yet: CloseTalkOfGone then
         g_host_locks.Free(npc);
-        uint8_t r[27];
-        CoopRecord(r, kSyncDone, 0);
-        memcpy(r + 5, &npc, 2);
-        r[7] = kDiffNone;  // nothing to apply: every copy frees the NPC and stops waiting, on arrival
-        SendCoopRecords(reinterpret_cast<const uint8_t(*)[27]>(r), 1);
+        SendTalkDoneFor(npc);
         Log("co-op: %s left during their conversation with NPC %u: it ends for everyone", who, npc);
         Notice("Co-op: %s left in the middle of a conversation - the game goes on", who);
     }
